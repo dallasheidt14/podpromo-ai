@@ -1,0 +1,22 @@
+{
+  "weights": { 
+    "hook": 0.32, 
+    "prosody": 0.24, 
+    "emotion": 0.20, 
+    "q_or_list": 0.08, 
+    "payoff": 0.08, 
+    "info": 0.04, 
+    "loop": 0.04 
+  },
+  "lexicons": {
+    "HOOK_CUES": [
+      "unpopular opinion","this is nuts","i can't believe","the wildest","true story"
+    ],
+    "EMO_WORDS": [
+      "hilarious","funny","insane","wild","ridiculous","awkward","cringe","wow"
+    ],
+    "PAYOFF_MARKERS": [
+      "and then","so","which means"
+    ]
+  }
+}

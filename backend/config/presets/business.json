@@ -1,0 +1,23 @@
+{
+  "weights": { 
+    "hook": 0.33, 
+    "prosody": 0.18, 
+    "emotion": 0.10, 
+    "q_or_list": 0.16, 
+    "payoff": 0.16, 
+    "info": 0.04, 
+    "loop": 0.03 
+  },
+  "lexicons": {
+    "HOOK_CUES": [
+      "the mistake","everyone thinks","but actually","3 rules","5 steps",
+      "the key is","here's why","what if","how do you","why most"
+    ],
+    "EMO_WORDS": [
+      "wrong","risky","expensive","waste"
+    ],
+    "PAYOFF_MARKERS": [
+      "here's why","because","therefore","the key is","bottom line"
+    ]
+  }
+}
