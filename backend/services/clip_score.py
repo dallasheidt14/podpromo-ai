@@ -678,7 +678,7 @@ class ClipScoreService:
                     "end": seg["end"],
                     "text": seg["text"],
                     "features": features,
-                    "score": seg.get("score", 0),
+                    "score": seg.get("display_score", 0),  # Frontend expects "score"
                     "raw_score": seg.get("raw_score", 0),
                     "display_score": seg.get("display_score", 0),
                     "clip_score_100": seg.get("clip_score_100", 0),

@@ -243,6 +243,13 @@ class EpisodeService:
             import asyncio
             loop = asyncio.get_event_loop()
             
+            # Check if Whisper model is loaded
+            if self.whisper_model is None:
+                logger.error("Whisper model not loaded, attempting to load now...")
+                self._init_whisper()
+                if self.whisper_model is None:
+                    raise Exception("Failed to load Whisper model")
+            
             # Update progress to show transcription is running
             self._update_progress(episode_id, "transcribing", 65.0, "Whisper model processing audio...")
             
@@ -298,6 +305,12 @@ class EpisodeService:
             
             # Fallback: try with minimal configuration
             try:
+                # Ensure model is loaded for fallback
+                if self.whisper_model is None:
+                    self._init_whisper()
+                    if self.whisper_model is None:
+                        raise Exception("Failed to load Whisper model for fallback")
+                
                 result = await loop.run_in_executor(
                     None,
                     lambda: self.whisper_model.transcribe(
@@ -333,6 +346,12 @@ class EpisodeService:
                 
                 # Final fallback: try without language specification
                 try:
+                    # Ensure model is loaded for final fallback
+                    if self.whisper_model is None:
+                        self._init_whisper()
+                        if self.whisper_model is None:
+                            raise Exception("Failed to load Whisper model for final fallback")
+                    
                     result = await loop.run_in_executor(
                         None,
                         lambda: self.whisper_model.transcribe(
