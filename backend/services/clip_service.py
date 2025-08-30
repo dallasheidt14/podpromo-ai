@@ -1,327 +1,543 @@
 """
-Clip Service - Manages clip generation and processing
+Clip Service - Handles video clip generation and rendering with enhanced features.
 """
 
 import os
+import json
+import time
+import subprocess
+import shlex
 import logging
-import asyncio
-from typing import List, Dict, Optional
 from datetime import datetime
-import ffmpeg
-
-from models import Clip, MomentScore, ClipGenerationRequest
-from config import settings
-from services.clip_score import ClipScoreService
-from services.episode_service import EpisodeService
+from typing import Dict, List, Optional
+from .caption_service import CaptionService
+from .loop_service import LoopService
 
 logger = logging.getLogger(__name__)
 
+# History tracking
+HISTORY_DIR = os.path.join("backend", "history")
+os.makedirs(HISTORY_DIR, exist_ok=True)
+HISTORY_LOG = os.path.join(HISTORY_DIR, "clips.jsonl")
+
 class ClipService:
-    """Service for generating video clips from podcast episodes"""
+    """Service for generating and rendering video clips"""
     
     def __init__(self, episode_service, clip_score_service):
-        self.clips: dict = {}  # In-memory storage for MVP
-        self.clip_score_service = clip_score_service
         self.episode_service = episode_service
-        self.jobs: dict = {}  # Track generation jobs
+        self.clip_score_service = clip_score_service
+        self.caption_service = CaptionService()
+        self.loop_service = LoopService()
+        self.output_dir = "./outputs"
+        
+        # Ensure output directory exists
+        os.makedirs(self.output_dir, exist_ok=True)
     
-    async def generate_clips(self, job_id: str, episode_id: str, target_count: int = 3,
-                           min_duration: int = 12, max_duration: int = 30):
-        """Generate clips from an episode"""
+    def _log_history(self, payload: dict):
+        """Log clip creation to history"""
         try:
-            logger.info(f"Starting clip generation job {job_id} for episode {episode_id}")
+            payload = dict(payload)
+            payload["ts"] = datetime.now().isoformat() + "Z"
+            with open(HISTORY_LOG, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload) + "\n")
+        except Exception as e:
+            logger.error(f"Failed to log history: {e}")
+    
+    def list_history(self, limit: int = 50):
+        """Get clip history with optional limit"""
+        try:
+            items = []
+            if os.path.exists(HISTORY_LOG):
+                with open(HISTORY_LOG, "r", encoding="utf-8") as f:
+                    for line in f:
+                        try:
+                            items.append(json.loads(line))
+                        except Exception:
+                            pass
+            items.sort(key=lambda x: x.get("ts", ""), reverse=True)
+            return items[:limit]
+        except Exception as e:
+            logger.error(f"Failed to load history: {e}")
+            return []
+    
+    async def render_clip_enhanced(
+        self, 
+        clip_id: str, 
+        audio_path: str, 
+        start_time: float, 
+        end_time: float, 
+        output_filename: str,
+        style: str = "bold",
+        captions: bool = True,
+        punch_ins: bool = True,
+        loop_seam: bool = False
+    ) -> Dict:
+        """
+        Render a clip with enhanced features: captions, punch-ins, and optional loop seam.
+        
+        Args:
+            clip_id: Unique identifier for the clip
+            audio_path: Path to the source audio/video file
+            start_time: Start time in seconds
+            end_time: End time in seconds
+            output_filename: Name for the output file
+            style: Caption style (bold, clean, caption-heavy)
+            captions: Whether to add captions
+            punch_ins: Whether to add punch-in effects
+            loop_seam: Whether to create a seamless loop
+        
+        Returns:
+            Dict with success status and output path
+        """
+        try:
+            output_path = os.path.join(self.output_dir, output_filename)
             
-            # Update job status
-            self.jobs[job_id] = {"status": "processing", "progress": 0}
-            
-            # Get episode
-            episode = await self.episode_service.get_episode(episode_id)
-            if not episode:
-                raise ValueError(f"Episode {episode_id} not found")
-            
-            # Get episode file path
-            episode_path = os.path.join(settings.UPLOAD_DIR, episode.filename)
-            
-            # Analyze episode to find best moments
-            self.jobs[job_id]["progress"] = 20
-            moment_scores = await self._analyze_episode(episode_path, episode_id)
-            
-            # Select best moments
-            self.jobs[job_id]["progress"] = 40
-            selected_moments = self.clip_score_service.select_best_moments(
-                moment_scores, target_count, min_duration, max_duration
+            # Step 1: Create base clip with trim and format
+            base_clip_path = self._create_base_clip(
+                audio_path, start_time, end_time, clip_id
             )
             
-            if not selected_moments:
-                raise ValueError("No suitable moments found for clips")
+            if not base_clip_path:
+                return {"success": False, "error": "Failed to create base clip"}
             
-            # Generate clips
-            self.jobs[job_id]["progress"] = 60
-            generated_clips = []
+            # Step 2: Add captions if requested
+            if captions:
+                captioned_path = await self._add_captions(
+                    base_clip_path, start_time, end_time, style, clip_id
+                )
+                if captioned_path:
+                    # Clean up base clip
+                    if os.path.exists(base_clip_path):
+                        os.remove(base_clip_path)
+                    base_clip_path = captioned_path
             
-            for i, moment in enumerate(selected_moments):
-                try:
-                    clip = await self._generate_single_clip(
-                        episode_id, moment, episode_path, i + 1
-                    )
-                    generated_clips.append(clip)
-                    
-                    # Update progress
-                    progress = 60 + (i + 1) * (30 / len(selected_moments))
-                    self.jobs[job_id]["progress"] = min(progress, 90)
-                    
-                except Exception as e:
-                    logger.error(f"Failed to generate clip {i + 1}: {e}")
-                    # Continue with other clips
+            # Step 3: Add punch-in effects if requested
+            if punch_ins:
+                punched_path = self._add_punch_ins(
+                    base_clip_path, clip_id
+                )
+                if punched_path:
+                    # Clean up previous version
+                    if os.path.exists(base_clip_path) and base_clip_path != audio_path:
+                        os.remove(base_clip_path)
+                    base_clip_path = punched_path
             
-            # Update job status
-            self.jobs[job_id]["status"] = "completed"
-            self.jobs[job_id]["progress"] = 100
+            # Step 4: Create loop seam if requested
+            if loop_seam:
+                looped_path = self._create_loop_seam(
+                    base_clip_path, clip_id
+                )
+                if looped_path:
+                    # Clean up previous version
+                    if os.path.exists(base_clip_path) and base_clip_path != audio_path:
+                        os.remove(base_clip_path)
+                    base_clip_path = looped_path
             
-            logger.info(f"Clip generation job {job_id} completed: {len(generated_clips)} clips")
-            
-        except Exception as e:
-            logger.error(f"Clip generation job {job_id} failed: {e}")
-            self.jobs[job_id]["status"] = "failed"
-            self.jobs[job_id]["error"] = str(e)
-    
-    async def _analyze_episode(self, episode_path: str, episode_id: str) -> List[MomentScore]:
-        """Analyze episode to find best moments using ClipScore algorithm"""
-        try:
-            # Get episode transcript from episode service
-            episode = await self.episode_service.get_episode(episode_id)
-            if not episode or not episode.transcript:
-                raise ValueError(f"Episode {episode_id} has no transcript")
-            
-            # Use ClipScore service to analyze the episode
-            moment_scores = self.clip_score_service.analyze_episode(episode_path, episode.transcript)
-            
-            logger.info(f"Found {len(moment_scores)} potential moments using ClipScore")
-            return moment_scores
-            
-        except Exception as e:
-            logger.error(f"Episode analysis failed: {e}")
-            raise
-    
-    async def _generate_single_clip(self, episode_id: str, moment: MomentScore, 
-                                  episode_path: str, clip_number: int) -> Clip:
-        """Generate a single video clip"""
-        try:
-            # Create clip record
-            clip_id = str(uuid.uuid4())
-            clip = Clip(
-                id=clip_id,
-                episode_id=episode_id,
-                start_time=moment.start_time,
-                end_time=moment.end_time,
-                duration=moment.duration,
-                score=moment.total_score,
-                title=f"Clip {clip_number}",
-                description=f"Best moment from episode",
-                status="generating"
+            # Step 5: Finalize output
+            final_path = self._finalize_clip(
+                base_clip_path, output_path, clip_id
             )
             
-            # Store clip
-            self.clips[clip_id] = clip
+            # Clean up intermediate files
+            if os.path.exists(base_clip_path) and base_clip_path != audio_path:
+                os.remove(base_clip_path)
+            
+            if final_path and os.path.exists(final_path):
+                # Log to history
+                self._log_history({
+                    "clip_id": clip_id,
+                    "format": "vertical",
+                    "output": output_filename,
+                    "duration": end_time - start_time,
+                    "style": style,
+                    "captions": captions,
+                    "punch_ins": punch_ins,
+                    "loop_seam": loop_seam,
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "audio_path": audio_path
+                })
+                
+                return {
+                    "success": True,
+                    "output": output_filename,
+                    "path": final_path,
+                    "duration": end_time - start_time,
+                    "features": {
+                        "captions": captions,
+                        "punch_ins": punch_ins,
+                        "loop_seam": loop_seam,
+                        "style": style
+                    }
+                }
+            else:
+                return {"success": False, "error": "Failed to finalize clip"}
+                
+        except Exception as e:
+            logger.error(f"Enhanced clip rendering failed: {e}")
+            return {"success": False, "error": str(e)}
+    
+    async def render_variant(
+        self, 
+        clip_id: str, 
+        variant: str = "square", 
+        style: str = "bold", 
+        captions: bool = True
+    ) -> Dict:
+        """
+        Create alternate export formats. For now: 'square' (1080x1080).
+        """
+        try:
+            # Get clip metadata from history
+            clip_meta = self._get_clip_metadata(clip_id)
+            if not clip_meta:
+                # Try to get from episode service if not in history
+                episodes = await self.episode_service.get_all_episodes()
+                if episodes:
+                    latest_episode = episodes[-1]
+                    if latest_episode.audio_path and os.path.exists(latest_episode.audio_path):
+                        # Use the latest episode as fallback
+                        src = latest_episode.audio_path
+                        start_time = 0  # Default to start
+                        end_time = 15   # Default to 15 seconds
+                        duration = 15
+                    else:
+                        return {"success": False, "error": "No audio source available"}
+                else:
+                    return {"success": False, "error": "No episodes found"}
+            else:
+                # Use metadata from history
+                src = clip_meta.get("audio_path")
+                if not src or not os.path.exists(src):
+                    return {"success": False, "error": "Source file not found"}
+                
+                start_time = clip_meta.get("start_time", 0)
+                end_time = clip_meta.get("end_time", 0)
+                duration = end_time - start_time
+            
+            if duration <= 0:
+                duration = 15  # Default duration if invalid
+            
+            if duration <= 0:
+                return {"success": False, "error": "Invalid clip duration"}
             
             # Generate output filename
-            output_filename = f"clip_{clip_id}.mp4"
-            output_path = os.path.join(settings.OUTPUT_DIR, output_filename)
+            out_name = f"{clip_id}_{variant}.mp4"
+            out_path = os.path.join(self.output_dir, out_name)
             
-            # Generate video clip
-            await self._render_video_clip(
-                episode_path, output_path, moment.start_time, moment.end_time
-            )
+            # Build FFmpeg command for square format
+            if variant == "square":
+                # For square: center-crop/pad to 1080x1080
+                vf = "scale=1080:1080:force_original_aspect_ratio=cover,crop=1080:1080"
+                
+                # Add captions if requested
+                ass_file = None
+                if captions:
+                    # Generate captions for this variant
+                    transcript = await self._get_clip_transcript(start_time, end_time)
+                    if transcript:
+                        ass_content = self.caption_service.generate_ass_captions(transcript, style)
+                        ass_file = os.path.join(self.output_dir, f"captions_{clip_id}_{variant}.ass")
+                        
+                        with open(ass_file, 'w', encoding='utf-8') as f:
+                            f.write(ass_content)
+                        
+                        vf += f",subtitles='{ass_file.replace(os.sep, '/')}'"
+                
+                # Build FFmpeg command
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-ss", str(start_time),
+                    "-t", str(duration),
+                    "-i", src,
+                    "-vf", vf,
+                    "-c:v", "libx264",
+                    "-preset", "veryfast",
+                    "-crf", "20",
+                    "-c:a", "aac",
+                    "-b:a", "160k",
+                    "-movflags", "+faststart",
+                    out_path
+                ]
+                
+                # Run FFmpeg
+                result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                
+                # Clean up caption file
+                if captions and ass_file and os.path.exists(ass_file):
+                    os.remove(ass_file)
+                
+                # Log to history
+                self._log_history({
+                    "clip_id": clip_id,
+                    "format": variant,
+                    "output": out_name,
+                    "duration": duration,
+                    "style": style,
+                    "captions": captions,
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "audio_path": src
+                })
+                
+                if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                    return {
+                        "success": True,
+                        "output": out_name,
+                        "format": variant,
+                        "path": out_path
+                    }
+                else:
+                    return {"success": False, "error": "Failed to create square variant"}
             
-            # Update clip with output path
-            clip.output_path = output_path
-            clip.download_url = f"/clips/{output_filename}"
-            clip.status = "completed"
-            clip.completed_at = datetime.utcnow()
-            
-            logger.info(f"Generated clip {clip_id}: {output_filename}")
-            return clip
-            
+            else:
+                return {"success": False, "error": f"Unsupported variant: {variant}"}
+                
         except Exception as e:
-            logger.error(f"Failed to generate clip: {e}")
-            if clip:
-                clip.status = "failed"
-                clip.error = str(e)
-            raise
+            logger.error(f"Variant rendering failed: {e}")
+            return {"success": False, "error": str(e)}
     
-    async def _render_video_clip(self, input_path: str, output_path: str, 
-                                start_time: float, end_time: float):
-        """Render video clip using FFmpeg"""
+    def _get_clip_metadata(self, clip_id: str) -> Optional[Dict]:
+        """Get clip metadata from history"""
         try:
-            duration = end_time - start_time
-            
-            # Create a simple video with audio
-            # For MVP, we'll create a vertical video with captions
-            
-            # Extract audio segment
-            audio_stream = (
-                ffmpeg
-                .input(input_path, ss=start_time, t=duration)
-                .audio
-                .filter('loudnorm')  # Normalize audio
-                .filter('highpass', f=80)  # Remove low frequency noise
-                .filter('lowpass', f=8000)  # Remove high frequency noise
-            )
-            
-            # Create video background (solid color)
-            video_stream = (
-                ffmpeg
-                .input('color=c=#1a1a1a:size=1080x1920:duration=' + str(duration), f='lavfi')
-                .video
-                .filter('fps', fps=settings.FPS)
-            )
-            
-            # Add captions (simple text overlay)
-            # In production, this would use the actual transcript
-            caption_text = f"Podcast Clip\n{start_time:.0f}s - {end_time:.0f}s"
-            
-            # Combine audio and video
-            output_stream = (
-                ffmpeg
-                .output(
-                    video_stream,
-                    audio_stream,
-                    output_path,
-                    vcodec='libx264',
-                    acodec='aac',
-                    video_bitrate=settings.VIDEO_BITRATE,
-                    audio_bitrate=settings.AUDIO_BITRATE,
-                    preset='fast',
-                    movflags='faststart'
-                )
-            )
-            
-            # Run FFmpeg
-            ffmpeg.run(output_stream, overwrite_output=True, quiet=True)
-            
-            logger.info(f"Video clip rendered: {output_path}")
-            
+            items = self.list_history(limit=1000)
+            for item in items:
+                if item.get("clip_id") == clip_id:
+                    return item
+            return None
         except Exception as e:
-            logger.error(f"Video rendering failed: {e}")
-            raise
+            logger.error(f"Failed to get clip metadata: {e}")
+            return None
     
-    async def get_clip(self, clip_id: str) -> Optional[Clip]:
-        """Get clip by ID"""
-        return self.clips.get(clip_id)
-
-    async def render_clip(self, clip_id: str, audio_path: str, start_time: float, 
-                         end_time: float, output_filename: str):
-        """Render a single clip from audio file"""
+    def _create_base_clip(self, audio_path: str, start_time: float, end_time: float, clip_id: str) -> Optional[str]:
+        """Create the base clip with proper trimming and format"""
         try:
-            logger.info(f"Rendering clip {clip_id}: {start_time}s to {end_time}s")
+            temp_path = os.path.join(self.output_dir, f"temp_base_{clip_id}.mp4")
             
-            # Ensure output directory exists
-            os.makedirs(settings.OUTPUT_DIR, exist_ok=True)
-            output_path = os.path.join(settings.OUTPUT_DIR, output_filename)
+            # Basic clip extraction with vertical format
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", audio_path,
+                "-ss", str(start_time),
+                "-t", str(end_time - start_time),
+                "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2",
+                "-c:v", "libx264",
+                "-preset", "fast",
+                "-crf", "20",
+                "-c:a", "aac",
+                "-b:a", "160k",
+                temp_path
+            ]
             
-            # Calculate duration
-            duration = end_time - start_time
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
             
-            # Use FFmpeg to extract the clip
-            input_stream = ffmpeg.input(audio_path, ss=start_time, t=duration)
+            if os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
+                return temp_path
+            else:
+                return None
+                
+        except Exception as e:
+            logger.error(f"Base clip creation failed: {e}")
+            return None
+    
+    async def _add_captions(self, video_path: str, start_time: float, end_time: float, style: str, clip_id: str) -> Optional[str]:
+        """Add captions to the video"""
+        try:
+            # Get transcript for the clip duration
+            transcript = await self._get_clip_transcript(start_time, end_time)
+            if not transcript:
+                logger.warning("No transcript available for captions")
+                return video_path
             
-            # For MVP, create a simple video with audio
-            # In production, you'd add captions, effects, etc.
-            output_stream = (
-                input_stream
-                .output(
-                    output_path,
-                    vcodec='libx264',
-                    acodec='aac',
-                    video_bitrate=settings.VIDEO_BITRATE,
-                    audio_bitrate=settings.AUDIO_BITRATE,
-                    preset='fast',
-                    movflags='faststart',
-                    # Create a simple video (black background with audio)
-                    f='lavfi',
-                    i='color=black:size=1080x1920:duration=' + str(duration)
-                )
+            # Generate ASS captions
+            ass_content = self.caption_service.generate_ass_captions(transcript, style)
+            ass_file = os.path.join(self.output_dir, f"captions_{clip_id}.ass")
+            
+            with open(ass_file, 'w', encoding='utf-8') as f:
+                f.write(ass_content)
+            
+            # Add captions to video
+            captioned_path = os.path.join(self.output_dir, f"captioned_{clip_id}.mp4")
+            
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", video_path,
+                "-vf", f"subtitles='{ass_file}'",
+                "-c:v", "libx264",
+                "-preset", "fast",
+                "-crf", "20",
+                "-c:a", "copy",
+                captioned_path
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            
+            # Clean up ASS file
+            if os.path.exists(ass_file):
+                os.remove(ass_file)
+            
+            if os.path.exists(captioned_path) and os.path.getsize(captioned_path) > 0:
+                return captioned_path
+            else:
+                return video_path
+                
+        except Exception as e:
+            logger.error(f"Caption addition failed: {e}")
+            return video_path
+    
+    def _add_punch_ins(self, video_path: str, clip_id: str) -> Optional[str]:
+        """Add punch-in zoom effects to the video"""
+        try:
+            punched_path = os.path.join(self.output_dir, f"punched_{clip_id}.mp4")
+            
+            # Add subtle zoom effect that increases over time
+            filter_complex = (
+                "zoompan=z='min(zoom+0.001,1.05)':d=1:x=iw/2-(iw/zoom/2):y=ih/2-(ih/zoom/2)"
             )
             
-            # Run FFmpeg
-            ffmpeg.run(output_stream, overwrite_output=True, quiet=True)
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", video_path,
+                "-vf", filter_complex,
+                "-c:v", "libx264",
+                "-preset", "fast",
+                "-crf", "20",
+                "-c:a", "copy",
+                punched_path
+            ]
             
-            logger.info(f"Clip {clip_id} rendered successfully: {output_path}")
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            
+            if os.path.exists(punched_path) and os.path.getsize(punched_path) > 0:
+                return punched_path
+            else:
+                return video_path
+                
+        except Exception as e:
+            logger.error(f"Punch-in addition failed: {e}")
+            return video_path
+    
+    def _create_loop_seam(self, video_path: str, clip_id: str) -> Optional[str]:
+        """Create a seamless loop ending"""
+        try:
+            looped_path = os.path.join(self.output_dir, f"looped_{clip_id}.mp4")
+            
+            # Use the loop service to create seamless ending
+            result = self.loop_service.create_loop_seam(video_path, looped_path)
+            
+            if result["success"]:
+                return looped_path
+            else:
+                # Fallback to simple loop if crossfade fails
+                fallback_result = self.loop_service.create_simple_loop(video_path, looped_path)
+                if fallback_result["success"]:
+                    return looped_path
+                else:
+                    logger.warning("Loop seam creation failed, using original")
+                    return video_path
+                    
+        except Exception as e:
+            logger.error(f"Loop seam creation failed: {e}")
+            return video_path
+    
+    def _finalize_clip(self, input_path: str, output_path: str, clip_id: str) -> Optional[str]:
+        """Finalize the clip with proper encoding and metadata"""
+        try:
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", input_path,
+                "-c:v", "libx264",
+                "-preset", "fast",
+                "-crf", "20",
+                "-c:a", "aac",
+                "-b:a", "160k",
+                "-movflags", "+faststart",  # Optimize for web streaming
+                "-metadata", f"title=PodPromo AI Clip {clip_id}",
+                "-metadata", "artist=PodPromo AI",
+                output_path
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                return output_path
+            else:
+                return None
+                
+        except Exception as e:
+            logger.error(f"Clip finalization failed: {e}")
+            return None
+    
+    async def _get_clip_transcript(self, start_time: float, end_time: float) -> Optional[List[Dict]]:
+        """Get transcript segment for the specified time range"""
+        try:
+            # Get the most recent episode
+            episodes = await self.episode_service.list_episodes()
+            if not episodes:
+                return None
+            
+            latest_episode = episodes[-1]
+            if not latest_episode.transcript:
+                return None
+            
+            # Filter transcript for the clip duration
+            clip_transcript = []
+            for word in latest_episode.transcript:
+                # Handle both TranscriptSegment objects and dictionaries
+                if hasattr(word, 'start'):
+                    word_start = word.start
+                    word_end = word.end
+                    word_text = word.text if hasattr(word, 'text') else str(word)
+                else:
+                    word_start = word.get("start", 0)
+                    word_end = word.get("end", 0)
+                    word_text = word.get("text", str(word))
+                
+                # Check if word overlaps with clip time
+                if (word_start <= end_time and word_end >= start_time):
+                    # Adjust timing relative to clip start
+                    adjusted_word = {
+                        "start": max(0, word_start - start_time),
+                        "end": min(end_time - start_time, word_end - start_time),
+                        "text": word_text
+                    }
+                    clip_transcript.append(adjusted_word)
+            
+            return clip_transcript
             
         except Exception as e:
-            logger.error(f"Failed to render clip {clip_id}: {e}")
-            raise
+            logger.error(f"Transcript extraction failed: {e}")
+            return None
     
-    async def get_episode_clips(self, episode_id: str) -> List[Clip]:
-        """Get all clips for an episode"""
-        return [clip for clip in self.clips.values() if clip.episode_id == episode_id]
-    
-    async def get_job_status(self, job_id: str) -> Optional[dict]:
-        """Get job status and progress"""
-        return self.jobs.get(job_id)
+    async def render_clip(self, clip_id: str, audio_path: str, start_time: float, end_time: float, output_filename: str) -> Dict:
+        """
+        Legacy render method for backward compatibility.
+        Use render_clip_enhanced for new features.
+        """
+        return await self.render_clip_enhanced(
+            clip_id, audio_path, start_time, end_time, output_filename,
+            style="bold", captions=True, punch_ins=False, loop_seam=False
+        )
     
     def check_ffmpeg(self) -> bool:
         """Check if FFmpeg is available"""
         try:
-            # Try to run ffmpeg -version
-            result = ffmpeg.probe('dummy')
-            return True
-        except:
-            try:
-                # Alternative check
-                import subprocess
-                result = subprocess.run(['ffmpeg', '-version'], 
-                                      capture_output=True, text=True)
-                return result.returncode == 0
-            except:
-                return False
+            result = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True)
+            return result.returncode == 0
+        except Exception:
+            return False
     
     def check_whisper(self) -> bool:
         """Check if Whisper is available"""
         try:
             import whisper
             return True
-        except:
+        except ImportError:
             return False
     
-    async def cleanup_old_clips(self, max_age_hours: int = 24):
-        """Clean up old clips to save storage"""
+    def check_storage(self) -> bool:
+        """Check if storage is accessible"""
         try:
-            current_time = datetime.utcnow()
-            clips_to_delete = []
-            
-            for clip_id, clip in self.clips.items():
-                if clip.created_at:
-                    age_hours = (current_time - clip.created_at).total_seconds() / 3600
-                    if age_hours > max_age_hours:
-                        clips_to_delete.append(clip_id)
-            
-            for clip_id in clips_to_delete:
-                await self.delete_clip(clip_id)
-            
-            if clips_to_delete:
-                logger.info(f"Cleaned up {len(clips_to_delete)} old clips")
-                
-        except Exception as e:
-            logger.error(f"Clip cleanup failed: {e}")
-    
-    async def delete_clip(self, clip_id: str) -> bool:
-        """Delete clip and associated files"""
-        try:
-            clip = self.clips.get(clip_id)
-            if not clip:
-                return False
-            
-            # Remove output file
-            if clip.output_path and os.path.exists(clip.output_path):
-                os.remove(clip.output_path)
-            
-            # Remove from memory
-            del self.clips[clip_id]
-            
-            logger.info(f"Clip {clip_id} deleted")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to delete clip {clip_id}: {e}")
+            return os.access("./uploads", os.W_OK) and os.access("./outputs", os.W_OK)
+        except Exception:
             return False

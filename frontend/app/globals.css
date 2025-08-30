@@ -46,11 +46,31 @@
   }
   
   .progress-bar {
-    @apply w-full bg-gray-200 rounded-full h-2 overflow-hidden;
+    @apply w-full bg-gray-200 rounded-full h-3 overflow-hidden shadow-inner;
   }
   
   .progress-fill {
-    @apply h-full bg-primary-600 transition-all duration-300 ease-out;
+    @apply h-full bg-primary-600 transition-all duration-500 ease-out rounded-full;
+  }
+  
+  .progress-fill.bg-blue-500 {
+    @apply bg-blue-500;
+  }
+  
+  .progress-fill.bg-yellow-500 {
+    @apply bg-yellow-500;
+  }
+  
+  .progress-fill.bg-purple-500 {
+    @apply bg-purple-500;
+  }
+  
+  .progress-fill.bg-indigo-500 {
+    @apply bg-indigo-500;
+  }
+  
+  .progress-fill.bg-green-500 {
+    @apply bg-green-500;
   }
 }
 

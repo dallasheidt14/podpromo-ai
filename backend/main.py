@@ -1,465 +1,309 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Form
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse
-from fastapi.staticfiles import StaticFiles
+"""
+PodPromo AI - FastAPI Backend
+Main application entry point with all API endpoints.
+"""
+
 import os
 import uuid
-import asyncio
-from datetime import datetime
-from typing import List, Optional
 import logging
+from datetime import datetime
+from typing import List, Dict, Optional
 
-# Import your services
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Form, Query
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+
+from models import (
+    Episode, TranscriptSegment, MomentScore, UploadResponse, 
+    HealthCheck, ApiError, RenderRequest
+)
+from pydantic import BaseModel
+from config_loader import get_config, reload_config, set_weights, load_preset
+from services.episode_service import EpisodeService
 from services.clip_score import ClipScoreService
 from services.clip_service import ClipService
-from services.episode_service import EpisodeService
-from models import (
-    Episode, Clip, ClipGenerationRequest, 
-    ClipGenerationResponse, MomentScore, TranscriptSegment, UploadResponse, HealthCheck, ApiError
-)
-from config import settings
+from services.caption_service import CaptionService
+from services.loop_service import LoopService
+from services.ab_test_service import ABTestService
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Initialize FastAPI app
 app = FastAPI(
     title="PodPromo AI API",
-    description="AI-powered podcast clip generation service",
+    description="AI-powered podcast clip generation and scoring",
     version="1.0.0"
 )
 
-# CORS middleware
+# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=["*"],  # Configure appropriately for production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Mount static directories
+app.mount("/files", StaticFiles(directory="./uploads"), name="files")
+app.mount("/clips", StaticFiles(directory="./outputs"), name="clips")
+
 # Initialize services
 episode_service = EpisodeService()
 clip_score_service = ClipScoreService(episode_service)
 clip_service = ClipService(episode_service, clip_score_service)
+caption_service = CaptionService()
+loop_service = LoopService()
+ab_test_service = ABTestService()
 
-# Mount static files for serving generated clips
-os.makedirs(settings.OUTPUT_DIR, exist_ok=True)
-app.mount("/clips", StaticFiles(directory=settings.OUTPUT_DIR), name="clips")
+# Test transcription endpoint
+@app.post("/api/test-transcription")
+async def test_transcription(file_id: str = Form(...)):
+    """Test transcription with an existing file without uploading"""
+    try:
+        # Find the file in uploads directory
+        file_path = f"./uploads/{file_id}"
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=404, detail=f"File {file_id} not found")
+        
+        # Create a test episode
+        test_episode_id = f"test_{file_id}"
+        
+        # Create episode object
+        episode = Episode(
+            id=test_episode_id,
+            filename=file_id,
+            original_name=file_id,
+            size=os.path.getsize(file_path),
+            status="processing"
+        )
+        
+        # Store in service
+        episode_service.episodes[test_episode_id] = episode
+        episode.audio_path = file_path
+        
+        # Test transcription
+        transcript = await episode_service._transcribe_audio(file_path, test_episode_id)
+        
+        return {
+            "success": True,
+            "episode_id": test_episode_id,
+            "segments": len(transcript),
+            "duration": transcript[-1].end - transcript[0].start if transcript else 0,
+            "sample_segments": [
+                {
+                    "start": seg.start,
+                    "end": seg.end,
+                    "text": seg.text[:100] + "..." if len(seg.text) > 100 else seg.text
+                }
+                for seg in transcript[:3]  # First 3 segments
+            ]
+        }
+        
+    except Exception as e:
+        logger.error(f"Test transcription failed: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "error": str(e)}
+        )
 
-# Mount static files for general file access (including config)
-app.mount("/files", StaticFiles(directory=os.path.dirname(os.path.abspath(__file__))), name="files")
-
-@app.get("/", response_model=dict)
-async def root():
-    """Root endpoint with API information"""
-    return {
-        "message": "PodPromo AI API",
-        "version": "1.0.0",
-        "docs": "/docs",
-        "health": "/health"
-    }
-
+# Health check endpoint
 @app.get("/health", response_model=HealthCheck)
 async def health_check():
-    """Health check endpoint"""
+    """Check system health and service status"""
     try:
-        # Check if required services are available
-        ffmpeg_available = clip_service.check_ffmpeg()
-        whisper_available = clip_service.check_whisper()
-        storage_available = episode_service.check_storage()
+        # Check FFmpeg
+        ffmpeg_ok = clip_service.check_ffmpeg()
+        
+        # Check Whisper (if model is loaded)
+        whisper_ok = clip_service.check_whisper()
+        
+        # Check storage
+        storage_ok = episode_service.check_storage()
+        
+        # Check outputs directory
+        outputs_ok = os.path.exists("./outputs") or os.makedirs("./outputs", exist_ok=True)
+        
+        status = "healthy" if all([ffmpeg_ok, whisper_ok, storage_ok, outputs_ok]) else "unhealthy"
         
         return HealthCheck(
-            status="healthy" if all([ffmpeg_available, whisper_available, storage_available]) else "unhealthy",
-            timestamp=datetime.utcnow().isoformat(),
+            status=status,
+            timestamp=datetime.now(),
             version="1.0.0",
             services={
-                "ffmpeg": ffmpeg_available,
-                "whisper": whisper_available,
-                "storage": storage_available
+                "ffmpeg": ffmpeg_ok,
+                "whisper": whisper_ok,
+                "storage": storage_ok
             }
         )
     except Exception as e:
         logger.error(f"Health check failed: {e}")
         return HealthCheck(
             status="unhealthy",
-            timestamp=datetime.utcnow().isoformat(),
+            timestamp=datetime.now(),
             version="1.0.0",
             services={"ffmpeg": False, "whisper": False, "storage": False}
         )
 
-@app.post("/api/upload")
-async def upload_episode(
-    background_tasks: BackgroundTasks,
-    file: UploadFile = File(...)
-):
-    """Upload a podcast episode file"""
+# Configuration endpoints
+@app.get("/config/get")
+async def get_config_endpoint():
+    """Get current configuration"""
     try:
-        # Validate file
-        if not file.filename:
-            raise HTTPException(status_code=400, detail="No filename provided")
-        
-        # Check file size
-        if file.size and file.size > settings.MAX_FILE_SIZE:
-            raise HTTPException(
-                status_code=413, 
-                detail=f"File too large. Maximum size: {settings.MAX_FILE_SIZE / (1024*1024):.1f}MB"
-            )
-        
-        # Check file type
-        allowed_types = ['.mp3', '.wav', '.m4a', '.mp4', '.mov', '.avi']
-        file_ext = os.path.splitext(file.filename)[1].lower()
-        if file_ext not in allowed_types:
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Unsupported file type. Allowed: {', '.join(allowed_types)}"
-            )
-        
-        # Generate unique episode ID
-        episode_id = str(uuid.uuid4())
-        
-        # Save file and create episode record
-        episode = await episode_service.create_episode(
-            episode_id=episode_id,
-            file=file,
-            original_filename=file.filename
-        )
-        
-        # Process episode in background
-        background_tasks.add_task(
-            episode_service.process_episode,
-            episode_id
-        )
-        
+        config = get_config()
+        return {"ok": True, "config": config}
+    except Exception as e:
+        logger.error(f"Config get failed: {e}")
+        return {"ok": False, "error": str(e)}
+
+@app.post("/config/set-weights")
+async def set_weights_endpoint(weights: Dict[str, float]):
+    """Set custom weights for scoring"""
+    try:
+        result = set_weights(weights)
+        return {"ok": True, "weights": result}
+    except Exception as e:
+        logger.error(f"Weight setting failed: {e}")
+        return {"ok": False, "error": str(e)}
+
+@app.post("/config/reload")
+async def reload_config_endpoint():
+    """Reload configuration from files"""
+    try:
+        config = reload_config()
+        return {"ok": True, "config": config, "lexicons": config.get("lexicons", {})}
+    except Exception as e:
+        logger.error(f"Config reload failed: {e}")
+        return {"ok": False, "error": str(e)}
+
+@app.post("/debug/test-detectors")
+async def test_detectors(body: dict):
+    """Test individual detectors with sample text"""
+    try:
+        txt = body.get("text", "")
+        from services.secret_sauce import _hook_score, _payoff_presence, _info_density, _ad_penalty
+        # Test original hook detection
+        hook_val = _hook_score(txt)
+        # Test original ad detection
+        ad_result = _ad_penalty(txt)
         return {
-            "ok": True,
-            "episodeId": episode_id,
-            "filename": episode.filename,
-            "size": episode.size,
-            "status": episode.status,
-            "message": "Episode uploaded successfully and processing started"
+            "hook": hook_val,
+            "payoff": _payoff_presence(txt),
+            "info": _info_density(txt),
+            "ad_flag": ad_result["flag"],
+            "ad_penalty": ad_result["penalty"],
+            "ad_reason": ad_result["reason"]
         }
+    except Exception as e:
+        logger.error(f"Detector test failed: {e}")
+        return {"ok": False, "error": str(e)}
+
+@app.post("/config/load-preset")
+async def load_preset_endpoint(preset_name: str):
+    """Load a preset configuration"""
+    try:
+        result = load_preset(preset_name)
+        return {"ok": True, "weights": result}
+    except Exception as e:
+        logger.error(f"Preset loading failed: {e}")
+        return {"ok": False, "error": str(e)}
+
+# Metrics endpoint
+@app.post("/metrics/log-choice")
+async def log_choice(choice_data: Dict):
+    """Log user choice for learning"""
+    try:
+        # In production, this would go to a database
+        logger.info(f"User choice logged: {choice_data}")
+        return {"ok": True, "logged": True}
+    except Exception as e:
+        logger.error(f"Choice logging failed: {e}")
+        return {"ok": False, "error": str(e)}
+
+# Main API endpoints
+@app.post("/api/upload")
+async def upload_episode(file: UploadFile = File(...)):
+    """Upload and process a podcast episode"""
+    try:
+        if not file.filename:
+            raise HTTPException(status_code=400, detail="No file provided")
         
-    except HTTPException:
-        raise
+        # Create episode and start processing
+        episode_id = str(uuid.uuid4())
+        episode = await episode_service.create_episode(episode_id, file, file.filename)
+        
+        # Start background processing
+        await episode_service.process_episode(episode.id)
+        
+        return {"ok": True, "episodeId": episode.id, "message": "Upload successful and processing started"}
+        
     except Exception as e:
         logger.error(f"Upload failed: {e}")
-        raise HTTPException(status_code=500, detail="Upload failed")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/candidates")
-async def get_candidates():
-    """Get AI-scored clip candidates for the latest uploaded episode"""
+async def get_candidates(
+    platform: str = Query("tiktok_reels", description="Platform for optimization (tiktok_reels, shorts, linkedin_sq)"),
+    genre: str | None = Query(None, description="Genre for optimization (comedy, fantasy_sports, sports, true_crime, business, news_politics, education, health_wellness)"),
+    debug: bool = Query(False, description="Enable debug mode for detailed candidate information")
+):
+    """Get AI-scored clip candidates with optional platform/tone optimization"""
     try:
-        # For MVP, get the most recent episode
+        # Set debug environment variable
+        os.environ["PODPROMO_DEBUG_ALL"] = "1" if debug else "0"
+        
+        # Get the most recent episode
         episodes = await episode_service.list_episodes()
         if not episodes:
             return {"ok": False, "error": "No episodes found. Upload a file first."}
         
-        latest_episode = episodes[-1]  # Most recent
+        latest_episode = episodes[-1]
+        
         if latest_episode.status != "completed":
             return {"ok": False, "error": "Episode still processing. Please wait."}
         
-        # Get candidates using ClipScore service
-        candidates = await clip_score_service.get_candidates(latest_episode.id)
+        # Get candidates using ClipScore with platform/genre optimization
+        candidates = await clip_score_service.get_candidates(
+            latest_episode.id, 
+            platform=platform, 
+            genre=genre
+        )
+        
+        if not candidates:
+            return {"ok": False, "error": "No candidates found for this episode."}
+        
+        # Add platform mapping info to response
+        from services.secret_sauce import resolve_platform
+        backend_platform = resolve_platform(platform)
         
         return {
             "ok": True, 
             "candidates": candidates,
-            "episode_id": latest_episode.id
+            "optimization": {
+                "frontend_platform": platform,
+                "frontend_genre": genre,
+                "backend_platform": backend_platform,
+                "description": f"Optimized for {platform}" + (f" in {genre} genre" if genre else "")
+            }
         }
         
     except Exception as e:
         logger.error(f"Failed to get candidates: {e}")
         return {"ok": False, "error": str(e)}
 
-@app.get("/api/progress")
-async def get_progress():
-    """Get current processing progress for all episodes"""
-    try:
-        from datetime import datetime
-        
-        # Get all episodes and their status
-        episodes = await episode_service.list_episodes()
-        if not episodes:
-            return {"ok": True, "progress": 0, "status": "No episodes"}
-        
-        # Find the most recent episode that's processing
-        processing_episodes = [ep for ep in episodes if ep.status == "processing"]
-        if not processing_episodes:
-            return {"ok": True, "progress": 100, "status": "No processing episodes"}
-        
-        # Get the most recent processing episode
-        latest = max(processing_episodes, key=lambda ep: ep.uploaded_at or datetime.min)
-        
-        # If it has a transcript, it's done
-        if latest.transcript:
-            return {"ok": True, "progress": 100, "status": "Transcription complete"}
-        
-        # Estimate progress based on time elapsed (rough approximation)
-        if latest.uploaded_at:
-            elapsed = (datetime.utcnow() - latest.uploaded_at).total_seconds()
-            # Assume average transcription takes 2 minutes for a typical podcast
-            estimated_total = 120  # seconds
-            progress = min(95, int((elapsed / estimated_total) * 100))
-            return {"ok": True, "progress": progress, "status": "Transcribing..."}
-        
-        return {"ok": True, "progress": 0, "status": "Starting..."}
-        
-    except Exception as e:
-        logger.error(f"Failed to get progress: {e}")
-        return {"ok": False, "error": str(e)}
-
-@app.get("/api/episodes/{episode_id}", response_model=Episode)
-async def get_episode(episode_id: str):
-    """Get episode details"""
-    try:
-        episode = await episode_service.get_episode(episode_id)
-        if not episode:
-            raise HTTPException(status_code=404, detail="Episode not found")
-        return episode
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Failed to get episode {episode_id}: {e}")
-        raise HTTPException(status_code=500, detail="Failed to get episode")
-
-@app.post("/api/generate-clips", response_model=ClipGenerationResponse)
-async def generate_clips(
-    request: ClipGenerationRequest,
-    background_tasks: BackgroundTasks
-):
-    """Generate clips from an episode"""
-    try:
-        # Validate episode exists and is processed
-        episode = await episode_service.get_episode(request.episode_id)
-        if not episode:
-            raise HTTPException(status_code=404, detail="Episode not found")
-        
-        if episode.status != "completed":
-            raise HTTPException(
-                status_code=400, 
-                detail="Episode must be fully processed before generating clips"
-            )
-        
-        # Generate job ID
-        job_id = str(uuid.uuid4())
-        
-        # Start clip generation in background
-        background_tasks.add_task(
-            clip_service.generate_clips,
-            job_id,
-            request.episode_id,
-            request.target_count or 3,
-            request.min_duration or 12,
-            request.max_duration or 30
-        )
-        
-        return ClipGenerationResponse(
-            jobId=job_id,
-            status="queued",
-            clips=[],
-            estimatedTime=300  # 5 minutes target
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Clip generation failed: {e}")
-        raise HTTPException(status_code=500, detail="Clip generation failed")
-
-@app.get("/api/clips/{clip_id}", response_model=Clip)
-async def get_clip(clip_id: str):
-    """Get clip details and download URL"""
-    try:
-        clip = await clip_service.get_clip(clip_id)
-        if not clip:
-            raise HTTPException(status_code=404, detail="Clip not found")
-        return clip
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Failed to get clip {clip_id}: {e}")
-        raise HTTPException(status_code=500, detail="Failed to get clip")
-
-@app.get("/api/clips/{clip_id}/download")
-async def download_clip(clip_id: str):
-    """Download a generated clip"""
-    try:
-        clip = await clip_service.get_clip(clip_id)
-        if not clip:
-            raise HTTPException(status_code=404, detail="Clip not found")
-        
-        if clip.status != "completed":
-            raise HTTPException(status_code=400, detail="Clip not ready for download")
-        
-        if not clip.output_path or not os.path.exists(clip.output_path):
-            raise HTTPException(status_code=404, detail="Clip file not found")
-        
-        return FileResponse(
-            clip.output_path,
-            media_type="video/mp4",
-            filename=f"clip_{clip_id}.mp4"
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Download failed for clip {clip_id}: {e}")
-        raise HTTPException(status_code=500, detail="Download failed")
-
-@app.get("/api/episodes/{episode_id}/clips", response_model=List[Clip])
-async def get_episode_clips(episode_id: str):
-    """Get all clips for an episode"""
-    try:
-        clips = await clip_service.get_episode_clips(episode_id)
-        return clips
-    except Exception as e:
-        logger.error(f"Failed to get clips for episode {episode_id}: {e}")
-        raise HTTPException(status_code=500, detail="Failed to get episode clips")
-
-@app.post("/config/reload")
-async def reload_config():
-    """Reload the secret sauce configuration"""
-    try:
-        from .config_loader import load_config
-        cfg = load_config()
-        return {"ok": True, "weights": cfg["weights"], "lexicons": list(cfg["lexicons"].keys())}
-    except Exception as e:
-        logger.error(f"Config reload failed: {e}")
-        raise HTTPException(status_code=500, detail="Config reload failed")
-
-@app.post("/config/load-preset")
-async def load_preset(name: str):
-    """Load a genre preset configuration"""
-    try:
-        import json
-        import os
-        from .config_loader import load_config, BASE_DIR
-        
-        preset_path = os.path.join(BASE_DIR, "config", "presets", f"{name}.json")
-        if not os.path.exists(preset_path):
-            return {"ok": False, "error": "Preset not found"}
-        
-        # Read preset
-        with open(preset_path, "r", encoding="utf-8") as f:
-            preset = json.load(f)
-        
-        # Overwrite main config with preset
-        main_config_path = os.path.join(BASE_DIR, "config", "secret_config.json")
-        with open(main_config_path, "w", encoding="utf-8") as f:
-            json.dump(preset, f, indent=2)
-        
-        # Reload configuration
-        from .config_loader import load_config as _reload
-        _reload()
-        
-        cfg = load_config()
-        return {"ok": True, "active": name, "weights": cfg["weights"]}
-        
-    except Exception as e:
-        logger.error(f"Preset loading failed: {e}")
-        raise HTTPException(status_code=500, detail="Preset loading failed")
-
-@app.get("/config/get")
-async def config_get():
-    """Get current configuration"""
-    try:
-        from config_loader import get_config
-        cfg = get_config()
-        return {"ok": True, "config": cfg}
-    except Exception as e:
-        logger.error(f"Config get failed: {e}")
-        raise HTTPException(status_code=500, detail="Config get failed")
-
-@app.post("/config/set-weights")
-async def set_weights(weights: dict):
-    """Set custom weights for the scoring algorithm"""
-    try:
-        import json
-        import os
-        from config_loader import BASE_DIR
-        
-        # Validate weights
-        required_keys = ["hook", "prosody", "emotion", "q_or_list", "payoff", "info", "loop"]
-        if not all(key in weights for key in required_keys):
-            return {"ok": False, "error": "Missing required weight keys"}
-        
-        # Normalize weights to sum to 1.0
-        total = sum(weights.values())
-        if total == 0:
-            return {"ok": False, "error": "Weights cannot all be zero"}
-        
-        normalized_weights = {k: v/total for k, v in weights.items()}
-        
-        # Load current config
-        main_config_path = os.path.join(BASE_DIR, "config", "secret_config.json")
-        current_config = {}
-        if os.path.exists(main_config_path):
-            with open(main_config_path, "r", encoding="utf-8") as f:
-                current_config = json.load(f)
-        
-        # Update weights
-        current_config["weights"] = normalized_weights
-        
-        # Save updated config
-        with open(main_config_path, "w", encoding="utf-8") as f:
-            json.dump(current_config, f, indent=2)
-        
-        # Reload configuration
-        from config_loader import load_config as _reload
-        _reload()
-        
-        return {"ok": True, "weights": normalized_weights}
-        
-    except Exception as e:
-        logger.error(f"Weight setting failed: {e}")
-        raise HTTPException(status_code=500, detail="Weight setting failed")
-
-@app.post("/metrics/log-choice")
-async def log_choice(data: dict):
-    """Log user choice for weight tuning analysis"""
-    try:
-        # For MVP, just log to console. In production, this would go to a database
-        logger.info(f"User choice logged: {data}")
-        
-        # You could also save to a simple JSON file for analysis
-        import json
-        import os
-        from datetime import datetime
-        
-        metrics_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "metrics")
-        os.makedirs(metrics_dir, exist_ok=True)
-        
-        metrics_file = os.path.join(metrics_dir, "user_choices.json")
-        
-        # Load existing metrics or create new
-        if os.path.exists(metrics_file):
-            with open(metrics_file, "r", encoding="utf-8") as f:
-                metrics = json.load(f)
-        else:
-            metrics = []
-        
-        # Add timestamp and append
-        data["timestamp"] = datetime.utcnow().isoformat()
-        metrics.append(data)
-        
-        # Keep only last 1000 entries for MVP
-        if len(metrics) > 1000:
-            metrics = metrics[-1000:]
-        
-        # Save updated metrics
-        with open(metrics_file, "w", encoding="utf-8") as f:
-            json.dump(metrics, f, indent=2)
-        
-        return {"ok": True, "logged": True}
-        
-    except Exception as e:
-        logger.error(f"Metrics logging failed: {e}")
-        # Don't fail the request for metrics issues
-
 @app.post("/api/render-one")
-async def render_one_clip(start: float = Form(...), end: float = Form(...)):
-    """Render a single clip from the selected time range"""
+async def render_one_clip(
+    start: float = Form(...), 
+    end: float = Form(...),
+    style: str = Form("bold"),
+    captions: bool = Form(True),
+    punch_ins: bool = Form(True),
+    loop_seam: bool = Form(False)
+):
+    """Render a single clip with enhanced options"""
     try:
         # For MVP, get the most recent episode
         episodes = await episode_service.list_episodes()
@@ -470,31 +314,441 @@ async def render_one_clip(start: float = Form(...), end: float = Form(...)):
         if latest_episode.status != "completed":
             return {"ok": False, "error": "Episode still processing. Please wait."}
         
-        # Generate clip using ClipService
+        # Generate clip using ClipService with enhanced options
         clip_id = str(uuid.uuid4())
         output_filename = f"clip_{clip_id}.mp4"
         
-        # Start rendering in background
+        # Start rendering in background with enhanced options
         background_tasks = BackgroundTasks()
         background_tasks.add_task(
-            clip_service.render_clip,
+            clip_service.render_clip_enhanced,
             clip_id,
             latest_episode.audio_path,
             start,
             end,
-            output_filename
+            output_filename,
+            style=style,
+            captions=captions,
+            punch_ins=punch_ins,
+            loop_seam=loop_seam
         )
         
         return {
             "ok": True,
             "clip_id": clip_id,
             "output": output_filename,
-            "status": "rendering"
+            "status": "rendering",
+            "options": {
+                "style": style,
+                "captions": captions,
+                "punch_ins": punch_ins,
+                "loop_seam": loop_seam
+            }
         }
         
     except Exception as e:
         logger.error(f"Render failed: {e}")
         return {"ok": False, "error": str(e)}
+
+@app.post("/api/create-ab-tests")
+async def create_ab_tests(
+    start: float = Form(...),
+    end: float = Form(...)
+):
+    """Create A/B test versions for hook testing"""
+    try:
+        # Get the most recent episode
+        episodes = await episode_service.list_episodes()
+        if not episodes:
+            return {"ok": False, "error": "No episodes found. Upload a file first."}
+        
+        latest_episode = episodes[-1]
+        if latest_episode.status != "completed":
+            return {"ok": False, "error": "Episode still processing. Please wait."}
+        
+        # Create A/B test versions
+        result = ab_test_service.create_ab_tests(
+            latest_episode.audio_path,
+            latest_episode.transcript,
+            start,
+            end
+        )
+        
+        if result["success"]:
+            return {
+                "ok": True,
+                "ab_tests": result["ab_tests"]
+            }
+        else:
+            return {"ok": False, "error": result.get("error", "A/B test creation failed")}
+        
+    except Exception as e:
+        logger.error(f"A/B test creation failed: {e}")
+        return {"ok": False, "error": str(e)}
+
+@app.post("/api/log-ab-choice")
+async def log_ab_choice(choice_data: Dict):
+    """Log which A/B test version the user chose"""
+    try:
+        result = ab_test_service.log_ab_test_choice(
+            choice_data["test_id"],
+            choice_data["choice"],
+            choice_data["clip_id"]
+        )
+        return {"ok": True, "logged": result["logged"]}
+    except Exception as e:
+        logger.error(f"A/B choice logging failed: {e}")
+        return {"ok": False, "error": str(e)}
+
+@app.get("/api/history")
+async def get_clip_history(limit: int = 50):
+    """Get clip creation history"""
+    try:
+        items = clip_service.list_history(limit=limit)
+        return {"ok": True, "items": items}
+    except Exception as e:
+        logger.error(f"History retrieval failed: {e}")
+        return {"ok": False, "error": str(e)}
+
+@app.post("/api/render-variant")
+async def render_variant(request: Dict):
+    """Render a variant format of an existing clip"""
+    try:
+        clip_id = request.get("clip_id")
+        variant = request.get("variant", "square")
+        style = request.get("style", "bold")
+        captions = request.get("captions", True)
+        
+        if not clip_id:
+            return {"ok": False, "error": "clip_id is required"}
+        
+        result = await clip_service.render_variant(
+            clip_id=clip_id,
+            variant=variant,
+            style=style,
+            captions=captions
+        )
+        
+        if result["success"]:
+            return {"ok": True, **result}
+        else:
+            return {"ok": False, "error": result.get("error", "Variant rendering failed")}
+            
+    except Exception as e:
+        logger.error(f"Variant rendering failed: {e}")
+        return {"ok": False, "error": str(e)}
+
+@app.get("/api/progress")
+async def get_progress():
+    """Get processing progress for the latest episode"""
+    try:
+        episodes = await episode_service.list_episodes()
+        if not episodes:
+            return {"ok": False, "error": "No episodes found"}
+        
+        latest_episode = episodes[-1]
+        
+        if latest_episode.status == "completed":
+            return {"ok": True, "progress": 100, "status": "completed"}
+        elif latest_episode.status == "processing":
+            # Estimate progress based on episode duration and processing time
+            if hasattr(latest_episode, 'duration') and latest_episode.duration:
+                # Rough estimate: assume transcription takes 2-3x real-time
+                estimated_time = latest_episode.duration * 2.5
+                elapsed = (datetime.now() - latest_episode.uploaded_at).total_seconds()
+                progress = min(95, int((elapsed / estimated_time) * 100))
+                return {"ok": True, "progress": progress, "status": "processing"}
+            else:
+                return {"ok": True, "progress": 50, "status": "processing"}
+        else:
+            return {"ok": True, "progress": 0, "status": latest_episode.status}
+            
+    except Exception as e:
+        logger.error(f"Progress check failed: {e}")
+        return {"ok": False, "error": str(e)}
+
+@app.get("/api/candidate/debug")
+async def candidate_debug(
+    file_id: str = Query(..., description="Episode ID to analyze"),
+    start: float = Query(..., description="Start time in seconds"),
+    end: float = Query(..., description="End time in seconds"),
+    platform: str = Query("tiktok_reels", description="Platform for optimization")
+):
+    """
+    Recompute features/score for a single [start,end] to inspect details.
+    """
+    try:
+        from services.secret_sauce import compute_features, score_segment, explain_segment
+        from config_loader import get_config
+        
+        # Get episode
+        episode = await episode_service.get_episode(file_id)
+        if not episode or not episode.transcript:
+            return {"ok": False, "error": "Episode not found or no transcript available"}
+        
+        # Create segment
+        seg = {"start": start, "end": end, "text": ""}
+        
+        # Extract text between timestamps
+        for segment in episode.transcript:
+            if segment.start <= start and segment.end >= end:
+                # Find overlapping text
+                text_parts = []
+                for seg_part in episode.transcript:
+                    if seg_part.start < end and seg_part.end > start:
+                        text_parts.append(seg_part.text)
+                seg["text"] = " ".join(text_parts)
+                break
+        
+        if not seg["text"]:
+            return {"ok": False, "error": "No text found for the specified time range"}
+        
+        # Compute features and score
+        feats = compute_features(seg, episode.audio_path)
+        w = get_config()["weights"]
+        raw = score_segment(feats, w)
+        
+        # Get explanation
+        explanation = explain_segment(feats, w)
+        
+        return {
+            "ok": True,
+            "features": feats,
+            "weights": w,
+            "raw": raw,
+            "explanation": explanation,
+            "text": seg["text"]
+        }
+        
+    except Exception as e:
+        logger.error(f"Candidate debug failed: {e}")
+        return {"ok": False, "error": str(e)}
+
+# Weight sandbox for testing different scoring configurations
+class WeightSandbox(BaseModel):
+    file_id: str
+    start: float
+    end: float
+    platform: str = "tiktok_reels"
+    weights: dict  # partial or full override
+
+@app.post("/api/sandbox/score")
+async def sandbox_score(body: WeightSandbox):
+    """Test different weight configurations on a specific clip segment"""
+    try:
+        from services.secret_sauce import compute_features, score_segment
+        
+        # Get episode
+        episode = await episode_service.get_episode(body.file_id)
+        if not episode or not episode.transcript:
+            return {"ok": False, "error": "Episode not found or no transcript available"}
+        
+        # Create segment
+        seg = {"start": body.start, "end": body.end, "text": ""}
+        
+        # Extract text between timestamps
+        for segment in episode.transcript:
+            if segment.start <= body.start and segment.end >= body.end:
+                # Find overlapping text
+                text_parts = []
+                for seg_part in episode.transcript:
+                    if seg_part.start < body.end and seg_part.end > body.start:
+                        text_parts.append(seg_part.text)
+                seg["text"] = " ".join(text_parts)
+                break
+        
+        if not seg["text"]:
+            return {"ok": False, "error": "No text found for the specified time range"}
+        
+        # Compute features
+        feats = compute_features(seg, episode.audio_path)
+        
+        # Apply custom weights
+        w = get_config()["weights"].copy()
+        w.update(body.weights or {})
+        
+        # Score with custom weights
+        raw = score_segment(feats, w)
+        
+        return {
+            "ok": True, 
+            "raw": raw, 
+            "features": feats, 
+            "weights_used": w,
+            "text": seg["text"]
+        }
+        
+    except Exception as e:
+        logger.error(f"Weight sandbox failed: {e}")
+        return {"ok": False, "error": str(e)}
+
+# Feedback endpoint for user corrections
+class FeedbackData(BaseModel):
+    timestamp: str
+    episode_id: str
+    clip_start: float
+    clip_end: float
+    clip_score: float
+    features: dict
+    synergy_mult: float
+    reason: str
+    user_rating: str
+
+@app.post("/api/feedback/flag-wrong")
+async def flag_wrong_clip(feedback: FeedbackData):
+    """Log user feedback when a clip is flagged as wrong"""
+    try:
+        import json
+        import os
+        from datetime import datetime
+        
+        # Create metrics directory if it doesn't exist
+        metrics_dir = "metrics"
+        os.makedirs(metrics_dir, exist_ok=True)
+        
+        # Load existing feedback or create new
+        feedback_file = os.path.join(metrics_dir, "feedback.json")
+        existing_feedback = []
+        
+        if os.path.exists(feedback_file):
+            try:
+                with open(feedback_file, 'r') as f:
+                    existing_feedback = json.load(f)
+            except json.JSONDecodeError:
+                existing_feedback = []
+        
+        # Add new feedback
+        feedback_entry = {
+            "id": str(uuid.uuid4()),
+            "timestamp": feedback.timestamp,
+            "episode_id": feedback.episode_id,
+            "clip_start": feedback.clip_start,
+            "clip_end": feedback.clip_end,
+            "clip_score": feedback.clip_score,
+            "features": feedback.features,
+            "synergy_mult": feedback.synergy_mult,
+            "reason": feedback.reason,
+            "user_rating": feedback.user_rating,
+            "logged_at": datetime.now().isoformat()
+        }
+        
+        existing_feedback.append(feedback_entry)
+        
+        # Save back to file
+        with open(feedback_file, 'w') as f:
+            json.dump(existing_feedback, f, indent=2)
+        
+        logger.info(f"Feedback logged: {feedback.reason} for clip {feedback.clip_start}-{feedback.clip_end}")
+        
+        return {
+            "ok": True,
+            "message": "Feedback logged successfully",
+            "feedback_id": feedback_entry["id"]
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to log feedback: {e}")
+        return {"ok": False, "error": str(e)}
+
+# Debug Router for Quality Gate Inspection
+from fastapi import APIRouter
+debug_router = APIRouter(prefix="/api/debug")
+
+@debug_router.post("/inspect-clip")
+async def inspect_clip(payload: dict):
+    """Inspect why a clip would pass/fail quality gates"""
+    try:
+        from services.secret_sauce import _hook_score, _ad_penalty, _payoff_presence
+        
+        # Extract payload data
+        text = payload.get("text", "")
+        start = float(payload.get("start", 0))
+        end = float(payload.get("end", start + 20))
+        arousal = float(payload.get("arousal", 0.3))
+        qscore = float(payload.get("question_score", 0.0))
+        
+        # Compute hook score with original detection
+        hook_val = _hook_score(text)
+        
+        # Detect ad content
+        ad_result = _ad_penalty(text)
+        
+        # Compute payoff score
+        payoff_score = _payoff_presence(text)
+        
+        # Check quality gates with new conditional logic
+        payoff = payoff_score
+        arousal = arousal
+        
+        # Conditional hook threshold based on payoff and arousal
+        if payoff >= 0.5 and arousal >= 0.40:
+            hook_threshold = 0.08  # τ_cond for high-quality clips
+        else:
+            hook_threshold = 0.12  # τ for standard clips
+        
+        weak_hook = hook_val < hook_threshold
+        has_early_question = qscore >= 0.50
+        no_payoff = payoff < 0.25
+        ad_like = ad_result["flag"] and (weak_hook or no_payoff)
+        
+        # Determine gate reason with new soft penalty logic
+        gate_reason = None
+        if ad_like:
+            if weak_hook and no_payoff:
+                gate_reason = "ad_like;weak_hook;no_payoff"
+            elif weak_hook:
+                gate_reason = "ad_like;weak_hook"
+            else:
+                gate_reason = "ad_like;no_payoff"
+        elif weak_hook and not has_early_question:
+            gate_reason = "weak_hook_soft"  # Will get penalty, not hard fail
+        elif no_payoff and not has_early_question:
+            gate_reason = "no_payoff"
+        
+        return {
+            "hook_score": round(hook_val, 3),
+            "payoff_score": round(payoff_score, 3),
+            "ad_flag": ad_result["flag"],
+            "ad_penalty": round(ad_result["penalty"], 3),
+            "ad_reason": ad_result["reason"],
+            "question_score": round(qscore, 3),
+            "weak_hook_gate": weak_hook,
+            "no_payoff_gate": no_payoff,
+            "ad_like_gate": ad_like,
+            "gate_reason": gate_reason,
+            "would_pass": gate_reason is None,
+            "note": "question_score>=0.5 bypasses weak_hook and no_payoff gates"
+        }
+        
+    except Exception as e:
+        logger.error(f"Clip inspection failed: {e}")
+        return {"ok": False, "error": str(e)}
+
+# Include debug router
+app.include_router(debug_router)
+
+# Root endpoint
+@app.get("/")
+async def root():
+    """Root endpoint with API information"""
+    return {
+        "message": "PodPromo AI API",
+        "version": "1.0.0",
+        "endpoints": {
+            "health": "/health",
+            "upload": "/api/upload",
+            "candidates": "/api/candidates",
+            "render": "/api/render-one",
+            "ab_tests": "/api/create-ab-tests",
+            "history": "/api/history",
+            "variant": "/api/render-variant",
+            "config": "/config/get",
+            "debug": "/api/candidate/debug",
+            "sandbox": "/api/sandbox/score",
+            "feedback": "/api/feedback/flag-wrong",
+            "inspect": "/api/debug/inspect-clip"
+        }
+    }
 
 if __name__ == "__main__":
     import uvicorn

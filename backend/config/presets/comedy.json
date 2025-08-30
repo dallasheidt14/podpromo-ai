@@ -1,12 +1,13 @@
 {
   "weights": { 
-    "hook": 0.32, 
-    "prosody": 0.24, 
-    "emotion": 0.20, 
+    "hook": 0.30, 
+    "arousal": 0.22, 
+    "emotion": 0.18, 
     "q_or_list": 0.08, 
     "payoff": 0.08, 
     "info": 0.04, 
-    "loop": 0.04 
+    "loop": 0.04,
+    "platform_len": 0.06
   },
   "lexicons": {
     "HOOK_CUES": [

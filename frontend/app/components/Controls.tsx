@@ -3,16 +3,17 @@ import { useEffect, useState } from "react";
 import { API_URL } from "../lib/config";
 
 type Weights = {
-  hook: number; prosody: number; emotion: number; q_or_list: number;
-  payoff: number; info: number; loop: number;
+  hook: number; arousal: number; payoff: number; info: number; 
+  loop: number; q_or_list: number; platform_len: number;
 };
 
 export default function Controls() {
   const [weights, setWeights] = useState<Weights>({
-    hook: 0.35, prosody: 0.20, emotion: 0.15, q_or_list: 0.10,
-    payoff: 0.10, info: 0.05, loop: 0.05
+    hook: 0.35, arousal: 0.20, payoff: 0.15, info: 0.10,
+    loop: 0.08, q_or_list: 0.07, platform_len: 0.05
   });
   const [status, setStatus] = useState("");
+  const [weightsApplied, setWeightsApplied] = useState(false);
 
   useEffect(() => {
     (async () => {
@@ -20,6 +21,17 @@ export default function Controls() {
       const data = await res.json();
       if (data?.ok) setWeights(data.config.weights);
     })();
+    
+    // Listen for candidates update event to reset weights applied flag
+    const handleCandidatesUpdated = () => {
+      setWeightsApplied(false);
+    };
+    
+    window.addEventListener('candidatesUpdated', handleCandidatesUpdated);
+    
+    return () => {
+      window.removeEventListener('candidatesUpdated', handleCandidatesUpdated);
+    };
   }, []);
 
   const setPreset = async (name: string) => {
@@ -33,6 +45,7 @@ export default function Controls() {
     if (data.ok) {
       setWeights(data.weights);
       setStatus(`Preset ${name} active.`);
+      setWeightsApplied(false);
     } else {
       setStatus(`Error: ${data.error || "unknown"}`);
     }
@@ -53,7 +66,8 @@ export default function Controls() {
     const data = await res.json();
     if (data.ok) {
       setWeights(data.weights);
-      setStatus("Weights applied.");
+      setStatus("Weights applied. Click '🔄 Re-score with New Weights' to see changes!");
+      setWeightsApplied(true);
     } else {
       setStatus(`Error: ${data.error || "unknown"}`);
     }
@@ -63,8 +77,12 @@ export default function Controls() {
     setStatus("Reloading config…");
     const res = await fetch(`${API_URL}/config/reload`, { method: "POST" });
     const data = await res.json();
-    if (data.ok) setStatus("Reloaded.");
-    else setStatus("Reload failed.");
+    if (data.ok) {
+      setStatus("Reloaded.");
+      setWeightsApplied(false);
+    } else {
+      setStatus("Reload failed.");
+    }
   };
 
   const slider = (key: keyof Weights, label: string) => (
@@ -81,24 +99,52 @@ export default function Controls() {
     <div style={{border:"1px solid #e5e7eb", padding:12, borderRadius:8, marginTop:12}}>
       <h3>Scoring Controls</h3>
       <div style={{display:"flex", gap:8, flexWrap:"wrap", marginBottom:8}}>
-        <button onClick={()=>setPreset("business")}>Preset: Business</button>
-        <button onClick={()=>setPreset("comedy")}>Preset: Comedy</button>
-        <button onClick={reload}>Reload</button>
+        <button 
+          onClick={()=>setPreset("business")}
+          title="Business: Higher weights on hook, payoff, and structured content. Perfect for professional/business podcasts."
+        >
+          🏢 Business Preset
+        </button>
+        <button 
+          onClick={()=>setPreset("comedy")}
+          title="Comedy: Higher weights on arousal/energy, hook, and payoff. Perfect for entertainment/funny content."
+        >
+          😄 Comedy Preset
+        </button>
+        <button 
+          onClick={reload}
+          title="Reload: Reset to default weights and reload configuration from files."
+        >
+          🔄 Reload
+        </button>
       </div>
       <div style={{display:"grid", gap:6}}>
         {slider("hook","Hook")}
-        {slider("prosody","Prosody")}
-        {slider("emotion","Emotion")}
-        {slider("q_or_list","Question/List")}
+        {slider("arousal","Arousal/Energy")}
         {slider("payoff","Payoff")}
         {slider("info","Info Density")}
         {slider("loop","Loopability")}
+        {slider("q_or_list","Question/List")}
+        {slider("platform_len","Platform Length")}
       </div>
       <div style={{marginTop:8}}>
         <button onClick={applyWeights}>Apply Weights</button>
       </div>
       <div style={{opacity:0.7, marginTop:6}}>{status}</div>
-      <small style={{opacity:0.6}}>Tip: after applying weights, click "Find Candidates" again to see new rankings.</small>
+      {weightsApplied && (
+        <div style={{
+          backgroundColor: "#d4edda",
+          border: "1px solid #c3e6cb",
+          color: "#155724",
+          padding: "8px 12px",
+          borderRadius: 4,
+          marginTop: 8,
+          fontSize: "14px"
+        }}>
+          ✅ Weights updated! Use "🔄 Re-score with New Weights" button above to see your clips re-ranked.
+        </div>
+      )}
+      <small style={{opacity:0.6}}>💡 Tip: After applying weights, click "🔄 Re-score with New Weights" to see clips re-ranked with your new settings!</small>
     </div>
   );
 }

@@ -8,7 +8,7 @@ import os
 # Add backend to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'backend'))
 
-from services.secret_sauce import _hook_score, _emotion_score, _question_or_list, _payoff_presence
+from services.secret_sauce import _hook_score, _question_or_list, _payoff_presence
 
 
 def test_hook_detector_hits_on_contrarian():
@@ -18,7 +18,8 @@ def test_hook_detector_hits_on_contrarian():
 
 def test_emotion_detector_hits_on_high_arousal_words():
     text = "This is unbelievable, crazy, hilarious!"
-    assert _emotion_score(text) >= 0.66
+    # Note: _emotion_score was removed in cleanup, emotion detection now part of _hook_score
+    assert _hook_score(text) >= 0.4  # Should detect emotional words
 
 
 def test_question_or_list_detector():

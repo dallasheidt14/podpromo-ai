@@ -1,13 +1,20 @@
 'use client';
 
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { useDropzone } from 'react-dropzone';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Upload, FileAudio, FileVideo, X, CheckCircle, AlertCircle, Clock } from 'lucide-react';
+import { Upload, FileAudio, FileVideo, X, CheckCircle, AlertCircle, Clock, Loader2 } from 'lucide-react';
 import { Episode } from '../../shared/types';
 
 interface EpisodeUploadProps {
   onEpisodeUploaded: (episode: Episode) => void;
+}
+
+interface ProgressData {
+  stage: string;
+  percentage: number;
+  message: string;
+  timestamp: string;
 }
 
 export default function EpisodeUpload({ onEpisodeUploaded }: EpisodeUploadProps) {
@@ -16,6 +23,49 @@ export default function EpisodeUpload({ onEpisodeUploaded }: EpisodeUploadProps)
   const [uploadProgress, setUploadProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [episode, setEpisode] = useState<Episode | null>(null);
+  const [episodeId, setEpisodeId] = useState<string | null>(null);
+  const [progressData, setProgressData] = useState<ProgressData | null>(null);
+
+  // Poll for progress updates
+  useEffect(() => {
+    if (!episodeId || uploadStatus !== 'processing') return;
+
+    const progressInterval = setInterval(async () => {
+      try {
+        console.log('Polling progress for episode:', episodeId);
+        const response = await fetch(`/api/progress/${episodeId}`);
+        if (response.ok) {
+          const data = await response.json();
+          console.log('Progress response:', data);
+          if (data.ok && data.progress) {
+            setProgressData(data.progress);
+            setUploadProgress(data.progress.percentage);
+            console.log('Updated progress:', data.progress.stage, data.progress.percentage);
+            
+            // Check if processing is complete or failed
+            if (data.progress.stage === 'completed') {
+              console.log('Episode completed successfully');
+              setUploadStatus('completed');
+              if (episode) {
+                episode.status = 'completed';
+                onEpisodeUploaded(episode);
+              }
+            } else if (data.progress.stage === 'error') {
+              console.log('Episode processing failed:', data.progress.message);
+              setUploadStatus('failed');
+              setError(data.progress.message);
+            }
+          }
+        } else {
+          console.log('Progress response not ok:', response.status, response.statusText);
+        }
+      } catch (err) {
+        console.error('Failed to fetch progress:', err);
+      }
+    }, 1000); // Poll every second
+
+    return () => clearInterval(progressInterval);
+  }, [episodeId, uploadStatus, episode, onEpisodeUploaded]);
 
   const onDrop = useCallback(async (acceptedFiles: File[]) => {
     if (acceptedFiles.length === 0) return;
@@ -25,6 +75,7 @@ export default function EpisodeUpload({ onEpisodeUploaded }: EpisodeUploadProps)
     setError(null);
     setUploadStatus('uploading');
     setUploadProgress(0);
+    setProgressData(null);
 
     try {
       // Validate file
@@ -36,17 +87,6 @@ export default function EpisodeUpload({ onEpisodeUploaded }: EpisodeUploadProps)
         throw new Error('File too large. Maximum size is 500MB.');
       }
 
-      // Simulate upload progress
-      const progressInterval = setInterval(() => {
-        setUploadProgress(prev => {
-          if (prev >= 90) {
-            clearInterval(progressInterval);
-            return 90;
-          }
-          return prev + 10;
-        });
-      }, 200);
-
       // Upload file
       const formData = new FormData();
       formData.append('file', file);
@@ -56,21 +96,22 @@ export default function EpisodeUpload({ onEpisodeUploaded }: EpisodeUploadProps)
         body: formData,
       });
 
-      clearInterval(progressInterval);
-
       if (!response.ok) {
         const errorData = await response.json();
         throw new Error(errorData.detail || 'Upload failed');
       }
 
       const uploadResponse = await response.json();
-      setUploadProgress(100);
+      console.log('Upload response:', uploadResponse);
+      setEpisodeId(uploadResponse.episodeId);
+      console.log('Set episode ID:', uploadResponse.episodeId);
+      setUploadProgress(25); // Initial progress after upload
       setUploadStatus('processing');
 
       // Create episode object
       const newEpisode: Episode = {
         id: uploadResponse.episodeId,
-        filename: uploadResponse.filename,
+        filename: uploadResponse.filename || file.name,
         originalName: file.name,
         size: file.size,
         duration: undefined,
@@ -79,14 +120,6 @@ export default function EpisodeUpload({ onEpisodeUploaded }: EpisodeUploadProps)
       };
 
       setEpisode(newEpisode);
-
-      // Simulate processing time
-      setTimeout(() => {
-        setUploadStatus('completed');
-        newEpisode.status = 'completed';
-        newEpisode.duration = Math.random() * 300 + 180; // Random duration between 3-8 minutes
-        onEpisodeUploaded(newEpisode);
-      }, 3000);
 
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Upload failed');
@@ -140,6 +173,30 @@ export default function EpisodeUpload({ onEpisodeUploaded }: EpisodeUploadProps)
     setUploadProgress(0);
     setError(null);
     setEpisode(null);
+    setEpisodeId(null);
+    setProgressData(null);
+  };
+
+  const getProgressColor = (stage: string) => {
+    switch (stage) {
+      case 'uploading': return 'bg-blue-500';
+      case 'converting': return 'bg-yellow-500';
+      case 'transcribing': return 'bg-purple-500';
+      case 'processing': return 'bg-indigo-500';
+      case 'completed': return 'bg-green-500';
+      default: return 'bg-gray-500';
+    }
+  };
+
+  const getProgressIcon = (stage: string) => {
+    switch (stage) {
+      case 'uploading': return <Upload className="w-6 h-6 text-blue-600" />;
+      case 'converting': return <Loader2 className="w-6 h-6 text-yellow-600 animate-spin" />;
+      case 'transcribing': return <Loader2 className="w-6 h-6 text-purple-600 animate-spin" />;
+      case 'processing': return <Loader2 className="w-6 h-6 text-indigo-600 animate-spin" />;
+      case 'completed': return <CheckCircle className="w-6 h-6 text-green-600" />;
+      default: return <Clock className="w-6 h-6 text-gray-600" />;
+    }
   };
 
   return (
@@ -209,15 +266,38 @@ export default function EpisodeUpload({ onEpisodeUploaded }: EpisodeUploadProps)
             className="text-center"
           >
             <div className="w-16 h-16 bg-blue-100 rounded-full flex items-center justify-center mx-auto mb-4">
-              <Clock className="w-8 h-8 text-blue-600 animate-spin" />
+              {getProgressIcon(progressData?.stage || 'processing')}
             </div>
-            <h4 className="text-lg font-medium text-gray-900 mb-2">Processing Episode</h4>
+            <h4 className="text-lg font-medium text-gray-900 mb-2">
+              {progressData?.stage ? progressData.stage.charAt(0).toUpperCase() + progressData.stage.slice(1) : 'Processing Episode'}
+            </h4>
             <p className="text-sm text-gray-600 mb-4">
-              Transcribing audio and analyzing content...
+              {progressData?.message || 'Transcribing audio and analyzing content...'}
             </p>
-            <div className="progress-bar">
-              <div className="progress-fill w-full animate-pulse"></div>
+            
+            {/* Real-time progress bar */}
+            <div className="progress-bar mb-4">
+              <div 
+                className={`progress-fill ${getProgressColor(progressData?.stage || 'processing')}`}
+                style={{ width: `${uploadProgress}%` }}
+              ></div>
             </div>
+            
+            <div className="flex items-center justify-center space-x-2 mb-2">
+              <span className="text-lg font-semibold text-gray-900">{uploadProgress.toFixed(1)}%</span>
+              <span className="text-sm text-gray-500">complete</span>
+            </div>
+            
+            {/* Stage indicator */}
+            {progressData && (
+              <div className="bg-gray-50 rounded-lg p-3 text-sm text-gray-600">
+                <div className="flex items-center space-x-2">
+                  <div className={`w-2 h-2 rounded-full ${getProgressColor(progressData.stage)}`}></div>
+                  <span className="capitalize">{progressData.stage}</span>
+                </div>
+                <p className="mt-1 text-xs text-gray-500">{progressData.message}</p>
+              </div>
+            )}
           </motion.div>
         )}
 

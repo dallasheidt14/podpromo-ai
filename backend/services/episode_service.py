@@ -5,7 +5,7 @@ Episode Service - Manages episode uploads and transcription
 import os
 import logging
 import asyncio
-from typing import List, Optional
+from typing import List, Optional, Dict
 from datetime import datetime
 import whisper
 import aiofiles
@@ -22,8 +22,10 @@ class EpisodeService:
     
     def __init__(self):
         self.episodes: dict = {}  # In-memory storage for MVP
+        self.progress: Dict[str, Dict] = {}  # Progress tracking for each episode
         self.whisper_model = None
         self._init_whisper()
+        self._processing_episodes: set[str] = set() # Track episodes currently being processed
     
     def _init_whisper(self):
         """Initialize Whisper model"""
@@ -34,11 +36,47 @@ class EpisodeService:
             logger.info("Whisper model 'base' loaded successfully")
         except Exception as e:
             logger.error(f"Failed to load Whisper model: {e}")
+            logger.warning("Will attempt to load model on first use")
             self.whisper_model = None
+    
+    def _update_progress(self, episode_id: str, stage: str, percentage: float, message: str = ""):
+        """Update progress for an episode"""
+        if episode_id not in self.progress:
+            self.progress[episode_id] = {}
+        
+        self.progress[episode_id].update({
+            "stage": stage,
+            "percentage": percentage,
+            "message": message,
+            "timestamp": datetime.now().isoformat()
+        })
+        
+        # Log progress with visual indicator like the backend logs
+        progress_bar = "█" * int(percentage / 10) + "▌" * (10 - int(percentage / 10))
+        logger.info(f"Episode {episode_id}: {stage} - {percentage:.1f}%|{progress_bar}| {message}")
+    
+    def get_progress(self, episode_id: str) -> Optional[Dict]:
+        """Get current progress for an episode"""
+        return self.progress.get(episode_id)
     
     async def create_episode(self, episode_id: str, file, original_filename: str) -> Episode:
         """Create a new episode from uploaded file"""
         try:
+            # Check if episode already exists
+            if episode_id in self.episodes:
+                logger.warning(f"Episode {episode_id} already exists, skipping duplicate creation")
+                return self.episodes[episode_id]
+            
+            # Check if we're already processing this episode
+            if episode_id in self._processing_episodes:
+                logger.warning(f"Episode {episode_id} is already being processed, skipping duplicate")
+                return self.episodes.get(episode_id)
+            
+            logger.info(f"Creating new episode {episode_id}: {original_filename}")
+            
+            # Initialize progress tracking
+            self._update_progress(episode_id, "uploading", 0.0, "Starting upload...")
+            
             # Generate unique filename
             file_ext = os.path.splitext(original_filename)[1]
             filename = f"{episode_id}{file_ext}"
@@ -64,11 +102,15 @@ class EpisodeService:
             # Store episode
             self.episodes[episode_id] = episode
             
+            # Update progress
+            self._update_progress(episode_id, "uploaded", 25.0, f"File uploaded ({file_size / 1024 / 1024:.1f} MB)")
+            
             logger.info(f"Created episode {episode_id}: {original_filename}")
             return episode
             
         except Exception as e:
             logger.error(f"Failed to create episode {episode_id}: {e}")
+            self._update_progress(episode_id, "error", 0.0, f"Upload failed: {str(e)}")
             raise
     
     async def get_episode(self, episode_id: str) -> Optional[Episode]:
@@ -86,14 +128,18 @@ class EpisodeService:
     async def process_episode(self, episode_id: str):
         """Process episode: transcribe and analyze"""
         try:
+            # Add to processing guard
+            self._processing_episodes.add(episode_id)
+            
             episode = self.episodes.get(episode_id)
             if not episode:
                 logger.error(f"Episode {episode_id} not found")
                 return
             
-            # Update status
+            # Update status and progress
             episode.status = "processing"
-            episode.uploaded_at = datetime.utcnow()
+            episode.uploaded_at = datetime.now()
+            self._update_progress(episode_id, "processing", 30.0, "Starting audio processing...")
             
             logger.info(f"Processing episode {episode_id}")
             
@@ -101,25 +147,31 @@ class EpisodeService:
             file_path = os.path.join(settings.UPLOAD_DIR, episode.filename)
             
             # Convert to audio if needed
+            self._update_progress(episode_id, "converting", 35.0, "Converting to audio format...")
             audio_path = await self._ensure_audio_format(file_path)
             
             # Store the audio path in the episode
             episode.audio_path = audio_path
+            self._update_progress(episode_id, "converted", 45.0, "Audio conversion completed")
             
             # Get duration
+            self._update_progress(episode_id, "analyzing", 50.0, "Analyzing audio duration...")
             duration = await self._get_audio_duration(audio_path)
             episode.duration = duration
+            self._update_progress(episode_id, "analyzed", 55.0, f"Audio duration: {duration:.1f}s")
             
             # Transcribe audio
-            transcript = await self._transcribe_audio(audio_path)
+            self._update_progress(episode_id, "transcribing", 60.0, "Starting transcription with Whisper...")
+            transcript = await self._transcribe_audio(audio_path, episode_id)
             
             # Store transcript in episode
             episode.transcript = transcript
-            logger.info(f"Transcription completed for {episode_id}: {len(transcript)} segments")
+            self._update_progress(episode_id, "transcribed", 85.0, f"Transcription completed: {len(transcript)} segments")
             
             # Update episode status
             episode.status = "completed"
-            episode.processed_at = datetime.utcnow()
+            episode.processed_at = datetime.now()
+            self._update_progress(episode_id, "completed", 100.0, "Episode processing completed successfully!")
             
             logger.info(f"Episode {episode_id} processing completed")
             
@@ -129,6 +181,10 @@ class EpisodeService:
             if episode:
                 episode.status = "failed"
                 episode.error = str(e)
+                self._update_progress(episode_id, "error", 0.0, f"Processing failed: {str(e)}")
+        finally:
+            # Remove from processing guard
+            self._processing_episodes.discard(episode_id)
     
     async def _ensure_audio_format(self, file_path: str) -> str:
         """Convert file to audio format if needed"""
@@ -168,11 +224,18 @@ class EpisodeService:
             logger.warning(f"Could not determine audio duration: {e}")
             return 300.0  # Default to 5 minutes
     
-    async def _transcribe_audio(self, audio_path: str) -> List[TranscriptSegment]:
-        """Transcribe audio using Whisper"""
+    async def _transcribe_audio(self, audio_path: str, episode_id: str) -> List[TranscriptSegment]:
+        """Transcribe audio using Whisper with progress updates"""
         try:
+            # Lazy load Whisper model if not available
             if not self.whisper_model:
-                raise RuntimeError("Whisper model not available")
+                logger.info("Whisper model not loaded, attempting to load now...")
+                try:
+                    self.whisper_model = whisper.load_model("base")
+                    logger.info("Whisper model loaded successfully")
+                except Exception as load_error:
+                    logger.error(f"Failed to load Whisper model: {load_error}")
+                    raise RuntimeError(f"Whisper model not available: {load_error}")
             
             logger.info(f"Starting transcription for {audio_path}")
             
@@ -180,17 +243,26 @@ class EpisodeService:
             import asyncio
             loop = asyncio.get_event_loop()
             
+            # Update progress to show transcription is running
+            self._update_progress(episode_id, "transcribing", 65.0, "Whisper model processing audio...")
+            
             # Run transcription in thread pool to avoid blocking
             result = await loop.run_in_executor(
                 None, 
                 lambda: self.whisper_model.transcribe(
                     audio_path,
                     language=settings.WHISPER_LANGUAGE,
-                    word_timestamps=True,
+                    word_timestamps=False,  # Disable word timestamps to avoid tensor issues
                     fp16=False,  # Force FP32 to avoid warnings
-                    verbose=False  # Reduce logging
+                    verbose=False,  # Reduce logging
+                    beam_size=1,  # Faster decoding
+                    best_of=1,    # Faster decoding
+                    temperature=0.0  # Deterministic, faster
                 )
             )
+            
+            # Update progress during processing
+            self._update_progress(episode_id, "processing", 75.0, "Processing transcription results...")
             
             # Convert to our format
             transcript = []
@@ -221,7 +293,10 @@ class EpisodeService:
             logger.error(f"Transcription failed: {e}")
             logger.info("Attempting fallback transcription...")
             
-            # Fallback: try without word timestamps
+            # Update progress for fallback
+            self._update_progress(episode_id, "fallback", 70.0, "Primary transcription failed, trying fallback...")
+            
+            # Fallback: try with minimal configuration
             try:
                 result = await loop.run_in_executor(
                     None,
@@ -230,7 +305,10 @@ class EpisodeService:
                         language=settings.WHISPER_LANGUAGE,
                         word_timestamps=False,  # Disable word timestamps
                         fp16=False,
-                        verbose=False
+                        verbose=False,
+                        beam_size=1,
+                        best_of=1,
+                        temperature=0.0
                     )
                 )
                 
@@ -251,19 +329,47 @@ class EpisodeService:
                 
             except Exception as fallback_error:
                 logger.error(f"Fallback transcription also failed: {fallback_error}")
-                raise RuntimeError(f"Transcription failed: {e}. Fallback failed: {fallback_error}")
+                logger.info("Attempting final fallback without language specification...")
+                
+                # Final fallback: try without language specification
+                try:
+                    result = await loop.run_in_executor(
+                        None,
+                        lambda: self.whisper_model.transcribe(
+                            audio_path,
+                            word_timestamps=False,
+                            fp16=False,
+                            verbose=False,
+                            beam_size=1,
+                            best_of=1,
+                            temperature=0.0
+                        )
+                    )
+                    
+                    # Convert to our format (without word-level details)
+                    transcript = []
+                    for segment in result['segments']:
+                        transcript_segment = TranscriptSegment(
+                            start=segment['start'],
+                            end=segment['end'],
+                            text=segment['text'].strip(),
+                            confidence=segment.get('confidence', 0.0),
+                            words=[]  # Empty words list for fallback
+                        )
+                        transcript.append(transcript_segment)
+                    
+                    logger.info(f"Final fallback transcription completed: {len(transcript)} segments")
+                    return transcript
+                    
+                except Exception as final_error:
+                    logger.error(f"Final fallback transcription failed: {final_error}")
+                    raise RuntimeError(f"All transcription methods failed: {e}, {fallback_error}, {final_error}")
     
     def check_storage(self) -> bool:
         """Check if storage is accessible"""
         try:
-            # Check if upload and output directories are writable
-            test_file = os.path.join(settings.UPLOAD_DIR, "test.txt")
-            with open(test_file, 'w') as f:
-                f.write("test")
-            os.remove(test_file)
-            return True
-        except Exception as e:
-            logger.error(f"Storage check failed: {e}")
+            return os.path.exists(settings.UPLOAD_DIR) and os.access(settings.UPLOAD_DIR, os.W_OK)
+        except Exception:
             return False
     
     async def delete_episode(self, episode_id: str) -> bool:
@@ -291,7 +397,7 @@ class EpisodeService:
     async def cleanup_old_episodes(self, max_age_hours: int = 24):
         """Clean up old episodes to save storage"""
         try:
-            current_time = datetime.utcnow()
+            current_time = datetime.now()
             episodes_to_delete = []
             
             for episode_id, episode in self.episodes.items():
