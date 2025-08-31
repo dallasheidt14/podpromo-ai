@@ -13,7 +13,7 @@ import ffmpeg
 from pydub import AudioSegment
 
 from models import Episode, TranscriptSegment
-from config import settings
+from config.settings import *
 
 logger = logging.getLogger(__name__)
 

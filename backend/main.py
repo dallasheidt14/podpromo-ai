@@ -14,18 +14,18 @@ from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from .models import (
+from models import (
     Episode, TranscriptSegment, MomentScore, UploadResponse, 
     HealthCheck, ApiError, RenderRequest
 )
 from pydantic import BaseModel
-from .config_loader import get_config, reload_config, set_weights, load_preset
-from .services.episode_service import EpisodeService
-from .services.clip_score import ClipScoreService
-from .services.clip_service import ClipService
-from .services.caption_service import CaptionService
-from .services.loop_service import LoopService
-from .services.ab_test_service import ABTestService
+from config_loader import get_config, reload_config, set_weights, load_preset
+from services.episode_service import EpisodeService
+from services.clip_score import ClipScoreService
+from services.clip_service import ClipService
+from services.caption_service import CaptionService
+from services.loop_service import LoopService
+from services.ab_test_service import ABTestService
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -60,9 +60,9 @@ loop_service = LoopService()
 ab_test_service = ABTestService()
 
 # Initialize production services
-from .services.file_manager import FileManager
-from .services.queue_manager import QueueManager
-from .services.monitoring import MonitoringService
+from services.file_manager import FileManager
+from services.queue_manager import QueueManager
+from services.monitoring import MonitoringService
 
 # Initialize services as None, will be created in startup event
 file_manager = None
@@ -86,11 +86,8 @@ async def startup_event():
         queue_manager = QueueManager()
         monitoring_service = MonitoringService()
         
-        # Initialize file manager
-        file_manager.initialize_storage()
-        
-        # Start monitoring
-        monitoring_service.start_background_monitoring()
+        # File manager directories are created in __init__
+        # Monitoring service starts automatically in __init__
         
         logger.info("Production services initialized successfully")
     except Exception as e:
@@ -101,7 +98,7 @@ async def startup_event():
 async def shutdown_event():
     """Cleanup production services on shutdown"""
     try:
-        monitoring_service.stop_background_monitoring()
+        # Monitoring service cleanup is handled automatically
         logger.info("Production services shutdown successfully")
     except Exception as e:
         logger.error(f"Failed to shutdown production services: {e}")
