@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 # Database configuration
 DATABASE_URL = os.getenv(
     "DATABASE_URL", 
-    "sqlite:///./podpromo.db"  # Default to SQLite for development
+    "postgresql://postgres:Carter14!@localhost:5432/podpromo_db"  # PostgreSQL with your credentials
 )
 
 # Engine configuration

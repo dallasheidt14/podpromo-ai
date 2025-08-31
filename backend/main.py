@@ -14,18 +14,18 @@ from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from models import (
+from .models import (
     Episode, TranscriptSegment, MomentScore, UploadResponse, 
     HealthCheck, ApiError, RenderRequest
 )
 from pydantic import BaseModel
-from config_loader import get_config, reload_config, set_weights, load_preset
-from services.episode_service import EpisodeService
-from services.clip_score import ClipScoreService
-from services.clip_service import ClipService
-from services.caption_service import CaptionService
-from services.loop_service import LoopService
-from services.ab_test_service import ABTestService
+from .config_loader import get_config, reload_config, set_weights, load_preset
+from .services.episode_service import EpisodeService
+from .services.clip_score import ClipScoreService
+from .services.clip_service import ClipService
+from .services.caption_service import CaptionService
+from .services.loop_service import LoopService
+from .services.ab_test_service import ABTestService
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -58,6 +58,53 @@ clip_service = ClipService(episode_service, clip_score_service)
 caption_service = CaptionService()
 loop_service = LoopService()
 ab_test_service = ABTestService()
+
+# Initialize production services
+from .services.file_manager import FileManager
+from .services.queue_manager import QueueManager
+from .services.monitoring import MonitoringService
+
+# Initialize services as None, will be created in startup event
+file_manager = None
+queue_manager = None
+monitoring_service = None
+
+# Startup event
+@app.on_event("startup")
+async def startup_event():
+    """Initialize production services on startup"""
+    global file_manager, queue_manager, monitoring_service
+    
+    try:
+        # Ensure directories exist
+        os.makedirs("./uploads", exist_ok=True)
+        os.makedirs("./outputs", exist_ok=True)
+        os.makedirs("./logs", exist_ok=True)
+        
+        # Initialize production services
+        file_manager = FileManager()
+        queue_manager = QueueManager()
+        monitoring_service = MonitoringService()
+        
+        # Initialize file manager
+        file_manager.initialize_storage()
+        
+        # Start monitoring
+        monitoring_service.start_background_monitoring()
+        
+        logger.info("Production services initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize production services: {e}")
+
+# Shutdown event
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup production services on shutdown"""
+    try:
+        monitoring_service.stop_background_monitoring()
+        logger.info("Production services shutdown successfully")
+    except Exception as e:
+        logger.error(f"Failed to shutdown production services: {e}")
 
 # Test transcription endpoint
 @app.post("/api/test-transcription")
@@ -127,7 +174,13 @@ async def health_check():
         # Check outputs directory
         outputs_ok = os.path.exists("./outputs") or os.makedirs("./outputs", exist_ok=True)
         
-        status = "healthy" if all([ffmpeg_ok, whisper_ok, storage_ok, outputs_ok]) else "unhealthy"
+        # Check production services (simplified for now)
+        file_manager_ok = file_manager is not None
+        queue_manager_ok = queue_manager is not None
+        monitoring_ok = monitoring_service is not None
+        
+        status = "healthy" if all([ffmpeg_ok, whisper_ok, storage_ok, outputs_ok, 
+                                  file_manager_ok, queue_manager_ok, monitoring_ok]) else "unhealthy"
         
         return HealthCheck(
             status=status,
@@ -136,7 +189,10 @@ async def health_check():
             services={
                 "ffmpeg": ffmpeg_ok,
                 "whisper": whisper_ok,
-                "storage": storage_ok
+                "storage": storage_ok,
+                "file_manager": file_manager_ok,
+                "queue_manager": queue_manager_ok,
+                "monitoring": monitoring_ok
             }
         )
     except Exception as e:
@@ -145,7 +201,14 @@ async def health_check():
             status="unhealthy",
             timestamp=datetime.now(),
             version="1.0.0",
-            services={"ffmpeg": False, "whisper": False, "storage": False}
+            services={
+                "ffmpeg": False, 
+                "whisper": False, 
+                "storage": False,
+                "file_manager": False,
+                "queue_manager": False,
+                "monitoring": False
+            }
         )
 
 # Configuration endpoints
@@ -211,6 +274,64 @@ async def load_preset_endpoint(preset_name: str):
         logger.error(f"Preset loading failed: {e}")
         return {"ok": False, "error": str(e)}
 
+# Production service endpoints
+@app.get("/api/system/status")
+async def get_system_status():
+    """Get detailed system status and metrics"""
+    try:
+        if not all([monitoring_service, queue_manager, file_manager]):
+            return {"ok": False, "error": "Production services not initialized"}
+        
+        # Get basic metrics (non-async)
+        metrics = monitoring_service.get_metrics_summary()
+        
+        # Get queue and file stats (async)
+        queue_status = await queue_manager.get_queue_stats()
+        file_status = await file_manager.get_storage_stats()
+        
+        return {
+            "ok": True,
+            "metrics": metrics,
+            "queue": queue_status,
+            "files": file_status,
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"System status failed: {e}")
+        return {"ok": False, "error": str(e)}
+
+@app.post("/api/system/cleanup")
+async def cleanup_files():
+    """Trigger file cleanup and maintenance"""
+    try:
+        if not file_manager:
+            return {"ok": False, "error": "File manager not initialized"}
+        
+        # Clean up old files
+        cleanup_result = await file_manager.cleanup_old_files()
+        
+        return {
+            "ok": True,
+            "uploads_cleaned": cleanup_result,
+            "message": "Cleanup completed successfully"
+        }
+    except Exception as e:
+        logger.error(f"Cleanup failed: {e}")
+        return {"ok": False, "error": str(e)}
+
+@app.get("/api/system/queue")
+async def get_queue_status():
+    """Get current job queue status"""
+    try:
+        if not queue_manager:
+            return {"ok": False, "error": "Queue manager not initialized"}
+        
+        status = await queue_manager.get_queue_stats()
+        return {"ok": True, "queue": status}
+    except Exception as e:
+        logger.error(f"Queue status failed: {e}")
+        return {"ok": False, "error": str(e)}
+
 # Metrics endpoint
 @app.post("/metrics/log-choice")
 async def log_choice(choice_data: Dict):
@@ -231,17 +352,48 @@ async def upload_episode(file: UploadFile = File(...)):
         if not file.filename:
             raise HTTPException(status_code=400, detail="No file provided")
         
+        # Validate file using FileManager (if available)
+        if file_manager:
+            validation_result = file_manager.validate_upload_file(file)
+            if not validation_result["valid"]:
+                raise HTTPException(status_code=400, detail=validation_result["error"])
+        
         # Create episode and start processing
         episode_id = str(uuid.uuid4())
         episode = await episode_service.create_episode(episode_id, file, file.filename)
         
-        # Start background processing
+        # Add to processing queue (if available)
+        job_id = None
+        if queue_manager:
+            job_id = queue_manager.add_job(
+                job_type="episode_processing",
+                priority="high",
+                data={"episode_id": episode.id}
+            )
+        
+        # Start background processing with queue management
         await episode_service.process_episode(episode.id)
         
-        return {"ok": True, "episodeId": episode.id, "message": "Upload successful and processing started"}
+        # Update queue status (if available)
+        if queue_manager and job_id:
+            queue_manager.update_job_status(job_id, "completed")
+        
+        # Log success to monitoring (if available)
+        if monitoring_service:
+            monitoring_service.record_metric("upload_success", 1)
+        
+        return {
+            "ok": True, 
+            "episodeId": episode.id, 
+            "jobId": job_id,
+            "message": "Upload successful and processing started"
+        }
         
     except Exception as e:
         logger.error(f"Upload failed: {e}")
+        # Log error to monitoring service (if available)
+        if monitoring_service:
+            monitoring_service.record_error("upload_failed", str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/candidates")
@@ -279,6 +431,11 @@ async def get_candidates(
         from services.secret_sauce import resolve_platform
         backend_platform = resolve_platform(platform)
         
+        # Record successful candidate generation (if monitoring available)
+        if monitoring_service:
+            monitoring_service.record_metric("candidates_generated", len(candidates))
+            monitoring_service.record_metric("candidate_generation_success", 1)
+        
         return {
             "ok": True, 
             "candidates": candidates,
@@ -292,6 +449,8 @@ async def get_candidates(
         
     except Exception as e:
         logger.error(f"Failed to get candidates: {e}")
+        if monitoring_service:
+            monitoring_service.record_error("candidates_failed", str(e))
         return {"ok": False, "error": str(e)}
 
 @app.post("/api/render-one")

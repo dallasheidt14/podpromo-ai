@@ -4,102 +4,103 @@ Database models for the podcast clip generation system
 
 from datetime import datetime
 from typing import List, Optional, Dict, Any
-from sqlalchemy import Column, Integer, String, Float, DateTime, Text, Boolean, JSON, ForeignKey
-from sqlalchemy.orm import relationship, declarative_base
-from sqlalchemy.ext.declarative import declarative_base
+# Temporarily disabled for Python 3.13 compatibility
+# from sqlalchemy import Column, Integer, String, Float, DateTime, Text, Boolean, JSON, ForeignKey
+# from sqlalchemy.orm import relationship, declarative_base
+# from sqlalchemy.ext.declarative import declarative_base
 from pydantic import BaseModel, Field
 import uuid
 
 # Import database configuration
-from config.database import Base
+# from config.database import Base
 
 # ============================================================================
-# SQLAlchemy ORM Models (for database persistence)
+# SQLAlchemy ORM Models (for database persistence) - TEMPORARILY DISABLED
 # ============================================================================
 
-class EpisodeDB(Base):
-    """Database model for episodes"""
-    __tablename__ = "episodes"
-    
-    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    filename = Column(String, nullable=False)
-    original_name = Column(String, nullable=False)
-    size = Column(Integer, nullable=False)  # File size in bytes
-    status = Column(String, default="uploading")  # uploading, processing, completed, failed
-    duration = Column(Float, nullable=True)  # Audio duration in seconds
-    audio_path = Column(String, nullable=True)
-    error = Column(Text, nullable=True)
-    uploaded_at = Column(DateTime, default=datetime.utcnow)
-    processed_at = Column(DateTime, nullable=True)
-    
-    # Relationships
-    transcript_segments = relationship("TranscriptSegmentDB", back_populates="episode", cascade="all, delete-orphan")
-    clips = relationship("ClipDB", back_populates="episode", cascade="all, delete-orphan")
-    feedback = relationship("FeedbackDB", back_populates="episode", cascade="all, delete-orphan")
+# class EpisodeDB(Base):
+#     """Database model for episodes"""
+#     __tablename__ = "episodes"
+#     
+#     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+#     filename = Column(String, nullable=False)
+#     original_name = Column(String, nullable=False)
+#     size = Column(Integer, nullable=False)  # File size in bytes
+#     status = Column(String, default="uploading")  # uploading, processing, completed, failed
+#     duration = Column(Float, nullable=True)  # Audio duration in seconds
+#     audio_path = Column(String, nullable=True)
+#     error = Column(Text, nullable=True)
+#     uploaded_at = Column(DateTime, default=datetime.utcnow)
+#     processed_at = Column(DateTime, nullable=True)
+#     
+#     # Relationships
+#     transcript_segments = relationship("TranscriptSegmentDB", back_populates="episode", cascade="all, delete-orphan")
+#     clips = relationship("ClipDB", back_populates="episode", cascade="all, delete-orphan")
+#     feedback = relationship("FeedbackDB", back_populates="episode", cascade="all, delete-orphan")
 
-class TranscriptSegmentDB(Base):
-    """Database model for transcript segments"""
-    __tablename__ = "transcript_segments"
-    
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    episode_id = Column(String, ForeignKey("episodes.id"), nullable=False)
-    start = Column(Float, nullable=False)
-    end = Column(Float, nullable=False)
-    text = Column(Text, nullable=False)
-    confidence = Column(Float, default=0.0)
-    words = Column(JSON, nullable=True)  # Store word-level timing as JSON
-    
-    # Relationships
-    episode = relationship("EpisodeDB", back_populates="transcript_segments")
+# class TranscriptSegmentDB(Base):
+#     """Database model for transcript segments"""
+#     __tablename__ = "transcript_segments"
+#     
+#     id = Column(Integer, primary_key=True, autoincrement=True)
+#     episode_id = Column(String, ForeignKey("episodes.id"), nullable=False)
+#     start = Column(Float, nullable=False)
+#     end = Column(Float, nullable=False)
+#     text = Column(Text, nullable=False)
+#     confidence = Column(Float, default=0.0)
+#     words = Column(JSON, nullable=True)  # Store word-level timing as JSON
+#     
+#     # Relationships
+#     episode = relationship("EpisodeDB", back_populates="transcript_segments")
 
-class ClipDB(Base):
-    """Database model for generated clips"""
-    __tablename__ = "clips"
-    
-    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    episode_id = Column(String, ForeignKey("episodes.id"), nullable=False)
-    start_time = Column(Float, nullable=False)
-    end_time = Column(Float, nullable=False)
-    duration = Column(Float, nullable=False)
-    file_path = Column(String, nullable=True)
-    thumbnail_path = Column(String, nullable=True)
-    score = Column(Float, nullable=False)
-    confidence = Column(String, nullable=True)
-    genre = Column(String, default="general")
-    platform = Column(String, default="tiktok")
-    features = Column(JSON, nullable=True)  # Store computed features
-    created_at = Column(DateTime, default=datetime.utcnow)
-    
-    # Relationships
-    episode = relationship("EpisodeDB", back_populates="clips")
+# class ClipDB(Base):
+#     """Database model for generated clips"""
+#     __tablename__ = "clips"
+#     
+#     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+#     episode_id = Column(String, ForeignKey("episodes.id"), nullable=False)
+#     start_time = Column(Float, nullable=False)
+#     end_time = Column(Float, nullable=False)
+#     duration = Column(Float, nullable=False)
+#     file_path = Column(String, nullable=True)
+#     thumbnail_path = Column(String, nullable=True)
+#     score = Column(Float, nullable=False)
+#     confidence = Column(String, nullable=True)
+#     genre = Column(String, default="general")
+#     platform = Column(String, default="tiktok")
+#     features = Column(JSON, nullable=True)  # Store computed features
+#     created_at = Column(DateTime, default=datetime.utcnow)
+#     
+#     # Relationships
+#     episode = relationship("EpisodeDB", back_populates="clips")
 
-class FeedbackDB(Base):
-    """Database model for user feedback"""
-    __tablename__ = "feedback"
-    
-    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    episode_id = Column(String, ForeignKey("episodes.id"), nullable=False)
-    clip_id = Column(String, ForeignKey("clips.id"), nullable=True)
-    feedback_type = Column(String, nullable=False)  # like, dislike, flag, comment
-    rating = Column(Integer, nullable=True)  # 1-5 scale
-    comment = Column(Text, nullable=True)
-    user_id = Column(String, nullable=True)  # For future authentication
-    created_at = Column(DateTime, default=datetime.utcnow)
-    
-    # Relationships
-    episode = relationship("EpisodeDB", back_populates="feedback")
-    clip = relationship("ClipDB")
+# class FeedbackDB(Base):
+#     """Database model for user feedback"""
+#     __tablename__ = "feedback"
+#     
+#     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+#     episode_id = Column(String, ForeignKey("episodes.id"), nullable=False)
+#     clip_id = Column(String, ForeignKey("clips.id"), nullable=True)
+#     feedback_type = Column(String, nullable=False)  # like, dislike, flag, comment
+#     rating = Column(Integer, nullable=True)  # 1-5 scale
+#     comment = Column(Text, nullable=True)
+#     user_id = Column(String, nullable=True)  # For future authentication
+#     created_at = Column(DateTime, default=datetime.utcnow)
+#     
+#     # Relationships
+#     episode = relationship("EpisodeDB", back_populates="feedback")
+#     clip = relationship("ClipDB")
 
-class UserSessionDB(Base):
-    """Database model for user sessions (future authentication)"""
-    __tablename__ = "user_sessions"
-    
-    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    user_id = Column(String, nullable=False)
-    session_token = Column(String, unique=True, nullable=False)
-    expires_at = Column(DateTime, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    last_activity = Column(DateTime, default=datetime.utcnow)
+# class UserSessionDB(Base):
+#     """Database model for user sessions (future authentication)"""
+#     __tablename__ = "user_sessions"
+#     
+#     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+#     user_id = Column(String, nullable=False)
+#     session_token = Column(String, unique=True, nullable=False)
+#     expires_at = Column(DateTime, nullable=False)
+#     created_at = Column(DateTime, default=datetime.utcnow)
+#     last_activity = Column(DateTime, default=datetime.utcnow)
 
 # ============================================================================
 # Pydantic Models (for API requests/responses)
@@ -117,6 +118,24 @@ class Episode(BaseModel):
     error: Optional[str] = None
     uploaded_at: Optional[datetime] = None
     processed_at: Optional[datetime] = None
+    
+    class Config:
+        from_attributes = True
+
+class AudioFeatures(BaseModel):
+    """Audio features for scoring"""
+    duration: float
+    energy: float
+    tempo: float
+    loudness: float
+    speech_rate: float
+    silence_ratio: float
+    dynamic_range: float
+    spectral_centroid: float
+    spectral_rolloff: float
+    zero_crossing_rate: float
+    mfcc_features: List[float]
+    chroma_features: List[float]
     
     class Config:
         from_attributes = True
@@ -178,5 +197,49 @@ class CandidatesResponse(BaseModel):
     ok: bool
     candidates: List[ClipCandidate]
     error: Optional[str] = None
+
+class ApiError(BaseModel):
+    """API error response"""
+    error: str
+    detail: Optional[str] = None
+
+class RenderRequest(BaseModel):
+    """Request for enhanced clip rendering"""
+    clip_id: str
+    style: str = "bold"         # bold, clean, caption-heavy
+    captions: bool = True
+    punch_ins: bool = True
+    loop_seam: bool = False
+
+class Clip(BaseModel):
+    """Generated clip model"""
+    id: str
+    episode_id: str
+    start_time: float
+    end_time: float
+    duration: float
+    score: float
+    title: str
+    description: str
+    status: str
+    output_path: Optional[str] = None
+    download_url: Optional[str] = None
+    created_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    error: Optional[str] = None
+
+class ClipGenerationRequest(BaseModel):
+    """Request for clip generation"""
+    episode_id: str
+    target_count: int = 3
+    min_duration: int = 12
+    max_duration: int = 30
+
+class ClipGenerationResponse(BaseModel):
+    """Response for clip generation"""
+    jobId: str
+    status: str
+    clips: List[Clip]
+    estimatedTime: int
 
 
