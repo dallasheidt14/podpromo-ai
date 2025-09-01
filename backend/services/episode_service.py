@@ -13,7 +13,7 @@ import ffmpeg
 from pydub import AudioSegment
 
 from models import Episode, TranscriptSegment
-from config.settings import *
+from config.settings import UPLOAD_DIR, OUTPUT_DIR, SAMPLE_RATE, WHISPER_LANGUAGE, MAX_FILE_SIZE, ALLOWED_EXTENSIONS
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +80,7 @@ class EpisodeService:
             # Generate unique filename
             file_ext = os.path.splitext(original_filename)[1]
             filename = f"{episode_id}{file_ext}"
-            file_path = os.path.join(settings.UPLOAD_DIR, filename)
+            file_path = os.path.join(UPLOAD_DIR, filename)
             
             # Save uploaded file
             async with aiofiles.open(file_path, 'wb') as f:
@@ -144,7 +144,7 @@ class EpisodeService:
             logger.info(f"Processing episode {episode_id}")
             
             # Get file path
-            file_path = os.path.join(settings.UPLOAD_DIR, episode.filename)
+            file_path = os.path.join(UPLOAD_DIR, episode.filename)
             
             # Convert to audio if needed
             self._update_progress(episode_id, "converting", 35.0, "Converting to audio format...")
@@ -203,7 +203,7 @@ class EpisodeService:
                 
                 # Use ffmpeg to extract audio
                 stream = ffmpeg.input(file_path)
-                stream = ffmpeg.output(stream, audio_path, acodec='pcm_s16le', ar=settings.SAMPLE_RATE)
+                stream = ffmpeg.output(stream, audio_path, acodec='pcm_s16le', ar=SAMPLE_RATE)
                 ffmpeg.run(stream, overwrite_output=True, quiet=True)
                 
                 return audio_path
@@ -258,7 +258,7 @@ class EpisodeService:
                 None, 
                 lambda: self.whisper_model.transcribe(
                     audio_path,
-                    language=settings.WHISPER_LANGUAGE,
+                    language=WHISPER_LANGUAGE,
                     word_timestamps=False,  # Disable word timestamps to avoid tensor issues
                     fp16=False,  # Force FP32 to avoid warnings
                     verbose=False,  # Reduce logging
@@ -315,7 +315,7 @@ class EpisodeService:
                     None,
                     lambda: self.whisper_model.transcribe(
                         audio_path,
-                        language=settings.WHISPER_LANGUAGE,
+                        language=WHISPER_LANGUAGE,
                         word_timestamps=False,  # Disable word timestamps
                         fp16=False,
                         verbose=False,
@@ -387,7 +387,7 @@ class EpisodeService:
     def check_storage(self) -> bool:
         """Check if storage is accessible"""
         try:
-            return os.path.exists(settings.UPLOAD_DIR) and os.access(settings.UPLOAD_DIR, os.W_OK)
+            return os.path.exists(UPLOAD_DIR) and os.access(UPLOAD_DIR, os.W_OK)
         except Exception:
             return False
     
@@ -399,7 +399,7 @@ class EpisodeService:
                 return False
             
             # Remove files
-            file_path = os.path.join(settings.UPLOAD_DIR, episode.filename)
+            file_path = os.path.join(UPLOAD_DIR, episode.filename)
             if os.path.exists(file_path):
                 os.remove(file_path)
             

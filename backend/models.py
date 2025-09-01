@@ -106,21 +106,17 @@ import uuid
 # Pydantic Models (for API requests/responses)
 # ============================================================================
 
-class Episode(BaseModel):
-    """Pydantic model for episode API responses"""
-    id: str
-    filename: str
-    original_name: str
-    size: int
-    status: str
-    duration: Optional[float] = None
-    audio_path: Optional[str] = None
-    error: Optional[str] = None
-    uploaded_at: Optional[datetime] = None
-    processed_at: Optional[datetime] = None
+class TranscriptSegment(BaseModel):
+    """Pydantic model for transcript segments"""
+    start: float
+    end: float
+    text: str
+    confidence: float = 0.0
+    words: Optional[List[Dict[str, Any]]] = None
     
-    class Config:
-        from_attributes = True
+    model_config = {
+        "from_attributes": True
+    }
 
 class AudioFeatures(BaseModel):
     """Audio features for scoring"""
@@ -137,19 +133,28 @@ class AudioFeatures(BaseModel):
     mfcc_features: List[float]
     chroma_features: List[float]
     
-    class Config:
-        from_attributes = True
+    model_config = {
+        "from_attributes": True
+    }
 
-class TranscriptSegment(BaseModel):
-    """Pydantic model for transcript segments"""
-    start: float
-    end: float
-    text: str
-    confidence: float = 0.0
-    words: Optional[List[Dict[str, Any]]] = None
+class Episode(BaseModel):
+    """Pydantic model for episode API responses"""
+    id: str
+    filename: str
+    original_name: str
+    size: int
+    status: str
+    duration: Optional[float] = None
+    audio_path: Optional[str] = None
+    transcript: Optional[List[TranscriptSegment]] = None
+    error: Optional[str] = None
+    uploaded_at: Optional[datetime] = None
+    processed_at: Optional[datetime] = None
     
-    class Config:
-        from_attributes = True
+    model_config = {
+        "from_attributes": True,
+        "frozen": False  # Allow mutation of fields after creation
+    }
 
 class MomentScore(BaseModel):
     """Pydantic model for moment scoring"""
@@ -176,8 +181,9 @@ class ClipCandidate(BaseModel):
     platform: str = "tiktok"
     features: Dict[str, Any] = {}
     
-    class Config:
-        from_attributes = True
+    model_config = {
+        "from_attributes": True
+    }
 
 class HealthCheck(BaseModel):
     """Pydantic model for health check responses"""
@@ -241,5 +247,67 @@ class ClipGenerationResponse(BaseModel):
     status: str
     clips: List[Clip]
     estimatedTime: int
+
+# User Authentication Models
+class UserSignup(BaseModel):
+    email: str = Field(..., description="User email address")
+    password: str = Field(..., description="User password")
+    name: str = Field(..., description="User full name")
+
+class UserLogin(BaseModel):
+    email: str = Field(..., description="User email address")
+    password: str = Field(..., description="User password")
+
+class UserProfile(BaseModel):
+    id: str = Field(..., description="User ID")
+    email: str = Field(..., description="User email")
+    name: str = Field(..., description="User full name")
+    plan: str = Field(..., description="Current plan (free/pro)")
+    subscription_id: Optional[str] = Field(None, description="Paddle subscription ID")
+    status: str = Field(..., description="Account status")
+    created_at: str = Field(..., description="Account creation date")
+    updated_at: str = Field(..., description="Last update date")
+
+# Membership Models
+class MembershipPlan(BaseModel):
+    id: str = Field(..., description="Plan ID")
+    name: str = Field(..., description="Plan name")
+    price: float = Field(..., description="Monthly price in USD")
+    billing: str = Field(..., description="Billing interval")
+    features: List[str] = Field(..., description="Plan features")
+    description: str = Field(..., description="Plan description")
+
+class UserMembership(BaseModel):
+    user_id: str = Field(..., description="User ID")
+    plan: str = Field(..., description="Plan type (free/pro)")
+    subscription_id: Optional[str] = Field(None, description="Paddle subscription ID")
+    status: str = Field(..., description="Membership status")
+    start_date: str = Field(..., description="Membership start date")
+    end_date: Optional[str] = Field(None, description="Membership end date")
+
+# Paddle Integration Models
+class PaddleCheckout(BaseModel):
+    user_id: str = Field(..., description="User ID")
+    plan: str = Field(..., description="Plan type (free/pro)")
+
+class PaddleWebhook(BaseModel):
+    event_type: str = Field(..., description="Webhook event type")
+    data: Dict[str, Any] = Field(..., description="Webhook data payload")
+
+# Usage Tracking Models
+class UsageLog(BaseModel):
+    id: str = Field(..., description="Usage log ID")
+    user_id: str = Field(..., description="User ID")
+    action: str = Field(..., description="Action performed")
+    details: Dict[str, Any] = Field(default_factory=dict, description="Action details")
+    created_at: str = Field(..., description="Action timestamp")
+
+class UsageSummary(BaseModel):
+    user_id: str = Field(..., description="User ID")
+    plan: str = Field(..., description="Current plan")
+    current_month: Dict[str, int] = Field(..., description="Current month usage")
+    limits: Dict[str, Any] = Field(..., description="Plan limits")
+    can_upload: bool = Field(..., description="Whether user can upload")
+    remaining_uploads: Optional[int] = Field(None, description="Remaining uploads (free plan only)")
 
 

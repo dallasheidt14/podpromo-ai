@@ -9,14 +9,15 @@ import logging
 from datetime import datetime
 from typing import List, Dict, Optional
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Form, Query
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Form, Query, Request
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from models import (
     Episode, TranscriptSegment, MomentScore, UploadResponse, 
-    HealthCheck, ApiError, RenderRequest
+    HealthCheck, ApiError, RenderRequest, UserSignup, UserLogin, 
+    PaddleCheckout
 )
 from pydantic import BaseModel
 from config_loader import get_config, reload_config, set_weights, load_preset
@@ -63,17 +64,22 @@ ab_test_service = ABTestService()
 from services.file_manager import FileManager
 from services.queue_manager import QueueManager
 from services.monitoring import MonitoringService
+from services.auth_service import AuthService
+from services.paddle_service import PaddleService
+from config.settings import UPLOAD_DIR, OUTPUT_DIR
 
 # Initialize services as None, will be created in startup event
 file_manager = None
 queue_manager = None
 monitoring_service = None
+auth_service = None
+paddle_service = None
 
 # Startup event
 @app.on_event("startup")
 async def startup_event():
     """Initialize production services on startup"""
-    global file_manager, queue_manager, monitoring_service
+    global file_manager, queue_manager, monitoring_service, auth_service, paddle_service
     
     try:
         # Ensure directories exist
@@ -85,6 +91,37 @@ async def startup_event():
         file_manager = FileManager()
         queue_manager = QueueManager()
         monitoring_service = MonitoringService()
+        
+        # Register job handlers for queue manager
+        async def episode_processing_handler(job):
+            """Handle episode processing jobs"""
+            try:
+                episode_id = job.metadata.get("episode_id")
+                if episode_id:
+                    logger.info(f"Processing episode {episode_id} from queue")
+                    await episode_service.process_episode(episode_id)
+                    return {"status": "completed", "episode_id": episode_id}
+                else:
+                    raise ValueError("No episode_id in job metadata")
+            except Exception as e:
+                logger.error(f"Episode processing job failed: {e}")
+                raise
+        
+        queue_manager.register_handler("episode_processing", episode_processing_handler)
+        logger.info("Registered episode_processing job handler")
+        
+        # Initialize authentication and payment services
+        supabase_url = os.getenv("SUPABASE_URL")
+        supabase_key = os.getenv("SUPABASE_KEY")
+        
+        if supabase_url and supabase_key:
+            auth_service = AuthService(supabase_url, supabase_key)
+            paddle_service = PaddleService(auth_service)
+            logger.info("Authentication and payment services initialized successfully")
+        else:
+            logger.warning("Supabase credentials not found, auth services disabled")
+            auth_service = None
+            paddle_service = None
         
         # File manager directories are created in __init__
         # Monitoring service starts automatically in __init__
@@ -351,7 +388,23 @@ async def upload_episode(file: UploadFile = File(...)):
         
         # Validate file using FileManager (if available)
         if file_manager:
-            validation_result = file_manager.validate_upload_file(file)
+            # Get file size from content length or read file
+            file_size = 0
+            try:
+                # Try to get size from content length header
+                if hasattr(file, 'size') and file.size:
+                    file_size = file.size
+                else:
+                    # Read file to get size
+                    content = await file.read()
+                    file_size = len(content)
+                    # Reset file position for later processing
+                    await file.seek(0)
+            except Exception as e:
+                logger.warning(f"Could not determine file size: {e}")
+                file_size = 0
+            
+            validation_result = await file_manager.validate_upload(file.filename, file_size)
             if not validation_result["valid"]:
                 raise HTTPException(status_code=400, detail=validation_result["error"])
         
@@ -362,18 +415,17 @@ async def upload_episode(file: UploadFile = File(...)):
         # Add to processing queue (if available)
         job_id = None
         if queue_manager:
-            job_id = queue_manager.add_job(
+            from services.queue_manager import JobPriority
+            job_id = await queue_manager.submit_job(
                 job_type="episode_processing",
-                priority="high",
-                data={"episode_id": episode.id}
+                priority=JobPriority.HIGH,
+                metadata={"episode_id": episode.id}
             )
-        
-        # Start background processing with queue management
-        await episode_service.process_episode(episode.id)
-        
-        # Update queue status (if available)
-        if queue_manager and job_id:
-            queue_manager.update_job_status(job_id, "completed")
+            logger.info(f"Episode {episode.id} queued for processing with job ID: {job_id}")
+        else:
+            # Fallback: process directly if queue manager not available
+            logger.warning("Queue manager not available, processing episode directly")
+            await episode_service.process_episode(episode.id)
         
         # Log success to monitoring (if available)
         if monitoring_service:
@@ -395,7 +447,6 @@ async def upload_episode(file: UploadFile = File(...)):
 
 @app.get("/api/candidates")
 async def get_candidates(
-    platform: str = Query("tiktok_reels", description="Platform for optimization (tiktok_reels, shorts, linkedin_sq)"),
     genre: str | None = Query(None, description="Genre for optimization (comedy, fantasy_sports, sports, true_crime, business, news_politics, education, health_wellness)"),
     debug: bool = Query(False, description="Enable debug mode for detailed candidate information")
 ):
@@ -415,9 +466,41 @@ async def get_candidates(
             return {"ok": False, "error": "Episode still processing. Please wait."}
         
         # Get candidates using ClipScore with platform/genre optimization
+        # Auto-recommend the best platform based on content analysis
+        from services.secret_sauce import find_viral_clips, PLATFORM_GENRE_MULTIPLIERS
+        
+        # Analyze content to recommend best platform
+        recommended_platform = "tiktok"  # Default fallback
+        
+        if genre and genre in ["comedy", "entertainment"]:
+            # Comedy works best on TikTok
+            recommended_platform = "tiktok"
+        elif genre and genre in ["education", "business"]:
+            # Educational/business content works better on YouTube Shorts
+            recommended_platform = "youtube_shorts"
+        elif genre and genre in ["fantasy_sports", "sports"]:
+            # Sports content works better on YouTube Shorts (longer format)
+            recommended_platform = "youtube_shorts"
+        elif genre and genre in ["true_crime", "news_politics"]:
+            # True crime/news works well on both, but slightly better on TikTok
+            recommended_platform = "tiktok"
+        else:
+            # For auto-detected or unknown genres, analyze content characteristics
+            # This is a simplified version - in production you'd analyze actual content
+            recommended_platform = "youtube_shorts"  # Safer default for most content
+        
+        # Map to frontend platform name
+        platform_mapping = {
+            "tiktok": "tiktok_reels",
+            "youtube_shorts": "shorts", 
+            "linkedin": "linkedin_sq"
+        }
+        frontend_platform = platform_mapping.get(recommended_platform, "tiktok_reels")
+        
+        # Get candidates using the auto-recommended platform
         candidates = await clip_score_service.get_candidates(
             latest_episode.id, 
-            platform=platform, 
+            platform=frontend_platform, 
             genre=genre
         )
         
@@ -426,7 +509,7 @@ async def get_candidates(
         
         # Add platform mapping info to response
         from services.secret_sauce import resolve_platform
-        backend_platform = resolve_platform(platform)
+        backend_platform = resolve_platform(frontend_platform)
         
         # Record successful candidate generation (if monitoring available)
         if monitoring_service:
@@ -437,10 +520,10 @@ async def get_candidates(
             "ok": True, 
             "candidates": candidates,
             "optimization": {
-                "frontend_platform": platform,
+                "recommended_platform": frontend_platform,
                 "frontend_genre": genre,
                 "backend_platform": backend_platform,
-                "description": f"Optimized for {platform}" + (f" in {genre} genre" if genre else "")
+                "description": f"Auto-recommended {frontend_platform.replace('_', ' ')}" + (f" for {genre.replace('_', ' ')} content" if genre else " based on content analysis")
             }
         }
         
@@ -604,23 +687,79 @@ async def get_progress():
         
         latest_episode = episodes[-1]
         
+        # Get actual progress from episode service
+        progress_data = episode_service.get_progress(latest_episode.id)
+        
+        # Debug logging
+        logger.info(f"Episode {latest_episode.id} status: {latest_episode.status}")
+        logger.info(f"Progress data: {progress_data}")
+        
         if latest_episode.status == "completed":
-            return {"ok": True, "progress": 100, "status": "completed"}
+            # Force progress to 100% for completed episodes, regardless of stored progress data
+            return {"ok": True, "progress": 100, "status": "completed", "message": "Processing completed"}
+        elif latest_episode.status == "processing" and progress_data:
+            # Use actual progress from episode service
+            return {
+                "ok": True, 
+                "progress": progress_data.get("percentage", 50), 
+                "status": "processing",
+                "stage": progress_data.get("stage", "processing"),
+                "message": progress_data.get("message", "Processing...")
+            }
         elif latest_episode.status == "processing":
-            # Estimate progress based on episode duration and processing time
-            if hasattr(latest_episode, 'duration') and latest_episode.duration:
-                # Rough estimate: assume transcription takes 2-3x real-time
-                estimated_time = latest_episode.duration * 2.5
+            # Fallback: estimate progress based on time
+            if hasattr(latest_episode, 'uploaded_at') and latest_episode.uploaded_at:
                 elapsed = (datetime.now() - latest_episode.uploaded_at).total_seconds()
-                progress = min(95, int((elapsed / estimated_time) * 100))
-                return {"ok": True, "progress": progress, "status": "processing"}
+                # Conservative estimate: assume 1-2 minutes for processing
+                estimated_time = 120  # 2 minutes
+                progress = min(90, int((elapsed / estimated_time) * 90))
+                return {"ok": True, "progress": progress, "status": "processing", "message": "Processing audio..."}
             else:
-                return {"ok": True, "progress": 50, "status": "processing"}
+                return {"ok": True, "progress": 25, "status": "processing", "message": "Starting processing..."}
         else:
-            return {"ok": True, "progress": 0, "status": latest_episode.status}
+            return {"ok": True, "progress": 0, "status": latest_episode.status, "message": "Ready to process"}
             
     except Exception as e:
         logger.error(f"Progress check failed: {e}")
+        return {"ok": False, "error": str(e)}
+
+@app.get("/api/progress/{episode_id}")
+async def get_episode_progress(episode_id: str):
+    """Get processing progress for a specific episode"""
+    try:
+        episode = await episode_service.get_episode(episode_id)
+        if not episode:
+            return {"ok": False, "error": "Episode not found"}
+        
+        # Get actual progress from episode service
+        progress_data = episode_service.get_progress(episode_id)
+        
+        if episode.status == "completed":
+            return {"ok": True, "progress": 100, "status": "completed", "message": "Processing completed"}
+        elif episode.status == "processing" and progress_data:
+            # Use actual progress from episode service
+            return {
+                "ok": True, 
+                "progress": progress_data.get("percentage", 50), 
+                "status": "processing",
+                "stage": progress_data.get("stage", "processing"),
+                "message": progress_data.get("message", "Processing...")
+            }
+        elif episode.status == "processing":
+            # Fallback: estimate progress based on time
+            if hasattr(episode, 'uploaded_at') and episode.uploaded_at:
+                elapsed = (datetime.now() - episode.uploaded_at).total_seconds()
+                # Conservative estimate: assume 1-2 minutes for processing
+                estimated_time = 120  # 2 minutes
+                progress = min(90, int((elapsed / estimated_time) * 90))
+                return {"ok": True, "progress": progress, "message": "Processing audio..."}
+            else:
+                return {"ok": True, "progress": 25, "message": "Starting processing..."}
+        else:
+            return {"ok": True, "progress": 0, "status": episode.status, "message": "Ready to process"}
+            
+    except Exception as e:
+        logger.error(f"Episode progress check failed: {e}")
         return {"ok": False, "error": str(e)}
 
 @app.get("/api/candidate/debug")
@@ -883,6 +1022,106 @@ async def inspect_clip(payload: dict):
 # Include debug router
 app.include_router(debug_router)
 
+# Authentication Endpoints
+@app.post("/api/auth/signup")
+async def signup(user_data: UserSignup):
+    """User signup endpoint"""
+    try:
+        result = await auth_service.signup_user(user_data)
+        return result
+    except Exception as e:
+        logger.error(f"Signup failed: {e}")
+        return {"success": False, "error": str(e)}
+
+@app.post("/api/auth/login")
+async def login(credentials: UserLogin):
+    """User login endpoint"""
+    try:
+        result = await auth_service.login_user(credentials)
+        return result
+    except Exception as e:
+        logger.error(f"Login failed: {e}")
+        return {"success": False, "error": str(e)}
+
+@app.get("/api/auth/profile")
+async def get_profile(user_id: str):
+    """Get user profile and membership"""
+    try:
+        profile = await auth_service.get_user_profile(user_id)
+        membership = await auth_service.get_user_membership(user_id)
+        return {
+            "success": True,
+            "profile": profile,
+            "membership": membership
+        }
+    except Exception as e:
+        logger.error(f"Failed to get profile: {e}")
+        return {"success": False, "error": str(e)}
+
+# Paddle Payment Endpoints
+@app.get("/api/paddle/plans")
+async def get_plans():
+    """Get available subscription plans"""
+    try:
+        plans = paddle_service.get_available_plans()
+        return {"success": True, "plans": plans}
+    except Exception as e:
+        logger.error(f"Failed to get plans: {e}")
+        return {"success": False, "error": str(e)}
+
+@app.post("/api/paddle/checkout")
+async def create_checkout(checkout_data: PaddleCheckout):
+    """Generate Paddle checkout URL"""
+    try:
+        checkout_url = paddle_service.get_checkout_url(
+            checkout_data.product_id, 
+            checkout_data.user_email
+        )
+        return {
+            "success": True,
+            "checkout_url": checkout_url,
+            "plan_type": checkout_data.plan_type
+        }
+    except Exception as e:
+        logger.error(f"Failed to create checkout: {e}")
+        return {"success": False, "error": str(e)}
+
+@app.post("/api/paddle/webhook")
+async def paddle_webhook(request: Request):
+    """Handle Paddle webhook events"""
+    try:
+        # Get webhook data
+        webhook_data = await request.json()
+        
+        # Process webhook
+        result = await paddle_service.process_webhook(webhook_data)
+        
+        return result
+    except Exception as e:
+        logger.error(f"Webhook processing failed: {e}")
+        return {"status": "error", "error": str(e)}
+
+# Usage Tracking Endpoints
+@app.get("/api/usage/summary/{user_id}")
+async def get_usage_summary(user_id: str):
+    """Get user usage summary"""
+    try:
+        # Get current usage vs limits
+        membership = await auth_service.get_user_membership(user_id)
+        if not membership:
+            return {"success": False, "error": "No active membership"}
+        
+        # Check usage for current month
+        usage_check = await auth_service.check_usage_limits(user_id, "upload")
+        
+        return {
+            "success": True,
+            "usage": usage_check
+        }
+    except Exception as e:
+        logger.error(f"Failed to get usage summary: {e}")
+        return {"success": False, "error": str(e)}
+
 # Root endpoint
 @app.get("/")
 async def root():
@@ -902,7 +1141,18 @@ async def root():
             "debug": "/api/candidate/debug",
             "sandbox": "/api/sandbox/score",
             "feedback": "/api/feedback/flag-wrong",
-            "inspect": "/api/debug/inspect-clip"
+            "inspect": "/api/debug/inspect-clip",
+            "auth": {
+                "signup": "/api/auth/signup",
+                "login": "/api/auth/login",
+                "profile": "/api/auth/profile"
+            },
+            "paddle": {
+                "plans": "/api/paddle/plans",
+                "checkout": "/api/paddle/checkout",
+                "webhook": "/api/paddle/webhook"
+            },
+            "usage": "/api/usage/summary/{user_id}"
         }
     }
 

@@ -8,7 +8,7 @@ import logging
 import re
 from typing import List, Dict
 from models import AudioFeatures, TranscriptSegment, MomentScore
-from config import settings
+from config.settings import UPLOAD_DIR, OUTPUT_DIR, MAX_FILE_SIZE, ALLOWED_EXTENSIONS
 
 from services.secret_sauce import compute_features_v4, score_segment_v4, explain_segment_v4, viral_potential_v4, get_clip_weights
 from services.viral_moment_detector import ViralMomentDetector
@@ -31,7 +31,7 @@ class ClipScoreService:
             logger.info(f"Starting episode analysis for {audio_path}")
             
             # Convert transcript to segments for ranking using improved moment detection
-            segments = self._transcript_to_segments(transcript, genre='general')
+            segments = self._transcript_to_segments(transcript, genre='general', platform='tiktok')
             
             # Rank candidates using secret sauce V4 with genre awareness
             ranked_segments = self.rank_candidates(segments, audio_path, top_k=10, platform='tiktok', genre='general')
@@ -342,7 +342,7 @@ class ClipScoreService:
         # If we didn't find enough topic-based segments, fall back to the original method
         if len(segments) < 3:  # Lowered threshold from 5 to 3
             logger.info("Topic-based segmentation produced too few segments, falling back to window-based approach")
-            return self._transcript_to_segments(transcript)
+            return self._transcript_to_segments(transcript, platform='tiktok')
         
         logger.info(f"Created {len(segments)} topic-based segments")
         return segments
@@ -434,8 +434,8 @@ class ClipScoreService:
         
         return True
 
-    def _transcript_to_segments(self, transcript: List[TranscriptSegment], genre: str = 'general') -> List[Dict]:
-        """Use moment detection for segmentation"""
+    def _transcript_to_segments(self, transcript: List[TranscriptSegment], genre: str = 'general', platform: str = 'tiktok') -> List[Dict]:
+        """Use dynamic segmentation with moment detection for segmentation"""
         try:
             # Convert TranscriptSegment objects to dicts
             transcript_dicts = []
@@ -449,30 +449,23 @@ class ClipScoreService:
                 else:
                     transcript_dicts.append(seg)
             
-            # Try moment detection first
-            detector = ViralMomentDetector(genre=genre)
-            moments = detector.find_moments(transcript_dicts)
+            # Apply dynamic segmentation first
+            from services.secret_sauce import create_dynamic_segments, split_mixed_segments
             
-            if len(moments) >= 3:
-                logger.info(f"Using {len(moments)} detected moments")
-                # Convert moments back to expected format
-                segments = []
-                for moment in moments:
-                    segments.append({
-                        "start": moment["start"],
-                        "end": moment["end"],
-                        "text": moment["text"],
-                        "type": moment.get("type", "general"),
-                        "confidence": moment.get("confidence", 0.5)
-                    })
-                return segments
+            # Split mixed segments to separate intro from good content
+            split_segments = split_mixed_segments(transcript_dicts)
             
-            # Fall back to window-based with larger steps to reduce overlaps
-            logger.info("Insufficient moments found, using window-based segmentation")
-            return self._window_based_segments(transcript_dicts, window=25, step=15)
+            # Create dynamic segments based on natural boundaries and platform optimization
+            dynamic_segments = create_dynamic_segments(split_segments, platform)
+            
+            logger.info(f"Created {len(dynamic_segments)} dynamic segments for {platform}")
+            
+            # Use dynamic segments directly (moment detection disabled for better results)
+            logger.info(f"Using {len(dynamic_segments)} dynamic segments with natural boundaries")
+            return dynamic_segments
             
         except Exception as e:
-            logger.error(f"Moment detection failed: {e}, falling back to window-based")
+            logger.error(f"Dynamic segmentation failed: {e}, falling back to window-based")
             return self._window_based_segments(transcript_dicts, window=25, step=15)
     
     def _window_based_segments(self, transcript: List[Dict], window: float = 25, step: float = 15) -> List[Dict]:
@@ -499,7 +492,7 @@ class ClipScoreService:
                     'end': end_time,
                     'text': segment_text,
                     'type': 'window'
-                })
+            })
         
         return segments
     
@@ -662,7 +655,7 @@ class ClipScoreService:
             logger.info(f"Using genre: {final_genre} (detected: {detected_genre}, user_selected: {genre})")
 
             # Convert transcript to segments using intelligent moment detection
-            segments = self._transcript_to_segments(episode.transcript, genre=final_genre)
+            segments = self._transcript_to_segments(episode.transcript, genre=final_genre, platform=platform)
 
             # Use rank_candidates for proper scoring pipeline
             ranked_segments = self.rank_candidates(segments, episode.audio_path, top_k=10, platform=backend_platform, genre=final_genre)
@@ -722,7 +715,7 @@ class ClipScoreService:
             quality_filtered = self._filter_low_quality(filtered_candidates, min_score=40)
             
             return quality_filtered[:10]  # Return top 10
-
+            
         except Exception as e:
             logger.error(f"Failed to get candidates: {e}", exc_info=True)
             return []

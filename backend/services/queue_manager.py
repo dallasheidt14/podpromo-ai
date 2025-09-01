@@ -49,7 +49,7 @@ class Job:
 class QueueManager:
     """Manages job queuing and execution"""
     
-    def __init__(self, max_concurrent_jobs: int = 3, max_queue_size: int = 100):
+    def __init__(self, max_concurrent_jobs: int = 1, max_queue_size: int = 100):
         self.max_concurrent_jobs = max_concurrent_jobs
         self.max_queue_size = max_queue_size
         self.jobs: Dict[str, Job] = {}
@@ -105,6 +105,37 @@ class QueueManager:
     async def get_job_status(self, job_id: str) -> Optional[Job]:
         """Get current status of a job"""
         return self.jobs.get(job_id)
+    
+    async def update_job_status(self, job_id: str, status: str, progress: float = None, error: str = None):
+        """Update job status and optional progress/error"""
+        if job_id not in self.jobs:
+            return False
+        
+        job = self.jobs[job_id]
+        
+        # Update status
+        if status == "completed":
+            job.status = JobStatus.COMPLETED
+            job.completed_at = datetime.now()
+            job.progress = 100.0
+        elif status == "failed":
+            job.status = JobStatus.FAILED
+            job.completed_at = datetime.now()
+            job.error = error
+        elif status == "processing":
+            job.status = JobStatus.PROCESSING
+            job.started_at = datetime.now()
+        
+        # Update progress if provided
+        if progress is not None:
+            job.progress = progress
+        
+        # Update error if provided
+        if error is not None:
+            job.error = error
+        
+        logger.info(f"Job {job_id} status updated to {status}")
+        return True
     
     async def cancel_job(self, job_id: str) -> bool:
         """Cancel a queued or running job"""

@@ -28,18 +28,21 @@ type Candidate = {
   display_score?: number;
   confidence?: string;
   confidence_color?: string;
+  genre?: string;
 };
 
 export default function Page() {
   const [file, setFile] = useState<File | null>(null);
   const [status, setStatus] = useState("");
   const [cands, setCands] = useState<Candidate[]>([]);
+  const [optimization, setOptimization] = useState<any>(null);
   const [mediaURL, setMediaURL] = useState("");
   const [range, setRange] = useState({ start: 0, end: 15 });
   const [selected, setSelected] = useState<number>(0);
   const [outputs, setOutputs] = useState<string[]>([]);
   const [pollCount, setPollCount] = useState(0);
   const [progress, setProgress] = useState(0);
+  const [progressMessage, setProgressMessage] = useState("");
   const [renderStyle, setRenderStyle] = useState("bold");
   const [enableCaptions, setEnableCaptions] = useState(true);
   const [enablePunchIns, setEnablePunchIns] = useState(true);
@@ -47,12 +50,28 @@ export default function Page() {
   const [abTests, setAbTests] = useState<any>(null);
   const [showABTests, setShowABTests] = useState(false);
   const [tooltip, setTooltip] = useState<{text: string, x: number, y: number} | null>(null);
-  const [platform, setPlatform] = useState<"tiktok_reels"|"shorts"|"linkedin_sq">("tiktok_reels");
+  // Platform will be auto-recommended by the system based on content analysis
   const [genre, setGenre] = useState<string | undefined>(undefined);
   const [modalOpen, setModalOpen] = useState(false);
   const [activeCandidate, setActiveCandidate] = useState<Candidate | null>(null);
   const [activeTab, setActiveTab] = useState<"candidates">("candidates");
   const [debugMode, setDebugMode] = useState(false);
+  const [serverConnected, setServerConnected] = useState(true);
+
+  // Periodic server connection check
+  React.useEffect(() => {
+    const checkConnection = async () => {
+      await checkServerConnection();
+    };
+    
+    // Check connection every 10 seconds
+    const interval = setInterval(checkConnection, 10000);
+    
+    // Initial check
+    checkConnection();
+    
+    return () => clearInterval(interval);
+  }, []);
 
   // Helper function to convert seconds to readable time format
   const formatTime = (seconds: number): string => {
@@ -67,8 +86,83 @@ export default function Page() {
     }
   };
 
+  const checkServerConnection = async () => {
+    try {
+      const res = await fetch(`${API_URL}/health`, { 
+        method: 'GET',
+        signal: AbortSignal.timeout(5000) // 5 second timeout
+      });
+      const connected = res.ok;
+      setServerConnected(connected);
+      return connected;
+    } catch (error) {
+      console.error("Server connection check failed:", error);
+      setServerConnected(false);
+      return false;
+    }
+  };
+
+  const resetProcessingState = async () => {
+    // Check if server is actually reachable before resetting
+    const serverOk = await checkServerConnection();
+    if (!serverOk) {
+      setStatus("Server unreachable. Please start the backend server first.");
+      return;
+    }
+    
+    setStatus("");
+    setProgress(0);
+    setProgressMessage("");
+    setPollCount(0);
+    setCands([]);
+    setMediaURL("");
+  };
+
+  const forceResetAllState = () => {
+    // Force reset all state variables
+    setFile(null);
+    setStatus("");
+    setCands([]);
+    setMediaURL("");
+    setRange({ start: 0, end: 15 });
+    setSelected(0);
+    setOutputs([]);
+    setPollCount(0);
+    setProgress(0);
+    setProgressMessage("");
+    setRenderStyle("bold");
+    setEnableCaptions(true);
+    setEnablePunchIns(true);
+    setEnableLoopSeam(true);
+    setAbTests(null);
+    setShowABTests(false);
+    setTooltip(null);
+    setGenre(undefined);
+    setModalOpen(false);
+    setActiveCandidate(null);
+    setActiveTab("candidates");
+    setDebugMode(false);
+    setServerConnected(true);
+    
+    console.log("All frontend state has been reset");
+  };
+
   const upload = async () => {
     if (!file) return;
+    
+    // Prevent multiple uploads
+    if (status === "Uploading…" || status === "Processing...") {
+      setStatus("Please wait for current upload to finish");
+      return;
+    }
+    
+    // Check server connection first
+    const serverOk = await checkServerConnection();
+    if (!serverOk) {
+      setStatus("Server unreachable. Please start the backend server first.");
+      return;
+    }
+    
     setStatus("Uploading…");
     const form = new FormData();
     form.append("file", file);
@@ -85,6 +179,7 @@ export default function Page() {
   const pollForCompletion = async () => {
     setPollCount(0);
     setProgress(0);
+    setProgressMessage("");
     const interval = setInterval(async () => {
       try {
         setPollCount(prev => prev + 1);
@@ -93,7 +188,11 @@ export default function Page() {
         const progressRes = await fetch(`${API_URL}/api/progress`);
         const progressData = await progressRes.json();
         if (progressData.ok) {
+          console.log("Progress update:", progressData.progress, progressData.message);
           setProgress(progressData.progress);
+          if (progressData.message) {
+            setProgressMessage(progressData.message);
+          }
           if (progressData.progress >= 100) {
             setStatus("Candidates ready.");
             clearInterval(interval);
@@ -102,29 +201,45 @@ export default function Page() {
         }
         
         // Then check if candidates are ready
-        const res = await fetch(`${API_URL}/api/candidates`);
-        const data = await res.json();
-        if (data.ok && data.candidates && data.candidates.length > 0) {
-          setStatus("Candidates ready.");
-          setProgress(100);
-          clearInterval(interval);
-        } else if (data.error && data.error.includes("still processing")) {
-          // Still processing, continue polling
-          setStatus("Processing...");
-        } else if (data.error && data.error.includes("No episodes found")) {
-          // Server restarted, no episodes found
-          setStatus("Server restarted. Please upload again.");
-          clearInterval(interval);
-        } else {
-          // Something went wrong
-          setStatus("Processing failed. Please try again.");
-          clearInterval(interval);
+        try {
+          const res = await fetch(`${API_URL}/api/candidates`);
+          const data = await res.json();
+          if (data.ok && data.candidates && data.candidates.length > 0) {
+            setStatus("Candidates ready.");
+            setProgress(100);
+            clearInterval(interval);
+          } else if (data.error && data.error.includes("still processing")) {
+            // Still processing, continue polling
+            setStatus("Processing...");
+          } else if (data.error && data.error.includes("No episodes found")) {
+            // Server restarted, no episodes found
+            setStatus("Server restarted. Please upload again.");
+            clearInterval(interval);
+          } else {
+            // Something went wrong
+            setStatus("Processing failed. Please try again.");
+            clearInterval(interval);
+          }
+        } catch (candidateError) {
+          console.error("Candidate check failed:", candidateError);
+          // If we can't reach the server, stop polling
+          if (candidateError.message.includes("fetch") || candidateError.message.includes("Failed to fetch")) {
+            setStatus("Server unreachable. Please wait for restart...");
+            setProgress(0);
+            setProgressMessage("");
+            clearInterval(interval);
+            return;
+          }
         }
       } catch (error) {
         console.error("Polling error:", error);
         // If we can't reach the server, it might have restarted
-        if (error.message.includes("fetch")) {
+        if (error.message.includes("fetch") || error.message.includes("Failed to fetch")) {
           setStatus("Server unreachable. Please wait for restart...");
+          setProgress(0);
+          setProgressMessage("");
+          clearInterval(interval);
+          return;
         }
       }
     }, 15000); // Check every 15 seconds (much more reasonable)
@@ -140,11 +255,12 @@ export default function Page() {
 
   const findCandidates = async () => {
     setStatus("Finding candidates…");
-    const url = `${API_URL}/api/candidates?platform=${platform}${genre ? `&genre=${genre}` : ""}&debug=1`;
+    const url = `${API_URL}/api/candidates${genre ? `?genre=${genre}&debug=1` : "?debug=1"}`;
     const res = await fetch(url);
     const data = await res.json();
     if (data.ok) {
       setCands(data.candidates || []);
+      setOptimization(data.optimization || null);
       if (data.candidates?.length) {
         setSelected(0);
         setRange({ start: data.candidates[0].start, end: data.candidates[0].end });
@@ -162,11 +278,12 @@ export default function Page() {
     }
     
     setStatus("Re-scoring candidates with current weights...");
-    const url = `${API_URL}/api/candidates?platform=${platform}${genre ? `&genre=${genre}` : ""}&debug=1`;
+    const url = `${API_URL}/api/candidates${genre ? `?genre=${genre}&debug=1` : "?debug=1"}`;
     const res = await fetch(url);
     const data = await res.json();
     if (data.ok) {
       setCands(data.candidates || []);
+      setOptimization(data.optimization || null);
       setStatus("Candidates re-scored with new weights!");
     } else setStatus(`Re-score error: ${data.error || "unknown"}`);
   };
@@ -391,27 +508,62 @@ export default function Page() {
       <div style={{display: "grid", gap: 12, maxWidth: 960, margin: "0 auto", padding: "20px"}}>
       <div style={{display: "flex", justifyContent: "space-between", alignItems: "center"}}>
         <h2>PodPromo AI</h2>
-        <a 
-          href="/history"
-          style={{
-            padding: "8px 16px",
-            backgroundColor: "#6b7280",
-            color: "white",
-            textDecoration: "none",
-            borderRadius: 6,
-            fontSize: "14px"
-          }}
-        >
-          📹 Clip History
-        </a>
+        <div style={{display: "flex", alignItems: "center", gap: "12px"}}>
+          <div style={{
+            display: "flex", 
+            alignItems: "center", 
+            gap: "8px", 
+            fontSize: "14px",
+            padding: "4px 8px",
+            backgroundColor: serverConnected ? "#f0f9ff" : "#fef2f2",
+            border: `1px solid ${serverConnected ? "#0ea5e9" : "#f87171"}`,
+            borderRadius: "4px"
+          }}>
+            <div style={{
+              width: "8px", 
+              height: "8px", 
+              borderRadius: "50%", 
+              backgroundColor: serverConnected ? "#10b981" : "#ef4444"
+            }}></div>
+            <span style={{color: serverConnected ? "#0c4a6e" : "#991b1b"}}>
+              {serverConnected ? "Server Connected" : "Server Disconnected"}
+            </span>
+          </div>
+          <a 
+            href="/history"
+            style={{
+              padding: "8px 16px",
+              backgroundColor: "#6b7280",
+              color: "white",
+              textDecoration: "none",
+              borderRadius: 6,
+              fontSize: "14px"
+            }}
+          >
+            📹 Clip History
+          </a>
+        </div>
       </div>
 
       <input type="file" accept="audio/*,video/*" onChange={e => setFile(e.target.files?.[0] || null)} />
       <div style={{display: "flex", gap: 8}}>
-        <button onClick={upload} disabled={!file}>Upload</button>
+        <button 
+          onClick={upload} 
+          disabled={!file || status === "Uploading…" || status === "Processing..."}
+          style={{
+            opacity: (!file || status === "Uploading…" || status === "Processing...") ? 0.5 : 1,
+            cursor: (!file || status === "Uploading…" || status === "Processing...") ? "not-allowed" : "pointer"
+          }}
+        >
+          {status === "Uploading…" ? "Uploading..." : 
+           status === "Processing..." ? "Processing..." : 
+           "Upload"}
+        </button>
         {status === "Processing..." && (
           <div style={{display: "flex", flexDirection: "column", gap: 8, alignItems: "center"}}>
-            <button disabled>Processing... {progress > 0 ? `${progress}%` : ''} (Checked {pollCount}x)</button>
+            <button disabled>
+              {progress > 0 ? `Progress: ${progress}% - ${progressMessage || 'Processing...'}` : 'Processing...'}
+            </button>
             {progress > 0 && (
               <div style={{width: "100%", maxWidth: 300, height: 8, backgroundColor: "#eee", borderRadius: 4, overflow: "hidden"}}>
                 <div style={{
@@ -420,16 +572,49 @@ export default function Page() {
                   backgroundColor: "#007bff", 
                   transition: "width 0.3s ease"
                 }} />
+
               </div>
             )}
             <div style={{fontSize: "12px", color: "#666", textAlign: "center"}}>
               {progress > 0 && progress < 100 && (
-                <>
-                  <div>Transcribing audio... This may take 5-10 minutes for long episodes</div>
-                  <div>Current speed: ~{Math.round(progress / (Date.now() - (window as any).startTime || 1) * 60000)}% per minute</div>
-                </>
+                <div>Processing your content... This may take a few minutes for long episodes</div>
               )}
             </div>
+          </div>
+        )}
+        {status && status !== "Candidates ready." && (
+          <div style={{margin: "16px 0", textAlign: "center"}}>
+            <button 
+              onClick={resetProcessingState}
+              style={{
+                padding: "8px 16px",
+                backgroundColor: "#6c757d",
+                color: "white",
+                border: "none",
+                borderRadius: "4px",
+                cursor: "pointer",
+                fontSize: "14px",
+                marginRight: "8px"
+              }}
+              title="Reset processing state"
+            >
+              Reset Processing State
+            </button>
+            <button 
+              onClick={forceResetAllState}
+              style={{
+                padding: "8px 16px",
+                backgroundColor: "#dc3545",
+                color: "white",
+                border: "none",
+                borderRadius: "4px",
+                cursor: "pointer",
+                fontSize: "14px"
+              }}
+              title="Force reset all frontend state"
+            >
+              🚨 Force Reset All
+            </button>
           </div>
         )}
         {status === "Candidates ready." && (
@@ -445,23 +630,9 @@ export default function Page() {
               border: "1px solid #e5e7eb",
               borderRadius: "8px"
             }}>
-              <label style={{display: "flex", alignItems: "center", gap: "8px", fontSize: "14px", fontWeight: "500"}}>
-                Platform:&nbsp;
-                <select 
-                  value={platform} 
-                  onChange={e=>setPlatform(e.target.value as any)}
-                  style={{
-                    padding: "6px 8px",
-                    borderRadius: "4px",
-                    border: "1px solid #ddd",
-                    fontSize: "14px"
-                  }}
-                >
-                  <option value="tiktok_reels">TikTok / Reels</option>
-                  <option value="shorts">YouTube Shorts</option>
-                  <option value="linkedin_sq">LinkedIn (Square)</option>
-                </select>
-              </label>
+              <div style={{display: "flex", alignItems: "center", gap: "8px", fontSize: "14px", fontWeight: "500", color: "#6b7280"}}>
+                🎯 Platform: Auto-recommended based on your content
+              </div>
 
               <label style={{display: "flex", alignItems: "center", gap: "8px", fontSize: "14px", fontWeight: "500"}}>
                 Genre:&nbsp;
@@ -485,7 +656,7 @@ export default function Page() {
                 borderRadius: "4px",
                 border: "1px solid #dee2e6"
               }}>
-                🎯 Optimizing for {platform.replace("_", " ")} {genre ? `+ ${genre.replace("_", " ")}` : ""}
+                🎯 Auto-optimizing for best platform {genre ? `+ ${genre.replace("_", " ")}` : ""}
               </div>
               <button 
                 onClick={() => setDebugMode(!debugMode)}
@@ -988,8 +1159,85 @@ export default function Page() {
                      onMouseLeave={() => setTooltip(null)}
                    >
                      <div style={{fontSize: "10px", color: "#6c757d", marginBottom: 2}}>Best For</div>
-                     <div style={{fontSize: "12px", fontWeight: "bold", color: "#6f42c1"}}>
-                       {(c.clip_score_100 ?? Math.round((c.score || 0) * 100)) >= 75 ? "🎯 TikTok/Reels" : (c.clip_score_100 ?? Math.round((c.score || 0) * 100)) >= 50 ? "📱 Instagram" : "💬 Twitter"}
+                     <div 
+                       style={{fontSize: "12px", fontWeight: "bold", color: "#6f42c1", cursor: "help"}}
+                       title={(() => {
+                         const score = c.clip_score_100 ?? Math.round((c.score || 0) * 100);
+                         const genre = c.genre || 'general';
+                         const selectedPlatform = optimization?.recommended_platform || 'tiktok_reels';
+                         
+                         // Generate helpful tooltip based on AI recommendation
+                         if (selectedPlatform === "tiktok_reels") {
+                           if (genre === "fantasy_sports" && score < 80) {
+                             return "Fantasy sports content needs to be more entertaining to succeed on TikTok. Try uploading the same content with YouTube Shorts selected for better performance.";
+                           } else if (genre === "comedy" && score < 70) {
+                             return "Comedy content thrives on TikTok! Your content is well-suited for this platform.";
+                           } else if (genre === "education" && score < 75) {
+                             return "Educational content performs better on YouTube Shorts where viewers expect to learn. Try uploading with YouTube Shorts selected.";
+                           } else if (genre === "business" && score < 70) {
+                             return "Business content reaches a more professional audience on LinkedIn. Try uploading with LinkedIn selected.";
+                           }
+                         } else if (selectedPlatform === "shorts") {
+                           if (genre === "comedy" && score < 70) {
+                             return "Comedy content thrives on TikTok's entertainment-focused audience. Try uploading with TikTok selected.";
+                           } else if (genre === "fantasy_sports" && score < 65) {
+                             return "Fantasy sports content reaches a broader audience on YouTube Shorts. Your content is well-suited for this platform.";
+                           } else if (genre === "business" && score < 65) {
+                             return "Business content reaches a more professional audience on LinkedIn. Try uploading with LinkedIn selected.";
+                           }
+                         } else if (selectedPlatform === "linkedin_sq") {
+                           if (genre === "comedy" && score < 60) {
+                             return "Comedy content performs better on TikTok's entertainment-focused platform. Try uploading with TikTok selected.";
+                           } else if (genre === "fantasy_sports" && score < 65) {
+                             return "Fantasy sports content reaches a broader audience on YouTube Shorts. Try uploading with YouTube Shorts selected.";
+                           } else if (genre === "business" && score < 60) {
+                             return "Business content is perfect for LinkedIn! Your content is well-suited for this platform.";
+                           }
+                         }
+                         
+                         return "AI-optimized platform recommendation based on content analysis";
+                       })()}
+                     >
+                       {(() => {
+                         const score = c.clip_score_100 ?? Math.round((c.score || 0) * 100);
+                         const genre = c.genre || 'general';
+                         const selectedPlatform = optimization?.recommended_platform || 'tiktok_reels';
+                         
+                         // AI platform recommendation based on content analysis
+                         if (selectedPlatform === "tiktok_reels") {
+                           if (genre === "fantasy_sports" && score < 80) {
+                             return "📺 YouTube Shorts";
+                           } else if (genre === "education" && score < 75) {
+                             return "📺 YouTube Shorts";
+                           } else if (genre === "business" && score < 70) {
+                             return "💼 LinkedIn";
+                           } else {
+                             return "🎯 TikTok/Reels";
+                           }
+                         } else if (selectedPlatform === "shorts") {
+                           if (genre === "comedy" && score < 70) {
+                             return "🎯 TikTok/Reels";
+                           } else if (genre === "business" && score < 65) {
+                             return "💼 LinkedIn";
+                           } else {
+                             return "📺 YouTube Shorts";
+                           }
+                         } else if (selectedPlatform === "linkedin_sq") {
+                           if (genre === "comedy" && score < 60) {
+                             return "🎯 TikTok/Reels";
+                           } else if (genre === "fantasy_sports" && score < 65) {
+                             return "📺 YouTube Shorts";
+                           } else {
+                             return "💼 LinkedIn";
+                           }
+                         }
+                         
+                         // Fallback to score-based recommendation
+                         if (score >= 75) return "🎯 TikTok/Reels";
+                         if (score >= 60) return "📺 YouTube Shorts"; 
+                         if (score >= 45) return "📱 Instagram";
+                         return "💬 Twitter";
+                       })()}
                      </div>
                    </div>
                 </div>

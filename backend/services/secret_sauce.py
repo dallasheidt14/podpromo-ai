@@ -802,6 +802,70 @@ PAYOFF_MARKERS = tuple(get_config()["lexicons"]["PAYOFF_MARKERS"])
 QUESTION_STARTS = tuple(get_config()["lexicons"]["QUESTION_STARTS"])
 LIST_MARKERS = tuple(get_config()["lexicons"]["LIST_MARKERS"])
 
+def _detect_insight_content(text: str, genre: str = 'general') -> tuple[float, str]:
+    """Detect if content contains actual insights vs. intro/filler material"""
+    if not text or len(text.strip()) < 10:
+        return 0.0, "too_short"
+    
+    t = text.lower()
+    insight_score = 0.0
+    reasons = []
+    
+    # Fantasy sports insight patterns
+    if genre in ['fantasy_sports', 'sports']:
+        insight_patterns = [
+            r"(observation|insight|noticed|realized|discovered)",
+            r"(main|key|important|significant) (takeaway|point|finding)",
+            r"(casual|serious|experienced) (drafters|players|managers)",
+            r"(way better|much better|improved|evolved)",
+            r"(under my belt|experience|seen|witnessed)",
+            r"(home league|draft|waiver|roster)",
+            r"(sleeper|bust|value|target|avoid)",
+            r"(this week|next week|season|playoffs)"
+        ]
+        
+        for pattern in insight_patterns:
+            if re.search(pattern, t):
+                insight_score += 0.2
+                reasons.append("fantasy_insight")
+        
+        # Boost for specific insights
+        if re.search(r"(casual drafters are way better)", t):
+            insight_score += 0.3
+            reasons.append("specific_insight_boost")
+    
+    # General insight patterns
+    general_insight_patterns = [
+        r"(here's what|the thing is|what i found|what i learned)",
+        r"(the key|the secret|the trick|the strategy)",
+        r"(most people|everyone|nobody) (thinks|believes|knows)",
+        r"(contrary to|despite|although|even though)",
+        r"(the truth is|reality is|actually|in fact)"
+    ]
+    
+    for pattern in general_insight_patterns:
+        if re.search(pattern, t):
+            insight_score += 0.15
+            reasons.append("general_insight")
+    
+    # Penalty for filler content
+    filler_patterns = [
+        r"^(yo|hey|hi|hello|what's up)",
+        r"^(it's|this is) (monday|tuesday|wednesday)",
+        r"^(hope you|hope everyone)",
+        r"^(let's get|let's start|let's begin)"
+    ]
+    
+    for pattern in filler_patterns:
+        if re.match(pattern, t):
+            insight_score -= 0.3
+            reasons.append("filler_penalty")
+            break
+    
+    final_score = float(np.clip(insight_score, 0.0, 1.0))
+    reason_str = ";".join(reasons) if reasons else "no_insights"
+    return final_score, reason_str
+
 def _hook_score_v4(text: str, arousal: float = 0.0, words_per_sec: float = 0.0, genre: str = 'general') -> tuple[float, str]:
     """V4 hook detection with more reasonable thresholds"""
     if not text or len(text.strip()) < 8:
@@ -811,10 +875,27 @@ def _hook_score_v4(text: str, arousal: float = 0.0, words_per_sec: float = 0.0, 
     score = 0.1  # Start with base score of 0.1 instead of 0.0
     reasons = []
     
+    # INTRO/GREETING DETECTION - Heavy penalty for intro material
+    intro_patterns = [
+        r"^(yo|hey|hi|hello|what's up|how's it going|good morning|good afternoon|good evening)",
+        r"^(it's|this is) (monday|tuesday|wednesday|thursday|friday|saturday|sunday)",
+        r"^(i'm|my name is) \w+",
+        r"^(welcome to|thanks for|thank you for)",
+        r"^(hope you|hope everyone)",
+        r"^(let's get|let's start|let's begin)",
+        r"^(today we're|today i'm|today let's)",
+        r"^(so|and|but then|after that|next)"  # Still penalize sequence words
+    ]
+    
+    for pattern in intro_patterns:
+        if re.match(pattern, t):
+            score = 0.01  # Set to extremely low score for intro material
+            reasons.append("intro_greeting_penalty")
+            break
+    
     # RELAXED: Context-dependent penalty (less harsh for sports content)
     context_patterns = [
         r"^(you like that|like that|that's|here's the)",  # Still penalize obvious context
-        r"^(so|and|but then|after that|next)"  # Still penalize sequence words
     ]
     
     # DON'T penalize sports-specific context like "Caleb Johnson is clearly"
@@ -863,8 +944,15 @@ def _hook_score_v4(text: str, arousal: float = 0.0, words_per_sec: float = 0.0, 
         score += 0.25
         reasons.append("question_mark")
     
+    # Boost for insight content (if not intro)
+    if not any("intro_greeting_penalty" in reason for reason in reasons):
+        insight_score, _ = _detect_insight_content(text, genre)
+        if insight_score > 0.5:
+            score += 0.2  # Boost for high insight content
+            reasons.append("insight_content_boost")
+    
     # At the end, ensure minimum score
-    final_score = float(np.clip(score, 0.1, 1.0))  # Minimum 0.1 instead of 0.0
+    final_score = float(np.clip(score, 0.05, 1.0))  # Allow lower minimum for intro content
     reason_str = ";".join(reasons) if reasons else "no_hooks_detected"
     return final_score, reason_str
 
@@ -1140,18 +1228,21 @@ def score_segment_v4(features: Dict, weights: Dict = None, apply_penalties: bool
         genre_profile = genre_scorer.genres.get(genre, genre_scorer.genres['general'])
         path_scores = genre_profile.get_scoring_paths(features)
     else:
-        # Default 4-path system for general genre with platform length match
-        path_a = (0.40 * f.get("hook_score", 0.0) + 0.20 * f.get("arousal_score", 0.0) + 
+        # Default 4-path system for general genre with platform length match and insight detection
+        path_a = (0.35 * f.get("hook_score", 0.0) + 0.20 * f.get("arousal_score", 0.0) + 
                   0.15 * f.get("payoff_score", 0.0) + 0.10 * f.get("info_density", 0.0) + 
-                  0.10 * f.get("platform_len_match", 0.0) + 0.05 * f.get("loopability", 0.0))
+                  0.10 * f.get("platform_len_match", 0.0) + 0.05 * f.get("loopability", 0.0) + 
+                  0.05 * f.get("insight_score", 0.0))  # NEW: Insight content boost
         
-        path_b = (0.35 * f.get("payoff_score", 0.0) + 0.25 * f.get("info_density", 0.0) + 
+        path_b = (0.30 * f.get("payoff_score", 0.0) + 0.25 * f.get("info_density", 0.0) + 
                   0.15 * f.get("emotion_score", 0.0) + 0.10 * f.get("hook_score", 0.0) + 
-                  0.10 * f.get("platform_len_match", 0.0) + 0.05 * f.get("arousal_score", 0.0))
+                  0.10 * f.get("platform_len_match", 0.0) + 0.05 * f.get("arousal_score", 0.0) + 
+                  0.05 * f.get("insight_score", 0.0))  # NEW: Insight content boost
         
-        path_c = (0.35 * f.get("arousal_score", 0.0) + 0.20 * f.get("emotion_score", 0.0) + 
+        path_c = (0.30 * f.get("arousal_score", 0.0) + 0.20 * f.get("emotion_score", 0.0) + 
                   0.20 * f.get("hook_score", 0.0) + 0.10 * f.get("loopability", 0.0) + 
-                  0.10 * f.get("platform_len_match", 0.0) + 0.05 * f.get("question_score", 0.0))
+                  0.10 * f.get("platform_len_match", 0.0) + 0.05 * f.get("question_score", 0.0) + 
+                  0.05 * f.get("insight_score", 0.0))  # NEW: Insight content boost
         
         path_d = (0.20 * f.get("question_score", 0.0) + 0.20 * f.get("info_density", 0.0) + 
                   0.20 * f.get("payoff_score", 0.0) + 0.15 * f.get("hook_score", 0.0) + 
@@ -1187,6 +1278,14 @@ def score_segment_v4(features: Dict, weights: Dict = None, apply_penalties: bool
         bonuses += 0.06
         bonus_reasons.append("payoff_excellence")
     
+    # NEW: Insight content bonus
+    if f.get("insight_score", 0.0) >= 0.6:
+        bonuses += 0.10
+        bonus_reasons.append("high_insight_content")
+    elif f.get("insight_score", 0.0) >= 0.3:
+        bonuses += 0.05
+        bonus_reasons.append("moderate_insight_content")
+    
     # Genre-specific bonuses
     if genre != 'general':
         genre_scorer = GenreAwareScorer()
@@ -1205,6 +1304,12 @@ def score_segment_v4(features: Dict, weights: Dict = None, apply_penalties: bool
         penalty = f.get("_ad_penalty", 0.0)
         final_score = max(0.0, final_score - penalty)
         bonus_reasons.append(f"ad_penalty_{penalty:.2f}")
+    
+    # Apply mixed intro penalty
+    if f.get("mixed_intro_penalty", 0.0) > 0:
+        penalty = f.get("mixed_intro_penalty", 0.0)
+        final_score = max(0.0, final_score - penalty)
+        bonus_reasons.append(f"mixed_intro_penalty_{penalty:.2f}")
     
     # Genre-specific quality gates
     if genre != 'general':
@@ -1310,6 +1415,9 @@ def compute_features_v4(segment: Dict, audio_file: str, y_sr=None, genre: str = 
     hook_score, hook_reasons = _hook_score_v4(text, segment.get("arousal_score", 0.0), words_per_sec, genre)
     payoff_score, payoff_type = _payoff_presence_v4(text)
     
+    # NEW: Detect insight content vs. intro/filler
+    insight_score, insight_reasons = _detect_insight_content(text, genre)
+    
     niche_penalty, niche_reason = _calculate_niche_penalty(text, genre)
     
     # REAL AUDIO ANALYSIS: Compute actual audio arousal from audio file
@@ -1350,14 +1458,16 @@ def compute_features_v4(segment: Dict, audio_file: str, y_sr=None, genre: str = 
         "payoff_score": payoff_score,
         "info_density": _info_density_v4(text),
         "loopability": _loopability_heuristic(text),
+        "insight_score": insight_score,  # NEW: Insight content detection
         "text": text,
         "duration": duration,
         "words_per_sec": words_per_sec,
         "hook_reasons": hook_reasons,
         "payoff_type": payoff_type,
+        "insight_reasons": insight_reasons,  # NEW: Insight detection reasons
         "text_arousal": text_arousal,
         "audio_arousal": audio_arousal,
-        "platform_len_match": _platform_length_match(duration, platform),
+        "platform_len_match": calculate_dynamic_length_score(segment, platform) if "boundary_type" in segment else _platform_length_match(duration, platform),
         "_ad_flag": ad_result["flag"],
         "_ad_penalty": ad_result["penalty"],
         "_ad_reason": ad_result["reason"],
@@ -1560,6 +1670,8 @@ def _platform_length_match(duration: float, platform: str = 'tiktok') -> float:
     """Calculate how well the duration matches platform preferences"""
     platform_ranges = {
         'tiktok': {'optimal': (15, 30), 'acceptable': (10, 45)},
+        'instagram': {'optimal': (15, 30), 'acceptable': (10, 45)},
+        'instagram_reels': {'optimal': (15, 30), 'acceptable': (10, 45)},
         'youtube_shorts': {'optimal': (20, 45), 'acceptable': (15, 60)},
         'linkedin': {'optimal': (30, 60), 'acceptable': (20, 90)}
     }
@@ -1576,6 +1688,22 @@ def _platform_length_match(duration: float, platform: str = 'tiktok') -> float:
             return 0.5 + 0.5 * (ranges['acceptable'][1] - duration) / (ranges['acceptable'][1] - ranges['optimal'][1])
     else:
         return 0.0  # Outside acceptable range
+
+def calculate_dynamic_length_score(segment: Dict, platform: str) -> float:
+    """
+    Calculate length score for dynamic segments, considering natural boundaries.
+    """
+    duration = segment.get("end", 0) - segment.get("start", 0)
+    base_score = _platform_length_match(duration, platform)
+    
+    # Bonus for natural boundaries
+    boundary_type = segment.get("boundary_type", "")
+    confidence = segment.get("confidence", 0.0)
+    
+    if boundary_type in ["sentence_end", "insight_marker"] and confidence > 0.8:
+        base_score += 0.1  # Bonus for clean boundaries
+    
+    return min(1.0, base_score)
 
 def _audio_prosody_score(audio_path: str, start: float, end: float, y_sr=None) -> float:
     """Enhanced audio analysis for arousal/energy detection"""
@@ -1739,6 +1867,302 @@ def filter_ads_from_features(all_features: List[Dict]) -> List[Dict]:
     
     return non_ad_features
 
+def filter_intro_content_from_features(all_features: List[Dict]) -> List[Dict]:
+    """
+    Filter out intro/greeting content completely from the feature list.
+    Returns only substantive content for scoring.
+    """
+    # Filter out intro content based on insight score and hook reasons
+    non_intro_features = []
+    
+    for f in all_features:
+        # Skip if it's marked as intro content
+        hook_reasons = f.get("hook_reasons", "")
+        insight_score = f.get("insight_score", 0.0)
+        text = f.get("text", "").lower()
+        
+        # Check if this is a mixed segment (contains both intro and good content)
+        has_intro_start = any(pattern in text[:100] for pattern in [
+            "yo, what's up", "hey", "hi", "hello", "what's up", 
+            "it's monday", "it's tuesday", "it's wednesday", "it's thursday", "it's friday",
+            "i'm jeff", "my name is", "hope you", "hope everyone"
+        ])
+        
+        has_good_content = insight_score > 0.3 or any(pattern in text for pattern in [
+            "observation", "insight", "casual drafters", "way better", "main observation",
+            "key takeaway", "the thing is", "what i found", "what i learned"
+        ])
+        
+        # If it's a mixed segment with good content, keep it but with reduced score
+        if has_intro_start and has_good_content:
+            # Reduce the score to account for intro content
+            f["mixed_intro_penalty"] = 0.2
+            f["hook_score"] = max(0.1, f.get("hook_score", 0.0) - 0.2)
+            non_intro_features.append(f)
+            continue
+        
+        # Skip pure intro content
+        if "intro_greeting_penalty" in hook_reasons and not has_good_content:
+            continue
+            
+        # Skip content with very low insight scores (likely filler) - but be less aggressive
+        if insight_score < 0.05 and not has_good_content:
+            continue
+            
+        non_intro_features.append(f)
+    
+    if len(non_intro_features) < 3:
+        # If we filtered out too much, be less aggressive - only filter obvious intro content
+        non_intro_features = [f for f in all_features if "intro_greeting_penalty" not in f.get("hook_reasons", "")]
+    
+    if len(non_intro_features) < 2:
+        return {"error": "Episode has too much intro content, no viable clips found"}
+    
+    return non_intro_features
+
+def find_natural_boundaries(text: str) -> List[Dict]:
+    """
+    Find natural content boundaries in text for dynamic segmentation.
+    Returns list of boundary points with their types and confidence.
+    """
+    boundaries = []
+    words = text.split()
+    
+    # Look for natural break points
+    for i, word in enumerate(words):
+        # Strong content boundaries
+        if word in [".", "!", "?", ":", ";"]:
+            boundaries.append({
+                "position": i + 1,  # Start after the punctuation
+                "type": "sentence_end",
+                "confidence": 0.9
+            })
+        
+        # Topic transitions
+        elif any(phrase in " ".join(words[max(0, i-2):i+3]) for phrase in [
+            "but", "however", "meanwhile", "on the other hand", "speaking of",
+            "that reminds me", "by the way", "oh wait", "actually"
+        ]):
+            boundaries.append({
+                "position": i,
+                "type": "topic_shift",
+                "confidence": 0.7
+            })
+        
+        # Story/insight markers
+        elif any(phrase in " ".join(words[max(0, i-1):i+2]) for phrase in [
+            "here's the thing", "the key is", "what i learned", "my take",
+            "the bottom line", "in summary", "to wrap up", "main observation",
+            "key takeaway", "the thing is", "what i found"
+        ]):
+            boundaries.append({
+                "position": i,
+                "type": "insight_marker",
+                "confidence": 0.8
+            })
+        
+        # Question/answer patterns
+        elif word == "?" and i < len(words) - 5:
+            # Look for answer patterns after question
+            next_words = " ".join(words[i+1:i+6])
+            if any(pattern in next_words for pattern in [
+                "well", "so", "the answer", "here's", "let me tell you"
+            ]):
+                boundaries.append({
+                    "position": i + 1,
+                    "type": "qa_boundary",
+                    "confidence": 0.8
+                })
+        
+        # Comma boundaries (weaker but useful)
+        elif word == "," and i > 5 and i < len(words) - 5:
+            # Check if it's a natural pause
+            context = " ".join(words[i-3:i+4])
+            if any(phrase in context for phrase in [
+                "first", "second", "third", "also", "additionally", "furthermore"
+            ]):
+                boundaries.append({
+                    "position": i + 1,
+                    "type": "comma_boundary",
+                    "confidence": 0.5
+                })
+    
+    # Remove duplicate positions and sort
+    unique_boundaries = []
+    seen_positions = set()
+    
+    for boundary in sorted(boundaries, key=lambda x: x["position"]):
+        if boundary["position"] not in seen_positions and 0 < boundary["position"] < len(words):
+            unique_boundaries.append(boundary)
+            seen_positions.add(boundary["position"])
+    
+    return unique_boundaries
+
+def create_dynamic_segments(segments: List[Dict], platform: str = 'tiktok') -> List[Dict]:
+    """
+    Create dynamic segments based on natural content boundaries and platform optimization.
+    """
+    dynamic_segments = []
+    
+    # Platform-specific optimal lengths
+    platform_lengths = {
+        'tiktok': {'min': 15, 'max': 30, 'optimal': 20},
+        'instagram': {'min': 15, 'max': 30, 'optimal': 22},
+        'instagram_reels': {'min': 15, 'max': 30, 'optimal': 22},
+        'youtube': {'min': 20, 'max': 60, 'optimal': 35},
+        'youtube_shorts': {'min': 20, 'max': 60, 'optimal': 35},
+        'twitter': {'min': 10, 'max': 25, 'optimal': 18},
+        'linkedin': {'min': 20, 'max': 45, 'optimal': 30}
+    }
+    
+    target_length = platform_lengths.get(platform, platform_lengths['tiktok'])
+    
+    for seg in segments:
+        text = seg.get("text", "")
+        start_time = seg.get("start", 0)
+        end_time = seg.get("end", 0)
+        total_duration = end_time - start_time
+        
+        # Find natural boundaries
+        boundaries = find_natural_boundaries(text)
+        
+        if not boundaries or len(boundaries) < 2:
+            # No natural boundaries found, use original segment
+            dynamic_segments.append(seg)
+            continue
+        
+        # Create segments based on boundaries
+        words = text.split()
+        current_start = start_time
+        
+        # Add start boundary
+        all_boundaries = [{"position": 0, "type": "start", "confidence": 1.0}] + boundaries
+        
+        for i, boundary in enumerate(all_boundaries):
+            if boundary["confidence"] < 0.6:
+                continue  # Skip low-confidence boundaries
+            
+            # Calculate end position
+            if i + 1 < len(all_boundaries):
+                next_boundary = all_boundaries[i + 1]
+                end_position = next_boundary["position"]
+            else:
+                end_position = len(words)
+            
+            # Extract segment text
+            segment_words = words[boundary["position"]:end_position]
+            segment_text = " ".join(segment_words)
+            
+            if len(segment_words) < 3:  # Skip very short segments
+                continue
+            
+            # Calculate timing (proportional to word count)
+            total_words = len(words)
+            segment_ratio = len(segment_words) / total_words
+            segment_duration = total_duration * segment_ratio
+            
+            # Check if segment meets platform requirements
+            if target_length["min"] <= segment_duration <= target_length["max"]:
+                dynamic_segments.append({
+                    "text": segment_text,
+                    "start": current_start,
+                    "end": current_start + segment_duration,
+                    "boundary_type": boundary["type"],
+                    "confidence": boundary["confidence"]
+                })
+            elif segment_duration < target_length["min"] and len(dynamic_segments) > 0:
+                # If segment is too short, try to merge with previous segment
+                prev_segment = dynamic_segments[-1]
+                merged_duration = (current_start + segment_duration) - prev_segment["start"]
+                if merged_duration <= target_length["max"]:
+                    # Merge with previous segment
+                    dynamic_segments[-1] = {
+                        "text": prev_segment["text"] + " " + segment_text,
+                        "start": prev_segment["start"],
+                        "end": current_start + segment_duration,
+                        "boundary_type": "merged",
+                        "confidence": min(prev_segment["confidence"], boundary["confidence"])
+                    }
+            
+            current_start += segment_duration
+    
+    # If no dynamic segments were created, return original segments
+    if not dynamic_segments:
+        return segments
+    
+    return dynamic_segments
+
+def split_mixed_segments(segments: List[Dict]) -> List[Dict]:
+    """
+    Split segments that contain both intro and good content into separate segments.
+    """
+    split_segments = []
+    
+    for seg in segments:
+        text = seg.get("text", "").lower()
+        
+        # Check if this segment contains both intro and good content
+        has_intro_start = any(pattern in text[:100] for pattern in [
+            "yo, what's up", "hey", "hi", "hello", "what's up", 
+            "it's monday", "it's tuesday", "it's wednesday", "it's thursday", "it's friday",
+            "i'm jeff", "my name is", "hope you", "hope everyone"
+        ])
+        
+        has_good_content = any(pattern in text for pattern in [
+            "observation", "insight", "casual drafters", "way better", "main observation",
+            "key takeaway", "the thing is", "what i found", "what i learned"
+        ])
+        
+        if has_intro_start and has_good_content:
+            # Try to find where the good content starts
+            words = text.split()
+            good_content_start = -1
+            
+            for i, word in enumerate(words):
+                if any(pattern in " ".join(words[i:i+3]) for pattern in [
+                    "observation", "insight", "casual drafters", "way better", "main observation"
+                ]):
+                    good_content_start = i
+                    break
+            
+            if good_content_start > 0:
+                # Split the segment
+                intro_words = words[:good_content_start]
+                good_words = words[good_content_start:]
+                
+                # Calculate timing split (rough estimate)
+                total_duration = seg["end"] - seg["start"]
+                intro_ratio = len(intro_words) / len(words)
+                good_ratio = len(good_words) / len(words)
+                
+                split_point = seg["start"] + (total_duration * intro_ratio)
+                
+                # Create intro segment (will be filtered out)
+                intro_seg = {
+                    "text": " ".join(intro_words),
+                    "start": seg["start"],
+                    "end": split_point
+                }
+                
+                # Create good content segment
+                good_seg = {
+                    "text": " ".join(good_words),
+                    "start": split_point,
+                    "end": seg["end"]
+                }
+                
+                # Only add the good content segment
+                if len(good_words) > 5:  # Make sure it's substantial enough
+                    split_segments.append(good_seg)
+            else:
+                # If we can't split cleanly, keep the original but mark it
+                seg["mixed_content"] = True
+                split_segments.append(seg)
+        else:
+            split_segments.append(seg)
+    
+    return split_segments
+
 def find_viral_clips(segments: List[Dict], audio_file: str, genre: str = 'general', platform: str = 'tiktok') -> Dict:
     """
     Main pipeline function that pre-filters ads and finds viral clips with genre awareness.
@@ -1753,8 +2177,14 @@ def find_viral_clips(segments: List[Dict], audio_file: str, genre: str = 'genera
         print("💡 You can override this by specifying a different genre")
         genre = detected_genre
     
+    # Split mixed segments to separate intro from good content
+    split_segments = split_mixed_segments(segments)
+    
+    # Create dynamic segments based on natural boundaries and platform optimization
+    dynamic_segments = create_dynamic_segments(split_segments, platform)
+    
     # Compute features for all segments with genre awareness
-    all_features = [compute_features_v4(seg, audio_file, genre=genre, platform=platform) for seg in segments]
+    all_features = [compute_features_v4(seg, audio_file, genre=genre, platform=platform) for seg in dynamic_segments]
     
     # FILTER OUT ADS COMPLETELY
     non_ad_features = filter_ads_from_features(all_features)
@@ -1762,8 +2192,14 @@ def find_viral_clips(segments: List[Dict], audio_file: str, genre: str = 'genera
     if isinstance(non_ad_features, dict) and "error" in non_ad_features:
         return non_ad_features
     
-    # Score only the non-ad content with genre awareness
-    scored_clips = [score_segment_v4(f, genre=genre) for f in non_ad_features]
+    # FILTER OUT INTRO CONTENT COMPLETELY
+    non_intro_features = filter_intro_content_from_features(non_ad_features)
+    
+    if isinstance(non_intro_features, dict) and "error" in non_intro_features:
+        return non_intro_features
+    
+    # Score only the non-ad, non-intro content with genre awareness
+    scored_clips = [score_segment_v4(f, genre=genre) for f in non_intro_features]
     
     # Sort by viral score and return top 5
     return {
@@ -2090,6 +2526,24 @@ PLATFORM_GENRE_MULTIPLIERS = {
         'news_politics': 1.0,
         'health_wellness': 1.05
     },
+    'instagram': {
+        'comedy': 1.15,  # Great match
+        'fantasy_sports': 0.9,  # Better than TikTok
+        'education': 1.0,
+        'true_crime': 1.05,
+        'business': 1.0,
+        'news_politics': 0.95,
+        'health_wellness': 1.1
+    },
+    'instagram_reels': {
+        'comedy': 1.15,  # Great match
+        'fantasy_sports': 0.9,  # Better than TikTok
+        'education': 1.0,
+        'true_crime': 1.05,
+        'business': 1.0,
+        'news_politics': 0.95,
+        'health_wellness': 1.1
+    },
     'youtube_shorts': {
         'education': 1.15,  # Great match
         'fantasy_sports': 1.0,
@@ -2309,6 +2763,7 @@ def find_candidates(segments: List[Dict], audio_file: str, platform: str = 'tikt
 # Frontend Platform to Backend Platform Mapping
 PLATFORM_MAP = {
     'tiktok_reels': 'tiktok',
+    'instagram_reels': 'instagram_reels',
     'shorts': 'youtube_shorts',
     'linkedin_sq': 'linkedin'
 }
