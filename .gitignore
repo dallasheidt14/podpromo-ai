@@ -68,6 +68,7 @@ tmp/
 *.db
 *.sqlite
 *.sqlite3
+PostgreSQL/
 
 # Whisper models (if downloaded)
 *.pt
