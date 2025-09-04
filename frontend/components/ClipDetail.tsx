@@ -41,7 +41,16 @@ export default function ClipDetail({ clip, onClose }: { clip: Clip | null; onClo
             {/* Media */}
             <div className="bg-black">
               {clip.previewUrl ? (
-                <video src={clip.previewUrl} controls className="w-full max-h-[460px] object-cover" />
+                (() => {
+                  const src = clip.previewUrl;
+                  const isAudio = !!src && /\.(mp3|m4a|aac|ogg|wav)$/i.test(src);
+                  
+                  return isAudio ? (
+                    <audio src={src} controls className="w-full" />
+                  ) : (
+                    <video src={src} controls className="w-full max-h-[460px] object-cover" />
+                  );
+                })()
               ) : (
                 <div className="h-full w-full grid place-items-center text-white/70 p-8">
                   No preview available

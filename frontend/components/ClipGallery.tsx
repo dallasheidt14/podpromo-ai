@@ -109,6 +109,19 @@ export default function ClipGallery({ clips }: ClipGalleryProps) {
                     <Eye className="w-3 h-3" />
                     <span>View Details</span>
                   </button>
+                  {clip.previewUrl && (
+                    <button
+                      onClick={(e) => { 
+                        e.stopPropagation(); 
+                        new Audio(clip.previewUrl).play(); 
+                      }}
+                      className="px-3 py-1.5 text-xs rounded border border-[#2b3448] text-white hover:bg-white/5 flex items-center space-x-1"
+                      title="Quick preview"
+                    >
+                      <Play className="w-3 h-3" />
+                      <span>Preview</span>
+                    </button>
+                  )}
                   {clip.downloadUrl && (
                     <a
                       href={clip.downloadUrl}

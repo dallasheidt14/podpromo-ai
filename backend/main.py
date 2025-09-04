@@ -1008,20 +1008,44 @@ async def get_episode_clips(episode_id: str, regenerate: bool = False):
         try:
             clips = await clip_score_service.get_candidates(episode_id)
             
+            # Import preview service
+            from services.preview_service import ensure_preview, get_episode_media_path
+            
+            # Get episode media path for preview generation
+            source_media = get_episode_media_path(episode_id)
+            
             # Format clips for frontend
             formatted_clips = []
             for i, clip in enumerate(clips):
+                clip_id = clip.get("id", f"clip_{i+1}")
+                start_sec = float(clip.get("start", 0))
+                end_sec = float(clip.get("end", 0))
+                
+                # Generate preview URL if source media exists
+                preview_url = None
+                if source_media and source_media.exists():
+                    preview_url = ensure_preview(
+                        source_media=source_media,
+                        episode_id=episode_id,
+                        clip_id=clip_id,
+                        start_sec=start_sec,
+                        end_sec=end_sec,
+                        max_preview_sec=min(30.0, end_sec - start_sec or 20.0),
+                        pad_start_sec=0.0,
+                    )
+                
                 formatted_clips.append({
-                    "id": clip.get("id", f"clip_{i+1}"),
+                    "id": clip_id,
                     "title": clip.get("title", f"Clip {i+1}"),
                     "text": clip.get("text", ""),
                     "score": clip.get("score", 0),
-                    "start_time": clip.get("start", 0),
-                    "end_time": clip.get("end", 0),
-                    "duration": clip.get("end", 0) - clip.get("start", 0),
+                    "start_time": start_sec,
+                    "end_time": end_sec,
+                    "duration": end_sec - start_sec,
                     "reason": clip.get("reason", ""),
                     "features": clip.get("features", {}),
-                    "is_advertisement": clip.get("is_advertisement", False)
+                    "is_advertisement": clip.get("is_advertisement", False),
+                    "previewUrl": preview_url  # Add preview URL
                 })
             
             return {
