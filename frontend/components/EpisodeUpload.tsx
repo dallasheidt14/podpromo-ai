@@ -6,7 +6,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { Upload, FileAudio, FileVideo, X, CheckCircle, AlertCircle, Clock, Loader2 } from 'lucide-react';
 import { Episode, Clip, ProgressInfo } from '@shared/types';
 import { normalizeClip, normalizeProgress } from '@shared/normalize';
-import { fetchJsonWithBackoff } from '@shared/backoff';
+import { getClips, uploadFile, handleApiResult } from '@shared/api';
 
 type Props = {
   onEpisodeUploaded: (id: string) => void;
@@ -48,28 +48,35 @@ export default function EpisodeUpload({
   const fetchClips = async (episodeId: string) => {
     try {
       console.log('[CLIPS] Fetching clips for episode:', episodeId);
-      const clipsData = await fetchJsonWithBackoff(`/api/episodes/${episodeId}/clips`);
-      console.log('[CLIPS] Retrieved clips:', clipsData);
-      if (clipsData.ok && Array.isArray(clipsData.clips)) {
-        const normalized = clipsData.clips.map(normalizeClip);
-        
-        // Filter ads and sort by score, then take top N
-        const TOP_N = 12; // make this easy to change
-        const isAd = (c: any) => Boolean(c?.is_advertisement || c?._ad_flag || c?.features?.is_advertisement);
-        
-        const ranked = [...normalized]
-          .filter(c => !isAd(c))
-          .sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
-          .slice(0, TOP_N);
-        
-        setClips(ranked);
-        console.log(`[CLIPS] Found ${normalized.length} clips, showing top ${ranked.length} after filtering`);
-        return ranked;
-      }
+      const result = await getClips(episodeId);
+      
+      handleApiResult(
+        result,
+        (data) => {
+          console.log('[CLIPS] Retrieved clips:', data);
+          if (Array.isArray(data.clips)) {
+            const normalized = data.clips.map(normalizeClip);
+            
+            // Filter ads and sort by score, then take top N
+            const TOP_N = 12; // make this easy to change
+            const isAd = (c: any) => Boolean(c?.is_advertisement || c?._ad_flag || c?.features?.is_advertisement);
+            
+            const ranked = [...normalized]
+              .filter(c => !isAd(c))
+              .sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
+              .slice(0, TOP_N);
+            
+            setClips(ranked);
+            console.log(`[CLIPS] Found ${normalized.length} clips, showing top ${ranked.length} after filtering`);
+          }
+        },
+        (error) => {
+          console.error('[CLIPS] Failed to fetch clips:', error);
+        }
+      );
     } catch (error) {
-      console.error('[CLIPS] Failed to fetch clips:', error);
+      console.error('[CLIPS] Unexpected error:', error);
     }
-    return [];
   };
 
   // Poll for progress updates with proper cleanup
@@ -120,7 +127,7 @@ export default function EpisodeUpload({
           } else if (progressInfo.stage === 'error') {
             console.log('[POLL] Episode processing failed:', progressInfo.message);
             if (active) {
-              setUploadStatus('failed');
+              setUploadStatus('error');
               setError(progressInfo.message);
             }
             return; // Stop polling
@@ -146,7 +153,7 @@ export default function EpisodeUpload({
         if (retryCount >= maxRetries) {
           console.error('[POLL] Max retries reached, stopping polling');
           setError('Lost connection to server. Please refresh.');
-          setUploadStatus('failed');
+          setUploadStatus('error');
         } else {
           console.log(`[POLL] Retry ${retryCount}/${maxRetries} after error:`, err);
           if (active) {
@@ -210,61 +217,32 @@ export default function EpisodeUpload({
         throw new Error('File too large. Maximum size is 500MB.');
       }
 
-      // Upload file
-      const formData = new FormData();
-      formData.append('file', file);
+      // Upload file using API adapter
+      const result = await uploadFile(file);
+      
+      handleApiResult(
+        result,
+        (data) => {
+          console.log('[UPLOAD] Upload successful, episode ID:', data.episodeId);
+          const episodeId = data.episodeId;
+          
+          setEpisodeId(episodeId);
+          console.log('[UPLOAD] Episode ID set:', episodeId);
+          setUploadProgress(25); // Initial progress after upload
+          setUploadStatus('processing');
 
-      const response = await fetch('/api/upload', {
-        method: 'POST',
-        body: formData,
-      });
-
-      if (!response.ok) {
-        let errorMessage = 'Upload failed';
-        try {
-          const errorText = await response.text();
-          // Try to parse as JSON first
-          try {
-            const errorData = JSON.parse(errorText);
-            errorMessage = errorData.detail || errorData.message || 'Upload failed';
-          } catch {
-            // If not JSON, use the raw text
-            errorMessage = `HTTP ${response.status}: ${errorText.slice(0, 200)}`;
-          }
-        } catch (e) {
-          errorMessage = `HTTP ${response.status}: ${response.statusText}`;
+          // Notify parent of new episode
+          onEpisodeUploaded(episodeId);
+        },
+        (error) => {
+          console.error('[UPLOAD] Upload failed:', error);
+          throw new Error(error);
         }
-        throw new Error(errorMessage);
-      }
-
-      const uploadResponse = await response.json();
-      console.log('[UPLOAD] Full upload response:', uploadResponse);
-      
-      // Try multiple possible field names for episode ID
-      const episodeId = uploadResponse.episodeId || 
-                        uploadResponse.episode_id || 
-                        uploadResponse.id ||
-                        uploadResponse.data?.episodeId ||
-                        uploadResponse.data?.id;
-      
-      console.log('[UPLOAD] Extracted episode ID:', episodeId);
-      
-      if (!episodeId) {
-        console.error('[UPLOAD] No episode ID in response:', uploadResponse);
-        throw new Error('No episode ID returned from server');
-      }
-      
-      setEpisodeId(episodeId);
-      console.log('[UPLOAD] Episode ID set:', episodeId);
-      setUploadProgress(25); // Initial progress after upload
-      setUploadStatus('processing');
-
-      // Notify parent of new episode
-      onEpisodeUploaded(episodeId);
+      );
 
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Upload failed');
-      setUploadStatus('failed');
+      setUploadStatus('error');
       setUploadProgress(0);
     }
   }, [onEpisodeUploaded]);
@@ -482,7 +460,7 @@ export default function EpisodeUpload({
 
 
 
-        {uploadStatus === 'failed' && (
+        {uploadStatus === 'error' && (
           <motion.div
             key="failed"
             initial={{ opacity: 0, y: 20 }}

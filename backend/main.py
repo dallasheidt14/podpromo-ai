@@ -1165,7 +1165,8 @@ async def get_episode_progress(episode_id: str):
         from pathlib import Path
         
         # Simple disk-based progress checking
-        UPLOADS = Path(os.getenv("UPLOADS_DIR", r"C:\Users\Dallas Heidt\Desktop\podpromo\backend\uploads"))
+        from config.settings import UPLOAD_DIR
+        UPLOADS = Path(os.getenv("UPLOADS_DIR", str(UPLOAD_DIR)))
         audio = UPLOADS / f"{episode_id}.mp3"
         transcript = UPLOADS / "transcripts" / f"{episode_id}.json"
 
@@ -1477,6 +1478,10 @@ async def inspect_clip(payload: dict):
 
 # Include debug router
 app.include_router(debug_router)
+
+# Include clips router
+from routes.clips import router as clips_router
+app.include_router(clips_router)
 
 # Authentication Endpoints
 @app.post("/api/auth/signup")

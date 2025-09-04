@@ -4,6 +4,7 @@ import { useState } from 'react';
 import { motion } from 'framer-motion';
 import { Video, Settings, Play, Sparkles, Clock, Target } from 'lucide-react';
 import { Episode } from '@shared/types';
+import { generateClips, handleApiResult } from '@shared/api';
 import { AnimatePresence } from 'framer-motion';
 
 interface ClipGenerationProps {
@@ -20,26 +21,38 @@ export default function ClipGeneration({ episode, onGenerateClips, isGenerating 
 
   const handleGenerate = async () => {
     try {
-      const response = await fetch(`/api/episodes/${episode.id}/clips?regenerate=true`, {
-        method: 'GET',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+      const result = await generateClips(episode.id, {
+        targetCount: clipCount,
+        minDurationSec: minDuration,
+        maxDurationSec: maxDuration,
+        excludeAds: true,
+        strategy: 'hybrid',
+        diversityPenalty: 0.15,
+        regenerate: true
       });
-
-      if (!response.ok) {
-        throw new Error('Failed to start clip generation');
-      }
-
-      const result = await response.json();
-      console.log('Clip generation started:', result);
       
-      // Trigger parent callback
-      onGenerateClips();
+      handleApiResult(
+        result,
+        (data) => {
+          console.log('Clip generation started:', data);
+          if (data.started) {
+            console.log('Job enqueued:', data.job?.id);
+            // Trigger parent callback to start polling
+            onGenerateClips();
+          } else {
+            console.log('Using cached results');
+            // Still trigger callback to refresh UI
+            onGenerateClips();
+          }
+        },
+        (error) => {
+          console.error('Error starting clip generation:', error);
+          // In a real app, you'd show an error message to the user
+        }
+      );
       
     } catch (error) {
-      console.error('Error starting clip generation:', error);
-      // In a real app, you'd show an error message to the user
+      console.error('Unexpected error during clip generation:', error);
     }
   };
 

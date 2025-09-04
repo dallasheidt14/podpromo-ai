@@ -27,7 +27,7 @@ export default function ClipGallery({ clips }: ClipGalleryProps) {
         return <CheckCircle className="w-4 h-4 text-green-400" />;
       case 'generating':
         return <Clock className="w-4 h-4 text-blue-400 animate-spin" />;
-      case 'failed':
+      case 'error':
         return <AlertCircle className="w-4 h-4 text-red-400" />;
       default:
         return <Clock className="w-4 h-4 text-gray-400" />;
@@ -87,7 +87,7 @@ export default function ClipGallery({ clips }: ClipGalleryProps) {
                 <span>{toSec(Number(clip.duration ?? 0))}s</span>
               </div>
 
-              {clip.status === 'failed' && clip.error && (
+              {clip.status === 'error' && clip.error && (
                 <div className="mt-3 p-3 bg-red-900/30 border border-red-500/30 rounded-lg">
                   <p className="text-sm text-red-400">
                     <AlertCircle className="w-4 h-4 inline mr-2" />
