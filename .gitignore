@@ -70,6 +70,10 @@ tmp/
 *.sqlite3
 PostgreSQL/
 
+# Large installer files
+*.exe
+postgresql-installer.exe
+
 # Whisper models (if downloaded)
 *.pt
 *.pth
