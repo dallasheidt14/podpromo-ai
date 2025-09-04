@@ -6,13 +6,18 @@ Main application entry point with all API endpoints.
 import os
 import uuid
 import logging
+import mimetypes
 from datetime import datetime
 from typing import List, Dict, Optional
+
+# Ensure correct MIME type for .m4a files
+mimetypes.add_type("audio/mp4", ".m4a")
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Form, Query, Request
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from models import (
     Episode, TranscriptSegment, MomentScore, UploadResponse, 
@@ -55,6 +60,16 @@ app.add_middleware(
     allow_methods=["*"],  # Include OPTIONS for preflight
     allow_headers=["*"],
 )
+
+# Cache headers middleware for preview files
+@app.middleware("http")
+async def preview_cache_headers(request, call_next):
+    resp = await call_next(request)
+    p = request.url.path
+    if p.startswith("/clips/previews/") and resp.status_code == 200:
+        resp.headers.setdefault("Cache-Control", "public, max-age=31536000, immutable")
+        resp.headers.setdefault("Accept-Ranges", "bytes")
+    return resp
 
 # Mount static directories using config
 from config.settings import UPLOAD_DIR, OUTPUT_DIR, MAX_FILE_SIZE
@@ -979,7 +994,7 @@ async def reload_episodes():
         return {"ok": False, "error": str(e)}
 
 @app.get("/api/episodes/{episode_id}/clips")
-async def get_episode_clips(episode_id: str, regenerate: bool = False):
+async def get_episode_clips(episode_id: str, regenerate: bool = False, background_tasks: BackgroundTasks = None):
     """Get clips for a specific episode"""
     try:
         # Get the episode from the service
@@ -1021,18 +1036,31 @@ async def get_episode_clips(episode_id: str, regenerate: bool = False):
                 start_sec = float(clip.get("start", 0))
                 end_sec = float(clip.get("end", 0))
                 
-                # Generate preview URL if source media exists
+                # Check if preview already exists
                 preview_url = None
                 if source_media and source_media.exists():
-                    preview_url = ensure_preview(
-                        source_media=source_media,
-                        episode_id=episode_id,
-                        clip_id=clip_id,
-                        start_sec=start_sec,
-                        end_sec=end_sec,
-                        max_preview_sec=min(30.0, end_sec - start_sec or 20.0),
-                        pad_start_sec=0.0,
-                    )
+                    # Try to get existing preview first
+                    from services.preview_service import build_preview_filename
+                    from pathlib import Path
+                    from config.settings import OUTPUT_DIR
+                    
+                    preview_filename = build_preview_filename(episode_id, clip_id)
+                    preview_path = Path(OUTPUT_DIR) / "previews" / preview_filename
+                    
+                    if preview_path.exists() and preview_path.stat().st_size > 0:
+                        preview_url = f"/clips/previews/{preview_filename}"
+                    elif background_tasks:
+                        # Schedule background generation for missing previews
+                        background_tasks.add_task(
+                            ensure_preview,
+                            source_media=source_media,
+                            episode_id=episode_id,
+                            clip_id=clip_id,
+                            start_sec=start_sec,
+                            end_sec=end_sec,
+                            max_preview_sec=min(30.0, end_sec - start_sec or 20.0),
+                            pad_start_sec=0.0,
+                        )
                 
                 formatted_clips.append({
                     "id": clip_id,

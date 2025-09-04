@@ -5,6 +5,7 @@ import { motion } from 'framer-motion';
 import { Video, Download, Play, Clock, Star, CheckCircle, AlertCircle, Eye } from 'lucide-react';
 import { Clip } from '@shared/types';
 import { toPct, toPctLabel, toHMMSS, toSec } from '@shared/format';
+import { playPreview, stopPreview, isPlaying, getCurrentSrc } from '@shared/previewAudio';
 import ClipDetail from './ClipDetail';
 
 interface ClipGalleryProps {
@@ -105,6 +106,8 @@ export default function ClipGallery({ clips }: ClipGalleryProps) {
                       setSelectedClip(clip); 
                     }}
                     className="px-3 py-1.5 text-xs rounded border border-[#2b3448] text-white hover:bg-white/5"
+                    title="View detailed clip information"
+                    aria-label="View detailed clip information"
                   >
                     <Eye className="w-3 h-3" />
                     <span>View Details</span>
@@ -113,10 +116,11 @@ export default function ClipGallery({ clips }: ClipGalleryProps) {
                     <button
                       onClick={(e) => { 
                         e.stopPropagation(); 
-                        new Audio(clip.previewUrl).play(); 
+                        playPreview(clip.previewUrl!); 
                       }}
                       className="px-3 py-1.5 text-xs rounded border border-[#2b3448] text-white hover:bg-white/5 flex items-center space-x-1"
-                      title="Quick preview"
+                      title={`Preview clip starting at ${Math.round(clip.start_time || 0)}s`}
+                      aria-label={`Preview clip starting at ${Math.round(clip.start_time || 0)}s`}
                     >
                       <Play className="w-3 h-3" />
                       <span>Preview</span>
@@ -128,6 +132,8 @@ export default function ClipGallery({ clips }: ClipGalleryProps) {
                       download
                       onClick={(e) => e.stopPropagation()}
                       className="px-3 py-1.5 text-xs rounded border border-[#2b3448] text-white hover:bg-white/5 flex items-center space-x-1"
+                      title="Download clip file"
+                      aria-label="Download clip file"
                     >
                       <Download className="w-3 h-3" />
                       <span>Download</span>

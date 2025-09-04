@@ -139,7 +139,7 @@ export default function Page() {
       {showResumePrompt && (
         <div className="rounded-xl border border-[#1e2636] bg-white/[0.04] p-4 mb-6 flex items-center justify-between gap-3">
           <div className="text-sm text-white/80">
-            We found a previous session. Would you like to resume it, or start a new upload?
+            Found a previous session. Resume it, or start a new upload?
           </div>
           <div className="flex gap-2">
             <button 
@@ -205,7 +205,19 @@ export default function Page() {
               </button>
             </div>
           </div>
-          <p className="text-sm text-white/60">Episode ID: {episodeId.slice(0, 8)}...</p>
+          <div className="flex items-center gap-2 text-sm text-white/60">
+            <span>Episode ID: {episodeId.slice(0, 8)}...</span>
+            <button
+              onClick={() => {
+                navigator.clipboard.writeText(episodeId);
+                // You could add a toast notification here
+              }}
+              className="px-2 py-1 text-xs bg-white/10 hover:bg-white/20 rounded transition-colors"
+              title="Copy full episode ID"
+            >
+              Copy
+            </button>
+          </div>
         </div>
       )}
 
