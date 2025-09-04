@@ -198,6 +198,8 @@ export default function EpisodeUpload({
   };
 
   const onDrop = useCallback(async (acceptedFiles: File[]) => {
+    // prevent starting a second upload while one is in-flight
+    if (uploadStatus === 'uploading') return;
     if (acceptedFiles.length === 0) return;
 
     const file = acceptedFiles[0];
@@ -254,7 +256,7 @@ export default function EpisodeUpload({
       'video/*': ['.mp4', '.mov', '.avi']
     },
     multiple: false,
-    disabled: uploadStatus === 'uploading' || uploadStatus === 'processing'
+    disabled: uploadStatus === 'uploading'
   });
 
   const isValidFile = (file: File): boolean => {

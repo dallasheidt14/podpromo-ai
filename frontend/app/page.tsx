@@ -13,6 +13,36 @@ export default function Page() {
   const [clips, setClips] = useState<Clip[]>([]);
   const [clipsLoading, setClipsLoading] = useState(false);
   const didResumeRef = useRef(false);
+  const [showResumePrompt, setShowResumePrompt] = useState(false);
+
+  function startNewUpload() {
+    try { localStorage.removeItem('lastEpisodeId'); } catch {}
+    setEpisodeId(null);
+    setUploadStatus('idle');
+    setClips([]);
+    setClipsLoading(false);
+    // Clear ?episodeId
+    try {
+      const url = new URL(window.location.href);
+      url.searchParams.delete('episodeId');
+      window.history.replaceState({}, '', url.toString());
+    } catch {}
+    setShowResumePrompt(false);
+  }
+
+  function resumeLast() {
+    try {
+      const saved = localStorage.getItem('lastEpisodeId');
+      if (saved) {
+        setEpisodeId(saved);
+        setUploadStatus('processing'); // EpisodeUpload will resume polling
+        const url = new URL(window.location.href);
+        url.searchParams.set('episodeId', saved);
+        window.history.replaceState({}, '', url.toString());
+      }
+    } catch {}
+    setShowResumePrompt(false);
+  }
 
   async function fetchClips(id: string) {
     try {
@@ -47,38 +77,41 @@ export default function Page() {
     if (didResumeRef.current) return;
     const urlId = new URLSearchParams(window.location.search).get("episodeId");
     const saved = localStorage.getItem("lastEpisodeId");
-    const id = urlId || saved;
-    if (!id) return;
+    
+    if (urlId) {
+      didResumeRef.current = true;
+      setEpisodeId(urlId);
 
-    didResumeRef.current = true;
-    setEpisodeId(id);
-
-    (async () => {
-      try {
-        console.log("[resume] checking progress for", id);
-        const result = await getProgress(id);
-        
-        handleApiResult(
-          result,
-          (data) => {
-            const stage = String(data.progress?.stage || data.status || "").toLowerCase();
-            console.log("[resume] stage:", stage);
-            if (stage === "completed") {
-              fetchClips(id);
-            } else {
-              setUploadStatus('processing'); // tell EpisodeUpload to resume polling
+      (async () => {
+        try {
+          console.log("[resume] checking progress for", urlId);
+          const result = await getProgress(urlId);
+          
+          handleApiResult(
+            result,
+            (data) => {
+              const stage = String(data.progress?.stage || data.status || "").toLowerCase();
+              console.log("[resume] stage:", stage);
+              if (stage === "completed") {
+                fetchClips(urlId);
+              } else {
+                setUploadStatus('processing'); // tell EpisodeUpload to resume polling
+              }
+            },
+            (error) => {
+              console.warn("[resume] progress check failed:", error);
+              setUploadStatus('processing'); // safe default: start polling
             }
-          },
-          (error) => {
-            console.warn("[resume] progress check failed:", error);
-            setUploadStatus('processing'); // safe default: start polling
-          }
-        );
-      } catch (e) {
-        console.warn("[resume] failed, defaulting to processing", e);
-        setUploadStatus('processing');
-      }
-    })();
+          );
+        } catch (e) {
+          console.warn("[resume] failed, defaulting to processing", e);
+          setUploadStatus('processing');
+        }
+      })();
+    } else if (saved) {
+      // Don't auto-resume; let the user choose.
+      setShowResumePrompt(true);
+    }
   }, []);
 
   // 🚀 Reset state when no episodeId (fresh page load)
@@ -103,6 +136,28 @@ export default function Page() {
 
   return (
     <main className="min-h-screen p-6 max-w-5xl mx-auto">
+      {showResumePrompt && (
+        <div className="rounded-xl border border-[#1e2636] bg-white/[0.04] p-4 mb-6 flex items-center justify-between gap-3">
+          <div className="text-sm text-white/80">
+            We found a previous session. Would you like to resume it, or start a new upload?
+          </div>
+          <div className="flex gap-2">
+            <button 
+              className="px-4 py-2 text-sm bg-white/10 hover:bg-white/20 text-white rounded-lg transition-colors"
+              onClick={startNewUpload}
+            >
+              Start new upload
+            </button>
+            <button 
+              className="px-4 py-2 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-colors"
+              onClick={resumeLast}
+            >
+              Resume
+            </button>
+          </div>
+        </div>
+      )}
+
       <div className="mb-6">
         <h1 className="text-3xl font-extrabold tracking-tight text-white">
           PodPromo <span className="text-emerald-400">AI</span>
@@ -118,6 +173,41 @@ export default function Page() {
         initialUploadStatus={uploadStatus}
         onCompleted={() => episodeId && fetchClips(episodeId)}
       />
+
+      {/* Session Controls */}
+      {episodeId && (
+        <div className="rounded-xl border border-[#1e2636] bg-white/[0.04] p-4 mb-6">
+          <div className="flex items-center justify-between mb-2">
+            <h2 className="text-lg font-semibold text-white">Current Session</h2>
+            <div className="flex gap-2">
+              <button 
+                className="px-4 py-2 text-sm bg-white/10 hover:bg-white/20 text-white rounded-lg transition-colors"
+                onClick={startNewUpload}
+              >
+                Start another upload
+              </button>
+              <button 
+                className="px-4 py-2 text-sm bg-red-600/20 hover:bg-red-600/30 text-red-400 rounded-lg transition-colors"
+                onClick={() => {
+                  try { localStorage.removeItem('lastEpisodeId'); } catch {}
+                  setEpisodeId(null);
+                  setUploadStatus('idle');
+                  setClips([]);
+                  setClipsLoading(false);
+                  try {
+                    const url = new URL(window.location.href);
+                    url.searchParams.delete('episodeId');
+                    window.history.replaceState({}, '', url.toString());
+                  } catch {}
+                }}
+              >
+                Clear session
+              </button>
+            </div>
+          </div>
+          <p className="text-sm text-white/60">Episode ID: {episodeId.slice(0, 8)}...</p>
+        </div>
+      )}
 
       {/* Top Clips */}
       <section id="clips" className="mt-8">
