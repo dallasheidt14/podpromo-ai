@@ -3,7 +3,7 @@
 import { useState } from 'react';
 import { motion } from 'framer-motion';
 import { Video, Settings, Play, Sparkles, Clock, Target } from 'lucide-react';
-import { Episode } from '../../shared/types';
+import { Episode } from '@shared/types';
 import { AnimatePresence } from 'framer-motion';
 
 interface ClipGenerationProps {
@@ -20,17 +20,11 @@ export default function ClipGeneration({ episode, onGenerateClips, isGenerating 
 
   const handleGenerate = async () => {
     try {
-      const response = await fetch('/api/generate-clips', {
-        method: 'POST',
+      const response = await fetch(`/api/episodes/${episode.id}/clips?regenerate=true`, {
+        method: 'GET',
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-          episode_id: episode.id,
-          target_count: clipCount,
-          min_duration: minDuration,
-          max_duration: maxDuration,
-        }),
       });
 
       if (!response.ok) {

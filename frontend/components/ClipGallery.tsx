@@ -3,8 +3,8 @@
 import { useState } from 'react';
 import { motion } from 'framer-motion';
 import { Video, Download, Play, Clock, Star, CheckCircle, AlertCircle, Eye } from 'lucide-react';
-import { Clip } from '../../shared/types';
-import { toPct, toPctLabel, toHMMSS, toSec } from '../../shared/format';
+import { Clip } from '@shared/types';
+import { toPct, toPctLabel, toHMMSS, toSec } from '@shared/format';
 import ClipDetail from './ClipDetail';
 
 interface ClipGalleryProps {

@@ -4,9 +4,9 @@ import { useState, useCallback, useEffect, useRef } from 'react';
 import { useDropzone } from 'react-dropzone';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Upload, FileAudio, FileVideo, X, CheckCircle, AlertCircle, Clock, Loader2 } from 'lucide-react';
-import { Episode, Clip, ProgressInfo } from '../../shared/types';
-import { normalizeClip, normalizeProgress } from '../../shared/normalize';
-import { fetchJsonWithBackoff } from '../../shared/backoff';
+import { Episode, Clip, ProgressInfo } from '@shared/types';
+import { normalizeClip, normalizeProgress } from '@shared/normalize';
+import { fetchJsonWithBackoff } from '@shared/backoff';
 
 type Props = {
   onEpisodeUploaded: (id: string) => void;

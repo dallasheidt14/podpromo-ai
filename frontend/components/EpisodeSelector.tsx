@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect } from 'react';
-import { Episode } from '../../shared/types';
+import { Episode } from '@shared/types';
 
 interface EpisodeSelectorProps {
   onEpisodeSelected: (episodeId: string) => void;

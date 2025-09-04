@@ -2,8 +2,8 @@
 
 import { Dialog } from "@headlessui/react";
 import { useEffect, useState } from "react";
-import type { Clip } from "../../shared/types";
-import { toPct, toPctLabel, toHMMSS } from "../../shared/format";
+import type { Clip } from "@shared/types";
+import { toPct, toPctLabel, toHMMSS } from "@shared/format";
 
 export default function ClipDetail({ clip, onClose }: { clip: Clip | null; onClose: () => void }) {
   const [open, setOpen] = useState(!!clip);

@@ -3,8 +3,8 @@
 import { useEffect, useRef, useState } from 'react';
 import EpisodeUpload from '../components/EpisodeUpload';
 import ClipGallery from '../components/ClipGallery';
-import { normalizeClip } from '../../shared/normalize';
-import { Clip } from '../../shared/types';
+import { normalizeClip } from '@shared/normalize';
+import { Clip } from '@shared/types';
 
 export default function Page() {
   const [episodeId, setEpisodeId] = useState<string | null>(null);
