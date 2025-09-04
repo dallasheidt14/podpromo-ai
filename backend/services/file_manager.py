@@ -28,8 +28,13 @@ class FileManager:
         self.upload_dir.mkdir(parents=True, exist_ok=True)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Start background cleanup task
-        asyncio.create_task(self._background_cleanup())
+        # Background task will be started in start_background_tasks()
+        self._cleanup_task = None
+    
+    def start_background_tasks(self):
+        """Start background tasks - call this during app startup when event loop is running"""
+        if self._cleanup_task is None:
+            self._cleanup_task = asyncio.create_task(self._background_cleanup())
     
     async def validate_upload(self, file_path: str, file_size: int) -> Dict[str, any]:
         """Validate uploaded file before processing"""

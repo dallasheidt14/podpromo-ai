@@ -5,6 +5,8 @@ ViralMomentDetector - Intelligent content-based segmentation for viral clips
 import re
 import logging
 from typing import List, Dict, Optional
+from functools import lru_cache
+from config_loader import load_config
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +144,156 @@ class ViralMomentDetector:
         
         return base_patterns
     
+    # --- Insight V2 helpers (lightweight, no heavy deps) ---
+    CLAUSE_END = re.compile(r"[.!?](?:\s+|$)")
+    CONTRAST = re.compile(r"(most (people|folks)|everyone|nobody).{0,40}\b(actually|but|instead)\b", re.I)
+    CAUSAL = re.compile(r"\b(because|therefore|so|which means)\b", re.I)
+    HAS_NUM = re.compile(r"\b\d+(?:\.\d+)?(?:%|k|m|b)?\b", re.I)
+    COMPAR = re.compile(r"\b(vs\.?|versus|more than|less than|bigger than|smaller than)\b", re.I)
+    IMPER = re.compile(r"\b(try|avoid|do|don['']t|stop|start|focus|use|measure|swap|choose|should|need|must)\b", re.I)
+    HEDGE = re.compile(r"\b(maybe|probably|i think|i guess|kinda|sort of)\b", re.I)
+    COORD = re.compile(r"^(and|but|so|or|yet|nor)\b", re.I)
+    EVIDENCE_TOKEN = re.compile(r"\b\d+(?:\.\d+)?(?:%|k|m|b|\$)?\b|\bvs\.?|versus\b|more than|less than", re.I)
+    
+    def _span_duration(self, transcript, i0, i1) -> float:
+        """Calculate duration between two transcript indices"""
+        return float(transcript[i1]['end'] - transcript[i0]['start'])
+    
+    def _token_count(self, s: str) -> int:
+        """Count tokens in a string"""
+        return len(re.findall(r"[A-Za-z']+", s or ""))
+    
+    def _looks_evidential(self, s: str) -> bool:
+        """Check if text contains evidence tokens or causal markers"""
+        return bool(self.EVIDENCE_TOKEN.search(s or "")) or bool(self.CAUSAL.search(s or ""))
+    
+    def _expand_insight_window(self, transcript, i, max_s=25.0):
+        """
+        Start at segment i; expand forward with 'soft boundary' rules:
+          - If current seg ends with a clause mark + NEXT starts capitalized, we usually stop…
+          - …UNLESS the current clause is a short opener (≤8 tokens), OR the next clause
+            starts with a coordinator (but/and/so) OR contains clear evidence.
+        Never exceed max_s from the seed start.
+        Optionally borrow the previous very-short setup (≤3s) if it's not low-info.
+        """
+        start = i
+        end = i
+        t0 = float(transcript[i]['start'])
+
+        # forward growth
+        while end + 1 < len(transcript):
+            nxt_end = float(transcript[end + 1]['end'])
+            if (nxt_end - t0) > max_s:
+                break
+
+            cur_txt = (transcript[end].get('text') or "").replace("'", "'")
+            nxt_txt = (transcript[end + 1].get('text') or "").replace("'", "'").lstrip()
+
+            # Hard boundary heuristic: current ends with clause mark AND next starts with capital
+            ends_clause = bool(self.CLAUSE_END.search(cur_txt))
+            next_cap    = bool(nxt_txt[:1].isupper())
+
+            # Soft-openers: very short first/preceding clause (<= 8 tokens)
+            short_opener = (self._token_count(cur_txt) <= 8)
+
+            # Continuation signals: coordinating conjunction at start OR next clause has evidence
+            continuation = bool(self.COORD.match(nxt_txt)) or self._looks_evidential(nxt_txt)
+
+            # Decision:
+            # - If hard boundary detected AND NOT (short opener OR continuation), stop.
+            if ends_clause and next_cap and not (short_opener or continuation):
+                break
+
+            end += 1
+
+        # Borrow a short setup segment before i if close and not low-info
+        if start > 0:
+            prev = transcript[start - 1]
+            if (float(transcript[i]['start']) - float(prev['start'])) <= 3.0:
+                txt_prev = prev.get('text') or ""
+                if not self._is_low_info(txt_prev):
+                    start -= 1
+
+        return start, end
+    
+    def _is_low_info(self, text: str) -> bool:
+        """Check if text is mostly filler/low-information content"""
+        toks = re.findall(r"[A-Za-z']+", text.lower())
+        if not toks:
+            return True
+        fillers = set("like you know kinda sort of basically literally actually really just i think maybe probably".split())
+        f = sum(1 for t in toks if t in fillers)
+        return (f / max(1, len(toks))) > 0.5
+    
+    @lru_cache(maxsize=128)
+    def _sentences(self, text: str) -> List[str]:
+        """Split text into sentences (cached)"""
+        return re.split(r'(?<=[.!?])\s+', text.strip())
+    
+    @lru_cache(maxsize=128)
+    def _tokens(self, text: str) -> List[str]:
+        """Extract tokens from text (cached)"""
+        return re.findall(r"[A-Za-z]+", text)
+    
+    def _noun_burst(self, text: str) -> bool:
+        """Detect concrete noun burst: 2+ proper-looking capitalized tokens not in sentence-initial position"""
+        sents = self._sentences(text)
+        for s in sents:
+            toks = self._tokens(s)
+            caps = 0
+            for idx, t in enumerate(toks):
+                if idx == 0:  # ignore sentence-initial capital
+                    continue
+                if t[0].isupper():
+                    caps += 1
+            if caps >= 2:
+                return True
+        return False
+    
+    def _evidence_and_confidence(self, text: str) -> tuple[bool, float]:
+        """
+        Returns (has_evidence, confidence 0.5..0.9).
+        Evidence = any of {contrast, number, comparison}. Imperatives add confidence;
+        hedges reduce confidence slightly. Start at 0.6.
+        """
+        t = (text or "").strip()
+        conf = 0.6
+        hard_hits = 0
+        
+        if self.CONTRAST.search(t): 
+            conf += 0.10
+            hard_hits += 1
+        if self.HAS_NUM.search(t):  
+            conf += 0.10
+            hard_hits += 1
+        if self.COMPAR.search(t):   
+            conf += 0.05
+            hard_hits += 1
+        if self.CAUSAL.search(t):   
+            conf += 0.05
+        if self.IMPER.search(t):    
+            conf += 0.10
+        if self.HEDGE.search(t):    
+            conf -= 0.10
+        if self._noun_burst(t):     
+            conf += 0.05
+        
+        conf = max(0.5, min(0.9, conf))
+        has_ev = (hard_hits >= 1)
+        return has_ev, conf
+    
+    def _avg_info_density(self, transcript, i0, i1) -> float | None:
+        """
+        Optional: if segments have 'info_density', return the average as a tiny nudge.
+        Safe to return None if unavailable.
+        """
+        vals = []
+        for j in range(i0, i1+1):
+            v = transcript[j].get('info_density')
+            if isinstance(v, (int, float)):
+                vals.append(float(v))
+        return (sum(vals)/len(vals)) if vals else None
+    
     def find_moments(self, transcript: List[Dict]) -> List[Dict]:
         """Find potential viral moments based on content patterns"""
         try:
@@ -151,8 +303,12 @@ class ViralMomentDetector:
             stories = self._find_complete_stories(transcript)
             moments.extend(stories)
             
-            # Find insights - tightened duration
-            insights = self._find_insights(transcript)
+            # Find insights - use V2 if enabled
+            config = load_config()
+            if config.get("insight_v2", {}).get("enabled", False):
+                insights = self._find_insights_v2(transcript)
+            else:
+                insights = self._find_insights_v1(transcript)
             moments.extend(insights)
             
             # Find hot takes - tightened duration
@@ -350,8 +506,8 @@ class ViralMomentDetector:
         
         return True
     
-    def _find_insights(self, transcript: List[Dict]) -> List[Dict]:
-        """Find insight moments - tightened duration"""
+    def _find_insights_v1(self, transcript: List[Dict]) -> List[Dict]:
+        """Find insight moments - V1 implementation (tightened duration)"""
         insights = []
         
         for i, segment in enumerate(transcript):
@@ -379,6 +535,57 @@ class ViralMomentDetector:
                     break
         
         return insights
+    
+    def _find_insights_v2(self, transcript: List[Dict]) -> List[Dict]:
+        """
+        Insight V2:
+        - Trigger on your existing markers.
+        - Expand window by clauses (≤ max_duration).
+        - Require evidence (numbers/comparison/contrast) OR be short & punchy (≤12s).
+        - Confidence reflects structure; small nudge for high info_density.
+        - Keep min/max duration + self-contained checks.
+        """
+        cfg = self.moment_patterns.get('insight', {})
+        min_d = float(cfg.get('min_duration', 10.0))
+        max_d = float(cfg.get('max_duration', 25.0))
+        insights = []
+
+        for i, seg in enumerate(transcript):
+            raw = (seg.get('text') or "")
+            text = raw.replace("'", "'")  # normalize smart quotes
+            low = text.lower()
+            if not any(re.search(p, low, flags=re.I) for p in cfg.get('markers', [])):
+                continue
+
+            i0, i1 = self._expand_insight_window(transcript, i, max_s=max_d)
+            start = float(transcript[i0]['start']); end = float(transcript[i1]['end'])
+            dur = end - start
+            window = self._extract_text(transcript, i0, i1)
+
+            if not (min_d <= dur <= max_d):
+                continue
+
+            if not self._is_self_contained(window):
+                continue
+
+            has_ev, conf = self._evidence_and_confidence(window)
+
+            if not has_ev:
+                if dur > 12.0:
+                    continue
+                if not (self.IMPER.search(window) or self.CAUSAL.search(window)):
+                    continue
+                conf = max(0.55, conf - 0.05)
+
+            # optional info_density nudge
+            idv = self._avg_info_density(transcript, i0, i1)
+            if isinstance(idv, float) and idv >= 0.60:
+                conf = min(0.90, conf + 0.05)
+
+            insights.append({"start":start, "end":end, "text":window, "type":"insight", "confidence":conf})
+
+        deduped = self._deduplicate_moments(insights)
+        return deduped
     
     def _find_hot_takes(self, transcript: List[Dict]) -> List[Dict]:
         """Find hot take moments - tightened duration"""

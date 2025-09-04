@@ -1,6 +1,6 @@
 "use client";
 import { useState } from "react";
-import { useAuth } from "@/contexts/AuthContext";
+import { useAuth } from "@/src/contexts/AuthContext";
 
 interface SignupFormProps {
   onSwitchToLogin: () => void;

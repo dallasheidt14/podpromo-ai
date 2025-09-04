@@ -19,7 +19,7 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en">
-      <body className={`${inter.className} bg-gray-50 text-gray-900 antialiased`}>
+      <body className={`${inter.className} min-h-screen bg-[radial-gradient(1200px_600px_at_20%_-10%,#0b0f1a_0%,#05070d_60%,#040507_100%)] text-white antialiased`}>
         <div className="min-h-screen">
           {children}
         </div>

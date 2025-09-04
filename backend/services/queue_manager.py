@@ -58,10 +58,15 @@ class QueueManager:
         self.job_handlers: Dict[str, Callable] = {}
         self.lock = asyncio.Lock()
         
-        # Start the queue processor
-        asyncio.create_task(self._process_queue())
+        # Background task will be started in start_processing()
+        self._processor_task = None
         
         logger.info(f"Queue manager initialized with {max_concurrent_jobs} concurrent jobs, max queue size {max_queue_size}")
+    
+    def start_processing(self):
+        """Start the queue processor - call this during app startup when event loop is running"""
+        if self._processor_task is None:
+            self._processor_task = asyncio.create_task(self._process_queue())
     
     async def submit_job(self, job_type: str, priority: JobPriority = JobPriority.NORMAL, 
                          metadata: Dict[str, Any] = None) -> str:

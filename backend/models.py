@@ -3,7 +3,7 @@ Database models for the podcast clip generation system
 """
 
 from datetime import datetime
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Union
 # Temporarily disabled for Python 3.13 compatibility
 # from sqlalchemy import Column, Integer, String, Float, DateTime, Text, Boolean, JSON, ForeignKey
 # from sqlalchemy.orm import relationship, declarative_base
@@ -147,6 +147,7 @@ class Episode(BaseModel):
     duration: Optional[float] = None
     audio_path: Optional[str] = None
     transcript: Optional[List[TranscriptSegment]] = None
+    clips: Optional[List[Dict[str, Any]]] = None  # Store generated clips
     error: Optional[str] = None
     uploaded_at: Optional[datetime] = None
     processed_at: Optional[datetime] = None
@@ -190,7 +191,7 @@ class HealthCheck(BaseModel):
     status: str
     timestamp: datetime
     version: str
-    services: Dict[str, bool]
+    services: Dict[str, Union[bool, Dict[str, Any]]]
 
 class UploadResponse(BaseModel):
     """Pydantic model for upload responses"""

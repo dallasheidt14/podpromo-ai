@@ -1,5 +1,5 @@
 "use client";
-import { useAuth } from "@/contexts/AuthContext";
+import { useAuth } from "@/src/contexts/AuthContext";
 import UsageDisplay from "./UsageDisplay";
 import UpgradeButton from "./UpgradeButton";
 

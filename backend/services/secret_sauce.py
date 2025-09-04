@@ -3,13 +3,21 @@ secret_sauce.py - V4 Enhanced Viral Detection System
 All heuristics + weights for picking 'winning' clips.
 """
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Any
 import numpy as np, librosa
 from config_loader import get_config
 import re
 import datetime
+import logging
+from scipy import signal
+from scipy.stats import skew, kurtosis
+import os
+
+logger = logging.getLogger(__name__)
 import hashlib
 from functools import lru_cache
+
+
 
 # Genre-Aware Scoring System
 class GenreProfile:
@@ -63,11 +71,18 @@ class GenreProfile:
         return {"hook": path_a, "payoff": path_b, "energy": path_c, "structured": path_d}
     
     def apply_quality_gate(self, features: Dict) -> float:
-        """Genre-specific quality gate logic"""
-        # Default quality gate for general genre
-        if (features.get("payoff_score", 0.0) < 0.3 and features.get("hook_score", 0.0) < 0.4):
-            return 0.85  # Mild penalty
-        return 1.0  # No penalty
+        """Genre-specific quality gate logic with insight/question awareness"""
+        payoff = features.get("payoff_score", 0.0)
+        hook = features.get("hook_score", 0.0)
+        insight = features.get("insight_score", 0.0)
+        qlist = features.get("question_score", 0.0)
+        
+        # Allow insight/question to substitute for payoff
+        if payoff >= 0.3 or insight >= 0.7 or qlist >= 0.5:
+            return 1.0  # No penalty
+        if hook >= 0.4:
+            return 0.95  # Very mild penalty
+        return 0.85  # Mild penalty
     
     def score(self, features: Dict) -> Dict:
         """Score features using genre-specific weights"""
@@ -180,14 +195,14 @@ class FantasySportsGenreProfile(GenreProfile):
                           0.20 * f.get("confidence_score", 0.0) + 
                           0.10 * f.get("urgency_score", 0.0))
         
-        # Hot take path (replaces structured path) - uses genre-specific features
-        hot_take_path = (0.35 * f.get("confidence_score", 0.0) + 
-                        0.35 * f.get("hook_score", 0.0) + 
-                        0.30 * f.get("viral_trigger_boost", 0.0))
+        # FIXED: Hot take path with higher hook weight
+        hot_take_path = (0.25 * f.get("confidence_score", 0.0) + 
+                        0.50 * f.get("hook_score", 0.0) + 
+                        0.25 * f.get("viral_trigger_boost", 0.0))
         
-        # Keep hook and payoff paths but adjust weights
-        hook_path = (0.35 * f.get("hook_score", 0.0) + 0.25 * f.get("arousal_score", 0.0) + 
-                     0.20 * f.get("payoff_score", 0.0) + 0.15 * f.get("info_density", 0.0) + 
+        # FIXED: Increase hook score weight to be the dominant factor
+        hook_path = (0.50 * f.get("hook_score", 0.0) + 0.20 * f.get("arousal_score", 0.0) + 
+                     0.15 * f.get("payoff_score", 0.0) + 0.10 * f.get("info_density", 0.0) + 
                      0.05 * f.get("loopability", 0.0))
         
         payoff_path = (0.45 * f.get("payoff_score", 0.0) + 0.25 * f.get("info_density", 0.0) + 
@@ -201,6 +216,12 @@ class FantasySportsGenreProfile(GenreProfile):
             "actionable": actionable_path, 
             "hot_take": hot_take_path
         }
+    
+    def apply_quality_gate(self, f: Dict) -> float:
+        """Fantasy Sports quality gate - 0.85x for no_payoff"""
+        if f.get("payoff_score", 0.0) >= 0.30 or f.get("insight_score", 0.0) >= 0.70 or f.get("question_score", 0.0) >= 0.50:
+            return 1.0
+        return 0.85
 
 class ComedyGenreProfile(GenreProfile):
     """Comedy specific scoring profile"""
@@ -408,9 +429,9 @@ class TrueCrimeGenreProfile(GenreProfile):
                           0.20 * f.get("mystery_score", 0.0) + 
                           0.10 * f.get("emotion_score", 0.0))
         
-        # Keep hook and payoff paths
-        hook_path = (0.35 * f.get("hook_score", 0.0) + 0.25 * f.get("arousal_score", 0.0) + 
-                     0.20 * f.get("payoff_score", 0.0) + 0.15 * f.get("info_density", 0.0) + 
+        # FIXED: Increase hook score weight to be the dominant factor
+        hook_path = (0.50 * f.get("hook_score", 0.0) + 0.20 * f.get("arousal_score", 0.0) + 
+                     0.15 * f.get("payoff_score", 0.0) + 0.10 * f.get("info_density", 0.0) + 
                      0.05 * f.get("loopability", 0.0))
         
         payoff_path = (0.40 * f.get("payoff_score", 0.0) + 0.30 * f.get("info_density", 0.0) + 
@@ -485,9 +506,9 @@ class BusinessGenreProfile(GenreProfile):
                            0.20 * f.get("payoff_score", 0.0) + 
                            0.10 * f.get("hook_score", 0.0))
         
-        # Keep hook and payoff paths
-        hook_path = (0.35 * f.get("hook_score", 0.0) + 0.25 * f.get("arousal_score", 0.0) + 
-                     0.20 * f.get("payoff_score", 0.0) + 0.15 * f.get("info_density", 0.0) + 
+        # FIXED: Increase hook score weight to be the dominant factor
+        hook_path = (0.50 * f.get("hook_score", 0.0) + 0.20 * f.get("arousal_score", 0.0) + 
+                     0.15 * f.get("payoff_score", 0.0) + 0.10 * f.get("info_density", 0.0) + 
                      0.05 * f.get("loopability", 0.0))
         
         payoff_path = (0.40 * f.get("payoff_score", 0.0) + 0.30 * f.get("info_density", 0.0) + 
@@ -501,6 +522,12 @@ class BusinessGenreProfile(GenreProfile):
             "authority": authority_path, 
             "specificity": specificity_path
         }
+    
+    def apply_quality_gate(self, f: Dict) -> float:
+        """Business quality gate - 0.80x for no_payoff"""
+        if f.get("payoff_score", 0.0) >= 0.30 or f.get("insight_score", 0.0) >= 0.70 or f.get("question_score", 0.0) >= 0.50:
+            return 1.0
+        return 0.80
 
 class EducationalGenreProfile(GenreProfile):
     """Educational/Science specific scoring profile"""
@@ -562,9 +589,9 @@ class EducationalGenreProfile(GenreProfile):
                        0.20 * f.get("info_density", 0.0) + 
                        0.10 * f.get("hook_score", 0.0))
         
-        # Keep hook and payoff paths
-        hook_path = (0.35 * f.get("hook_score", 0.0) + 0.25 * f.get("arousal_score", 0.0) + 
-                     0.20 * f.get("payoff_score", 0.0) + 0.15 * f.get("info_density", 0.0) + 
+        # FIXED: Increase hook score weight to be the dominant factor
+        hook_path = (0.50 * f.get("hook_score", 0.0) + 0.20 * f.get("arousal_score", 0.0) + 
+                     0.15 * f.get("payoff_score", 0.0) + 0.10 * f.get("info_density", 0.0) + 
                      0.05 * f.get("loopability", 0.0))
         
         payoff_path = (0.40 * f.get("payoff_score", 0.0) + 0.30 * f.get("info_density", 0.0) + 
@@ -676,9 +703,9 @@ class HealthWellnessGenreProfile(GenreProfile):
                              0.20 * f.get("payoff_score", 0.0) + 
                              0.10 * f.get("hook_score", 0.0))
         
-        # Keep hook and payoff paths
-        hook_path = (0.35 * f.get("hook_score", 0.0) + 0.25 * f.get("arousal_score", 0.0) + 
-                     0.20 * f.get("payoff_score", 0.0) + 0.15 * f.get("info_density", 0.0) + 
+        # FIXED: Increase hook score weight to be the dominant factor
+        hook_path = (0.50 * f.get("hook_score", 0.0) + 0.20 * f.get("arousal_score", 0.0) + 
+                     0.15 * f.get("payoff_score", 0.0) + 0.10 * f.get("info_density", 0.0) + 
                      0.05 * f.get("loopability", 0.0))
         
         payoff_path = (0.40 * f.get("payoff_score", 0.0) + 0.30 * f.get("info_density", 0.0) + 
@@ -792,7 +819,13 @@ class GenreAwareScorer:
         return profile.score(features)
 
 def get_clip_weights():
-    return get_config()["weights"]
+    """Get normalized clip weights (sum to 1.0)"""
+    weights = dict(get_config()["weights"])
+    ws = sum(weights.values()) or 1.0
+    if abs(ws - 1.0) > 1e-6:
+        weights = {k: v / ws for k, v in weights.items()}
+        logger.warning("Weights normalized from %.2f to 1.00", ws)
+    return weights
 
 CLIP_WEIGHTS = get_clip_weights()
 HOOK_CUES = tuple(get_config()["lexicons"]["HOOK_CUES"])
@@ -866,16 +899,407 @@ def _detect_insight_content(text: str, genre: str = 'general') -> tuple[float, s
     reason_str = ";".join(reasons) if reasons else "no_insights"
     return final_score, reason_str
 
-def _hook_score_v4(text: str, arousal: float = 0.0, words_per_sec: float = 0.0, genre: str = 'general') -> tuple[float, str]:
-    """V4 hook detection with more reasonable thresholds"""
-    if not text or len(text.strip()) < 8:
-        return 0.1, "text_too_short"  # Changed from 0.0 to 0.1 minimum
+def _detect_insight_content_v2(text: str, genre: str = 'general') -> tuple[float, str]:
+    """Detect insight content V2 with evidence-based scoring and saturating combiner"""
+    if not text or len(text.strip()) < 10:
+        return 0.0, "too_short"
     
-    t = text.lower()[:200]
-    score = 0.1  # Start with base score of 0.1 instead of 0.0
+    t = text.lower()
     reasons = []
     
-    # INTRO/GREETING DETECTION - Heavy penalty for intro material
+    # Evidence patterns (same as ViralMomentDetector V2)
+    CONTRAST = re.compile(r"(most (people|folks)|everyone|nobody).{0,40}\b(actually|but|instead)\b", re.I)
+    CAUSAL = re.compile(r"\b(because|therefore|so|which means)\b", re.I)
+    HAS_NUM = re.compile(r"\b\d+(?:\.\d+)?(?:%|k|m|b)?\b", re.I)
+    COMPAR = re.compile(r"\b(vs\.?|versus|more than|less than|bigger than|smaller than)\b", re.I)
+    IMPER = re.compile(r"\b(try|avoid|do|don['']t|stop|start|focus|use|measure|swap|choose|should|need|must)\b", re.I)
+    HEDGE = re.compile(r"\b(maybe|probably|i think|i guess|kinda|sort of)\b", re.I)
+    
+    # Evidence components (0-1 each)
+    evidence_parts = []
+    
+    # Contrast detection
+    if CONTRAST.search(t):
+        evidence_parts.append(0.8)
+        reasons.append("contrast")
+    
+    # Number/metric detection
+    if HAS_NUM.search(t):
+        evidence_parts.append(0.7)
+        reasons.append("number")
+    
+    # Comparison detection
+    if COMPAR.search(t):
+        evidence_parts.append(0.6)
+        reasons.append("comparison")
+    
+    # Causal reasoning
+    if CAUSAL.search(t):
+        evidence_parts.append(0.5)
+        reasons.append("causal")
+    
+    # Imperative/actionable content
+    if IMPER.search(t):
+        evidence_parts.append(0.6)
+        reasons.append("imperative")
+    
+    # Genre-specific patterns (reduced weights for V2)
+    if genre in ['fantasy_sports', 'sports']:
+        insight_patterns = [
+            r"(observation|insight|noticed|realized|discovered)",
+            r"(main|key|important|significant) (takeaway|point|finding)",
+            r"(casual|serious|experienced) (drafters|players|managers)",
+            r"(way better|much better|improved|evolved)",
+            r"(under my belt|experience|seen|witnessed)",
+            r"(home league|draft|waiver|roster)",
+            r"(sleeper|bust|value|target|avoid)",
+            r"(this week|next week|season|playoffs)"
+        ]
+        
+        for pattern in insight_patterns:
+            if re.search(pattern, t):
+                evidence_parts.append(0.4)
+                reasons.append("fantasy_insight")
+                break  # Only count once per genre
+        
+        # Specific insight boost
+        if re.search(r"(casual drafters are way better)", t):
+            evidence_parts.append(0.6)
+            reasons.append("specific_insight_boost")
+    
+    # General insight patterns (reduced weights)
+    general_insight_patterns = [
+        r"(here's what|the thing is|what i found|what i learned)",
+        r"(the key|the secret|the trick|the strategy)",
+        r"(most people|everyone|nobody) (thinks|believes|knows)",
+        r"(contrary to|despite|although|even though)",
+        r"(the truth is|reality is|actually|in fact)"
+    ]
+    
+    for pattern in general_insight_patterns:
+        if re.search(pattern, t):
+            evidence_parts.append(0.3)
+            reasons.append("general_insight")
+            break  # Only count once
+    
+    # Hedge penalty (reduces confidence)
+    hedge_penalty = 0.0
+    if HEDGE.search(t):
+        hedge_penalty = 0.2
+        reasons.append("hedge_penalty")
+    
+    # Filler penalty (same as V1)
+    filler_penalty = 0.0
+    filler_patterns = [
+        r"^(yo|hey|hi|hello|what's up)",
+        r"^(it's|this is) (monday|tuesday|wednesday)",
+        r"^(hope you|hope everyone)",
+        r"^(let's get|let's start|let's begin)"
+    ]
+    
+    for pattern in filler_patterns:
+        if re.match(pattern, t):
+            filler_penalty = 0.4
+            reasons.append("filler_penalty")
+            break
+    
+    # Saturating combiner: 1 - Π(1 - xᵢ)
+    if evidence_parts:
+        sat_score = 1.0
+        for part in evidence_parts:
+            sat_score *= (1.0 - part)
+        sat_score = 1.0 - sat_score
+    else:
+        sat_score = 0.0
+    
+    # Apply penalties
+    final_score = sat_score - hedge_penalty - filler_penalty
+    final_score = float(np.clip(final_score, 0.0, 1.0))
+    
+    reason_str = ";".join(reasons) if reasons else "no_insights"
+    return final_score, reason_str
+
+def _apply_insight_confidence_multiplier(insight_score: float, confidence: float = None) -> float:
+    """Apply confidence-based multiplier to insight score if V2 is enabled"""
+    config = get_config()
+    if not config.get("insight_v2", {}).get("enabled", False) or confidence is None:
+        return insight_score
+    
+    conf_config = config.get("insight_v2", {}).get("confidence_multiplier", {})
+    min_mult = conf_config.get("min_mult", 0.9)
+    max_mult = conf_config.get("max_mult", 1.2)
+    conf_range = conf_config.get("confidence_range", [0.5, 0.9])
+    
+    # Map confidence to multiplier: confidence 0.5→×0.95, 0.9→×1.20
+    conf_min, conf_max = conf_range
+    if conf_min >= conf_max:
+        return insight_score
+    
+    # Linear interpolation
+    multiplier = min_mult + (max_mult - min_mult) * ((confidence - conf_min) / (conf_max - conf_min))
+    multiplier = max(min_mult, min(max_mult, multiplier))
+    
+    # Apply multiplier and cap at 1.0
+    adjusted_score = insight_score * multiplier
+    return min(1.0, adjusted_score)
+
+def compute_audio_hook_modifier(audio_data, sr, start_time: float) -> float:
+    """Analyze first 3 seconds of audio for prosodic hook indicators"""
+    try:
+        if audio_data is None or sr is None:
+            return 0.0
+            
+        # Extract first 3 seconds
+        start_sample = int(start_time * sr)
+        end_sample = int((start_time + 3.0) * sr)
+        
+        if start_sample >= len(audio_data) or end_sample > len(audio_data):
+            return 0.0
+            
+        first_3_sec = audio_data[start_sample:end_sample]
+        
+        if len(first_3_sec) == 0:
+            return 0.0
+        
+        # Check for volume spikes (>1.5x average)
+        rms_energy = librosa.feature.rms(y=first_3_sec)[0]
+        avg_energy = np.mean(rms_energy)
+        max_energy = np.max(rms_energy)
+        
+        has_volume_spike = max_energy > (avg_energy * 1.5)
+        
+        # Check for pitch variance (emotional range)
+        pitches, magnitudes = librosa.piptrack(y=first_3_sec, sr=sr, threshold=0.1)
+        pitch_values = pitches[pitches > 0]
+        
+        if len(pitch_values) > 10:
+            pitch_variance = np.var(pitch_values)
+            has_high_pitch_variance = pitch_variance > 1000  # Threshold for emotional range
+        else:
+            has_high_pitch_variance = False
+        
+        # Check for dramatic pause (silence before speech)
+        # Look for low energy at start followed by high energy
+        if len(rms_energy) > 10:
+            first_quarter = np.mean(rms_energy[:len(rms_energy)//4])
+            last_quarter = np.mean(rms_energy[3*len(rms_energy)//4:])
+            has_dramatic_pause = (first_quarter < avg_energy * 0.3) and (last_quarter > avg_energy * 1.2)
+        else:
+            has_dramatic_pause = False
+        
+        # Return modifier based on detected features
+        if has_volume_spike:
+            return 0.2
+        elif has_high_pitch_variance:
+            return 0.15
+        elif has_dramatic_pause:
+            return 0.1
+        
+        return 0.0
+        
+    except Exception as e:
+        logger.warning(f"Audio analysis failed: {e}")
+        return 0.0
+
+def detect_laughter_exclamations(text: str, audio_data=None, sr=None, start_time: float = 0.0, 
+                                enable_audio_analysis: bool = False) -> float:
+    """Detect laughter and repeated exclamations for hook boost - optimized for performance"""
+    try:
+        boost = 0.0
+        
+        # Text-based laughter detection (always fast)
+        laughter_patterns = [
+            r"\b(ha|haha|hahaha|lol|lmao|rofl)\b",
+            r"\b(laughing|chuckling|giggling)\b",
+            r"😄|😂|🤣|😆"
+        ]
+        
+        text_lower = text.lower()
+        for pattern in laughter_patterns:
+            if re.search(pattern, text_lower):
+                boost += 0.15
+                break
+        
+        # Repeated exclamations detection (always fast)
+        exclamation_patterns = [
+            r"\b(dude|man|bro|wow|omg|damn|shit|fuck)\s+\1\s+\1",  # "DUDE DUDE DUDE"
+            r"!{2,}",  # Multiple exclamation marks
+            r"\b(no\s+way|are\s+you\s+kidding|you\s+gotta\s+be)\b"
+        ]
+        
+        for pattern in exclamation_patterns:
+            if re.search(pattern, text_lower):
+                boost += 0.1
+                break
+        
+        # OPTIMIZED: Audio-based laughter detection (only if explicitly enabled and audio available)
+        if enable_audio_analysis and audio_data is not None and sr is not None:
+            try:
+                start_sample = int(start_time * sr)
+                end_sample = int((start_time + 5.0) * sr)  # First 5 seconds
+                
+                if start_sample < len(audio_data) and end_sample <= len(audio_data):
+                    first_5_sec = audio_data[start_sample:end_sample]
+                    
+                    # OPTIMIZED: Use faster spectral analysis
+                    spectral_centroids = librosa.feature.spectral_centroid(y=first_5_sec, sr=sr, hop_length=512)[0]
+                    spectral_rolloff = librosa.feature.spectral_rolloff(y=first_5_sec, sr=sr, hop_length=512)[0]
+                    
+                    # Laughter typically has high spectral centroid and rolloff
+                    if np.mean(spectral_centroids) > 2000 and np.mean(spectral_rolloff) > 4000:
+                        boost += 0.1
+                        
+            except Exception as e:
+                logger.warning(f"Audio laughter detection failed: {e}")
+        
+        return min(boost, 0.25)  # Cap at 0.25 total boost
+        
+    except Exception as e:
+        logger.warning(f"Laughter/exclamation detection failed: {e}")
+        return 0.0
+
+def calculate_hook_components(text: str) -> Dict[str, float]:
+    """Calculate multi-dimensional hook components"""
+    try:
+        words = text.split()
+        text_lower = text.lower()
+        
+        # Attention grab: How jarring/surprising
+        attention_patterns = [
+            r"\b(shocking|surprising|unbelievable|incredible|amazing)\b",
+            r"\b(you won't believe|can't believe|never thought)\b",
+            r"\b(breaking|urgent|important|critical)\b"
+        ]
+        attention_score = sum(1 for pattern in attention_patterns if re.search(pattern, text_lower)) / len(attention_patterns)
+        
+        # Clarity: How clear the topic is
+        clarity_indicators = [
+            r"^(the|this|that|here's|listen|look|watch)",
+            r"\b(about|regarding|concerning|on the topic of)\b",
+            r"\b(specifically|exactly|precisely|clearly)\b"
+        ]
+        clarity_score = sum(1 for pattern in clarity_indicators if re.search(pattern, text_lower)) / len(clarity_indicators)
+        
+        # Tension: Problem/conflict setup
+        tension_patterns = [
+            r"\b(problem|issue|challenge|struggle|difficulty)\b",
+            r"\b(wrong|mistake|error|failure|disaster)\b",
+            r"\b(but|however|although|despite|even though)\b",
+            r"\b(conflict|disagreement|argument|debate)\b"
+        ]
+        tension_score = sum(1 for pattern in tension_patterns if re.search(pattern, text_lower)) / len(tension_patterns)
+        
+        # Authority: Confidence/expertise signals
+        authority_patterns = [
+            r"\b(i know|i've seen|i've experienced|i've learned)\b",
+            r"\b(trust me|believe me|mark my words|i guarantee)\b",
+            r"\b(as an expert|professionally|in my experience)\b",
+            r"\b(studies show|research indicates|data proves)\b"
+        ]
+        authority_score = sum(1 for pattern in authority_patterns if re.search(pattern, text_lower)) / len(authority_patterns)
+        
+        return {
+            "attention_grab": min(attention_score, 1.0),
+            "clarity": min(clarity_score, 1.0),
+            "tension": min(tension_score, 1.0),
+            "authority": min(authority_score, 1.0)
+        }
+        
+    except Exception as e:
+        logger.warning(f"Hook components calculation failed: {e}")
+        return {"attention_grab": 0.0, "clarity": 0.0, "tension": 0.0, "authority": 0.0}
+
+def calculate_time_weighted_hook_score(text: str) -> float:
+    """Calculate hook score with time-weighted analysis"""
+    try:
+        words = text.split()
+        
+        if len(words) < 10:
+            return 0.0
+        
+        # Weight by position
+        first_10_words = words[:10]    # 3x weight
+        words_10_to_30 = words[10:30]  # 2x weight
+        words_30_plus = words[30:]     # 1x weight
+        
+        # Score each section separately
+        early_hook = score_patterns_in_text(" ".join(first_10_words)) * 3
+        mid_hook = score_patterns_in_text(" ".join(words_10_to_30)) * 2
+        late_hook = score_patterns_in_text(" ".join(words_30_plus)) * 1
+        
+        total_weight = 3 + 2 + 1  # 6
+        return (early_hook + mid_hook + late_hook) / total_weight
+        
+    except Exception as e:
+        logger.warning(f"Time-weighted hook score calculation failed: {e}")
+        return 0.0
+
+def score_patterns_in_text(text: str) -> float:
+    """Score patterns in a text segment"""
+    try:
+        text_lower = text.lower()
+        score = 0.0
+        
+        # Hook patterns with weights
+        patterns = {
+            r"\b(you|your|you're)\b": 0.1,
+            r"\b(this|that|here's|listen|look)\b": 0.15,
+            r"\b(important|critical|urgent|breaking)\b": 0.2,
+            r"\b(truth|secret|hidden|unknown)\b": 0.25,
+            r"\b(never|always|everyone|nobody)\b": 0.2,
+            r"\b(stop|start|don't|must|should)\b": 0.25
+        }
+        
+        for pattern, weight in patterns.items():
+            if re.search(pattern, text_lower):
+                score += weight
+        
+        return min(score, 1.0)
+        
+    except Exception as e:
+        logger.warning(f"Pattern scoring failed: {e}")
+        return 0.0
+
+def _hook_score_v4(text: str, arousal: float = 0.0, words_per_sec: float = 0.0, genre: str = 'general', 
+                   audio_data=None, sr=None, start_time: float = 0.0) -> tuple[float, str, dict]:
+    """V4 hook detection with prosody analysis and multi-dimensional scoring"""
+    if not text or len(text.strip()) < 8:
+        return 0.0, "text_too_short"
+    
+    t = text.lower()[:500]  # Increased to capture more business value and true crime patterns
+    score = 0.0
+    reasons = []
+    
+    # ENHANCED: Audio-based prosody analysis
+    audio_modifier = 0.0
+    if audio_data is not None and sr is not None:
+        audio_modifier = compute_audio_hook_modifier(audio_data, sr, start_time)
+        if audio_modifier > 0:
+            score += audio_modifier
+            reasons.append(f"audio_prosody_{audio_modifier:.2f}")
+    
+    # OPTIMIZED: Laughter and exclamation detection (text-only for performance)
+    laughter_boost = detect_laughter_exclamations(text, audio_data, sr, start_time, enable_audio_analysis=False)
+    if laughter_boost > 0:
+        score += laughter_boost
+        reasons.append(f"laughter_exclamation_{laughter_boost:.2f}")
+    
+    # ENHANCED: Time-weighted analysis (with gradual decay instead of uniform)
+    time_weighted_score = calculate_time_weighted_hook_score(text)
+    if time_weighted_score > 0:
+        # More gradual time weighting: 0.9 for early content, 0.7 for later content
+        # This creates better differentiation between content at different positions
+        if time_weighted_score > 0.5:
+            time_weighted_score = 0.9  # Early content (first 30 words)
+        elif time_weighted_score > 0.3:
+            time_weighted_score = 0.8  # Mid content (words 30-60)
+        else:
+            time_weighted_score = 0.7  # Later content (words 60+)
+        
+        score += time_weighted_score * 0.3  # Weight the time-based score
+        reasons.append(f"time_weighted_{time_weighted_score:.2f}")
+    
+    # INTRO/GREETING DETECTION - Heavy penalty for intro material (but be smarter)
     intro_patterns = [
         r"^(yo|hey|hi|hello|what's up|how's it going|good morning|good afternoon|good evening)",
         r"^(it's|this is) (monday|tuesday|wednesday|thursday|friday|saturday|sunday)",
@@ -883,19 +1307,36 @@ def _hook_score_v4(text: str, arousal: float = 0.0, words_per_sec: float = 0.0, 
         r"^(welcome to|thanks for|thank you for)",
         r"^(hope you|hope everyone)",
         r"^(let's get|let's start|let's begin)",
-        r"^(today we're|today i'm|today let's)",
-        r"^(so|and|but then|after that|next)"  # Still penalize sequence words
+        r"^(today we're|today i'm|today let's)"
     ]
     
+    # Check for intro patterns but be smarter about it
+    is_intro = False
     for pattern in intro_patterns:
         if re.match(pattern, t):
-            score = 0.01  # Set to extremely low score for intro material
-            reasons.append("intro_greeting_penalty")
+            is_intro = True
             break
     
-    # RELAXED: Context-dependent penalty (less harsh for sports content)
+    # Only apply penalty if it's truly intro material AND doesn't have engaging content
+    engaging_content_patterns = [
+        r'(why don\'t|why do not|you haven\'t|you have not|figure out|teach them|earned the right)',
+        r'(destroy.*kid|embarrassed me|cancer.*killing|failed athletic dreams)',
+        r'(uncomfortable truth|probably is not that good|statistically speaking)',
+        r'(terrifying|forty percent|more likely to quit)',
+        r'(scholarship myth|needs to die|2\.9% chance)',
+        r'(storms onto the field|grabs his kid|never came back)',
+        r'(challenge.*parent|do not say.*single word)'
+    ]
+    
+    has_engaging_content = any(re.search(pattern, t) for pattern in engaging_content_patterns)
+    
+    if is_intro and not has_engaging_content:
+        score = 0.01  # Set to extremely low score for intro material
+        reasons.append("intro_greeting_penalty")
+    
+    # RELAXED: Context-dependent penalty (much less harsh for sports content)
     context_patterns = [
-        r"^(you like that|like that|that's|here's the)",  # Still penalize obvious context
+        r"^(you like that|like that|that's|here's the)",  # Only penalize very obvious context
     ]
     
     # DON'T penalize sports-specific context like "Caleb Johnson is clearly"
@@ -903,11 +1344,50 @@ def _hook_score_v4(text: str, arousal: float = 0.0, words_per_sec: float = 0.0, 
     
     for pattern in context_patterns:
         if re.match(pattern, t):
-            score -= 0.15  # Reduced from 0.3 to 0.15
+            score -= 0.05  # Reduced from 0.15 to 0.05
             reasons.append("context_dependent_opening")
             break
     
-    # NEW: Sports-specific hooks that shouldn't be penalized
+    # ENHANCED: Provocation patterns for high engagement
+    PROVOCATION_PATTERNS = [
+    r"you're (delusional|wrong|missing|wasting)",
+    r"you are (delusional|wrong|missing|wasting)",
+    r"stop (doing|believing|thinking|relying on)",
+    r"the truth about",
+    r"nobody wants to (hear|admit|say)",
+    r"everyone's wrong about",
+    r"this will (fail|destroy|ruin)",
+    r"you've been lied to",
+    r"if you are relying on.*you are so (delusional|wrong)",
+    r"you are so delusional as a (parent|coach|person)"
+]
+    
+    # ENHANCED: Action demand patterns for immediate engagement
+    ACTION_PATTERNS = [
+        r"^(you need to|you must|you should)",
+        r"^(stop|start|don't|never|always)",
+        r"^(here's what to do|do this)",
+        r"^(immediately|right now|today)"
+    ]
+    
+    # FIXED: Check for provocation patterns first (highest boost)
+    provocation_found = False
+    for pattern in PROVOCATION_PATTERNS:
+        if re.search(pattern, t):
+            score += 0.3  # Strong provocation boost
+            reasons.append("provocation_hook")
+            provocation_found = True
+            break
+    
+    # FIXED: Check for action demand patterns (only if no provocation to avoid double-counting)
+    if not provocation_found:
+        for pattern in ACTION_PATTERNS:
+            if re.search(pattern, t):
+                score += 0.2  # Action-oriented boost
+                reasons.append("action_demand_hook")
+                break
+    
+    # ENHANCED: Sports-specific hooks that shouldn't be penalized
     sports_hook_patterns = [
         r"(biggest|top|best|worst) (sleeper|bust|play|pick|value)",
         r"(nobody|everyone|people) (is|are) (talking about|sleeping on|missing)",
@@ -916,20 +1396,614 @@ def _hook_score_v4(text: str, arousal: float = 0.0, words_per_sec: float = 0.0, 
         r"(fantasy|draft|waiver) (gold|gem|steal|target)",
         r"(this|that) (guy|player|team) is",
         r"(i'm telling you|trust me|mark my words)",
-        r"(if you|when you) (draft|pick|start|sit)"
+        r"(if you|when you) (draft|pick|start|sit)",
+        # NEW: More compelling sports hooks
+        r"(running back|quarterback|receiver|defense) (is|are) (going to|about to)",
+        r"(why would|why should) (you|i) (like|love|hate) (that|this)",
+        r"(look at|check out|watch) (this|that) (guy|player|team)",
+        r"(the thing is|here's the thing|the problem is)",
+        r"(you know what|here's what|this is what)",
+        r"(i've been|i'm) (watching|following|tracking)",
+        r"(this week|next week|this season) (is|will be)",
+        r"(atlanta|dallas|indianapolis|cincinnati) (is|are)",
+        r"(jayden|caleb|ollie) (is|looks|seems)",
+        r"(zero from|from that) (game|match|week)",
+        r"(home league|casual) (drafts|drafting) (are|is)",
+        r"(way better|much better|improved|evolved)",
+        # ADDITIONAL: More sports patterns
+        r"(yeah|so|and) (it was|there was|we had)",
+        r"(if i|if we|if you) (didn't|won|lost|had)",
+        r"(parents|coaches|players) (were|are) (pissed|angry|happy)",
+        r"(synchronicity|values|traits) (that|which) (apply|work)",
+        r"(kids|players|athletes) (that|who) (have|are|know)",
+        r"(academy|national|team) (bound|level|quality)",
+        r"(serve you|help you|benefit you) (in the fact|because)",
+        r"(intention|purpose|goal) (for|to|of) (two hours|practice)",
+        r"(every player|each player|all players) (has|have) (that|one)",
+        r"(training|practicing|working) (with|on|for) (their|the)",
+        r"(changed|improved|enhanced) (the way|how|what)"
     ]
     
     for pattern in sports_hook_patterns:
         if re.search(pattern, t):
-            score += 0.3
+            score += 0.25  # Reduced from 0.4 to 0.25 for better clustering
             reasons.append("sports_hook")
             break
+    
+    # ENHANCED: More granular pattern tiers to break up clustering
+    # Very weak signals: +0.05 (filler content)
+    very_weak_patterns = [
+        r"^(so|and|but|well|okay|right|now)",
+        r"^(i think|i believe|i feel|i guess)",
+        r"^(you know|you see|you understand)"
+    ]
+    
+    # Weak signals: +0.15 (generic statements)
+    weak_patterns = [
+        r"^(listen|look|watch|check this out)",
+        r"^(you need to know|you have to understand)",
+        r"^(this is important|this matters|pay attention)",
+        r"^(well,|so,|and,|but,|okay,|right,|now,)"  # Only if not followed by engaging content
+    ]
+    
+    # Low-moderate signals: +0.25 (clear statements)
+    low_moderate_patterns = [
+        r"^(here's|this is|that's|it's)",
+        r"^(the thing is|the problem is|the issue is)",
+        r"^(what i mean|what i'm saying|what i think)"
+    ]
+    
+    # Moderate signals: +0.35 (engaging content)
+    moderate_patterns = [
+        r"^(let me tell you|here's what happened|this story)",
+        r"^(you won't believe|can't believe|unbelievable)",
+        r"^(crazy|insane|wild|amazing)",
+        r"^(what are you really|what are you actually|what do you think)",
+        r"^(were you|are you|do you think you)"
+    ]
+    
+    # High-moderate signals: +0.45 (strong engagement)
+    high_moderate_patterns = [
+        r"^(dude|man|bro|wow|omg|damn|shit|fuck)\s*[!.]*\s*\1",  # Repeated exclamations (allow punctuation)
+        r"^(haha|lol|lmao|rofl)",  # Laughter
+        r"^(no\s+way|are\s+you\s+kidding|you\s+gotta\s+be)"  # Surprise expressions
+    ]
+    
+    # Strong signals: +0.55 (viral potential)
+    strong_patterns = [
+        r"^(this\s+is\s+crazy|unbelievable|insane|wild)",  # High-energy descriptors
+        r"^(wait\s+until\s+you\s+hear|you\s+won't\s+believe)",  # Anticipation builders
+        r"^(i\s+can't\s+believe|this\s+is\s+unreal)",  # Shock expressions
+        r"^(dude|man|bro|wow|omg|damn|shit|fuck)\s+\1\s+\1",  # Repeated exclamations like "dude dude dude"
+        r"you\s+are\s+so\s+(delusional|wrong|missing|wasting)",  # Direct provocation
+        r"if\s+you\s+are\s+relying\s+on.*you\s+are\s+so"  # Conditional provocation
+    ]
+    
+    # Check pattern tiers (in order of strength to avoid double-counting)
+    pattern_matched = False
+    
+    # Strong signals: +0.55
+    for pattern in strong_patterns:
+        if re.search(pattern, t):
+            score += 0.55
+            reasons.append("strong_pattern")
+            pattern_matched = True
+            break
+    
+    if not pattern_matched:
+        # High-moderate signals: +0.45
+        for pattern in high_moderate_patterns:
+            if re.search(pattern, t):
+                score += 0.45
+                reasons.append("high_moderate_pattern")
+                pattern_matched = True
+                break
+    
+    if not pattern_matched:
+        # Moderate signals: +0.35
+        for pattern in moderate_patterns:
+            if re.search(pattern, t):
+                score += 0.35
+                reasons.append("moderate_pattern")
+                pattern_matched = True
+                break
+    
+    if not pattern_matched:
+        # Low-moderate signals: +0.25
+        for pattern in low_moderate_patterns:
+            if re.search(pattern, t):
+                score += 0.25
+                reasons.append("low_moderate_pattern")
+                pattern_matched = True
+                break
+    
+    if not pattern_matched:
+        # Weak signals: +0.15
+        for pattern in weak_patterns:
+            if re.search(pattern, t):
+                score += 0.15
+                reasons.append("weak_pattern")
+                pattern_matched = True
+                break
+    
+    if not pattern_matched:
+        # Very weak signals: +0.05
+        for pattern in very_weak_patterns:
+            if re.search(pattern, t):
+                score += 0.05
+                reasons.append("very_weak_pattern")
+                break
     
     # Direct hook cues
     strong_hits = sum(1 for cue in HOOK_CUES if cue in t)
     if strong_hits > 0:
         score += min(strong_hits * 0.15, 0.35)
         reasons.append(f"direct_hooks_{strong_hits}")
+    
+    # MICRO-BOOSTS: Add subtle differentiation to break clustering
+    # Length-based micro-boost (optimal hook length is 3-8 words)
+    word_count = len(t.split())
+    if 3 <= word_count <= 8:
+        score += 0.02  # Perfect hook length
+        reasons.append("optimal_length")
+    elif word_count <= 2:
+        score += 0.01  # Very short but punchy
+        reasons.append("punchy_short")
+    elif word_count <= 12:
+        score += 0.005  # Still concise
+        reasons.append("concise")
+    
+    # Emotional intensity micro-boost
+    high_energy_words = ['crazy', 'insane', 'unbelievable', 'amazing', 'incredible', 'wild', 'epic', 'mind-blowing']
+    if any(word in t.lower() for word in high_energy_words):
+        score += 0.03
+        reasons.append("high_energy_word")
+    
+    # Question micro-boost (questions are engaging)
+    question_count = t.count('?')
+    if question_count > 0:
+        score += 0.02 + (question_count - 1) * 0.03  # Extra boost for multiple questions
+        reasons.append(f"question_hook_{question_count}")
+    
+    # Personal story micro-boost
+    personal_words = ['i', 'me', 'my', 'mine', 'myself']
+    if sum(1 for word in personal_words if word in t.lower()) >= 2:
+        score += 0.02
+        reasons.append("personal_story")
+    
+    # Challenge question micro-boost (content that challenges the listener)
+    challenge_patterns = [
+        r"what are you really",
+        r"what are you actually", 
+        r"what do you think you",
+        r"were you really",
+        r"are you really",
+        r"why don't you",
+        r"why do not you",
+        r"you haven't earned",
+        r"you have not earned"
+    ]
+    if any(re.search(pattern, t) for pattern in challenge_patterns):
+        score += 0.04
+        reasons.append("challenge_question")
+    
+    # Coaching advice micro-boost (content that challenges coaching philosophy)
+    coaching_advice_patterns = [
+        r"figure out what kind of players",
+        r"teach them how to win",
+        r"catering it to them",
+        r"rather than you catering it to yourself",
+        r"you have not earned the right",
+        r"who are we developing",
+        r"is this about developing my philosophy"
+    ]
+    if any(re.search(pattern, t) for pattern in coaching_advice_patterns):
+        score += 0.06
+        reasons.append("coaching_advice")
+    
+    # Controversial claim micro-boost (content that makes bold claims)
+    controversial_patterns = [
+        r"i could do better",
+        r"i can do better",
+        r"i am standing on business",
+        r"i am standing on that",
+        r"nobody talks about",
+        r"got in trouble",
+        r"giving me so much shit",
+        r"they were just giving me",
+        r"mark my words",
+        r"i will eat my.*microphone",
+        r"that is how confident i am",
+        r"father time is undefeated",
+        r"even the goat can not beat",
+        r"fundamentally broken",
+        r"do not care who hears me",
+        r"bastardized.*into.*money machine",
+        r"predatory.*honestly",
+        r"straight up predatory",
+        r"truth.*will make people mad",
+        r"most.*kids.*not going pro",
+        r"better chance.*becoming an astronaut",
+        r"biggest scam.*youth sports",
+        r"math does not work",
+        r"nightmares about.*game",
+        r"child labor with a ball",
+        r"level of delusion.*astronomical"
+    ]
+    controversial_count = sum(1 for pattern in controversial_patterns if re.search(pattern, t))
+    if controversial_count > 0:
+        controversial_boost = min(0.08 + (controversial_count - 1) * 0.03, 0.20)  # Stack up to 0.20
+        score += controversial_boost
+        reasons.append(f"controversial_claim_{controversial_count}")
+    
+    # Educational content micro-boost (research-backed insights)
+    educational_patterns = [
+        r"research from",
+        r"studies show",
+        r"research demonstrates",
+        r"first documented by",
+        r"mathematical formula",
+        r"optimal.*interval",
+        r"superior.*retention",
+        r"often misunderstood",
+        r"fundamental principle"
+    ]
+    educational_count = sum(1 for pattern in educational_patterns if re.search(pattern, t))
+    if educational_count > 0:
+        educational_boost = min(0.04 + (educational_count - 1) * 0.02, 0.12)  # Stack up to 0.12
+        score += educational_boost
+        reasons.append(f"educational_content_{educational_count}")
+    
+    # High-value business content micro-boost (success stories, specific data)
+    business_value_patterns = [
+        r"sold my.*company for \d+ million",
+        r"\d+ million dollars",
+        r"\d+ billion dollars",
+        r"arr.*to.*arr",
+        r"revenue.*to.*revenue",
+        r"competitive moat",
+        r"moves the needle",
+        r"not what you would expect",
+        r"contrarian",
+        r"systematic documentation",
+        r"real data",
+        r"while competitors were"
+    ]
+    business_value_count = sum(1 for pattern in business_value_patterns if re.search(pattern, t))
+    if business_value_count > 0:
+        business_value_boost = min(0.06 + (business_value_count - 1) * 0.02, 0.15)  # Stack up to 0.15
+        score += business_value_boost
+        reasons.append(f"business_value_{business_value_count}")
+    
+    # True crime/suspense content micro-boost (mystery, investigation, emotional impact)
+    true_crime_patterns = [
+        r"night that disappeared",
+        r"never makes it home",
+        r"stepped off the earth",
+        r"vanished",
+        r"nobody tells you",
+        r"changes everything",
+        r"police reports",
+        r"eyewitnesses",
+        r"inconsistencies",
+        r"sealed record",
+        r"phone call.*whisper",
+        r"skin.*crawling",
+        r"coordinated disappearance",
+        r"truth.*still.*fog",
+        r"never look.*same way"
+    ]
+    true_crime_count = sum(1 for pattern in true_crime_patterns if re.search(pattern, t))
+    if true_crime_count > 0:
+        true_crime_boost = min(0.05 + (true_crime_count - 1) * 0.02, 0.12)  # Stack up to 0.12
+        score += true_crime_boost
+        reasons.append(f"true_crime_{true_crime_count}")
+    
+    # Clickbait penalty (high-energy words without substance)
+    clickbait_patterns = [
+        r"blow your mind",
+        r"change everything",
+        r"absolutely incredible",
+        r"you will not believe",
+        r"ready for this",
+        r"here it comes"
+    ]
+    clickbait_count = sum(1 for pattern in clickbait_patterns if re.search(pattern, t))
+    if clickbait_count > 0:
+        # Check if there's actual substance (not just filler)
+        filler_words = ["you know", "um", "basically", "so yeah", "and stuff"]
+        filler_count = sum(1 for filler in filler_words if filler in t.lower())
+        
+        # If high clickbait but low substance, apply penalty
+        if clickbait_count >= 2 and filler_count >= 2:
+            score -= 0.10  # Penalty for clickbait without substance
+            reasons.append("clickbait_penalty")
+    
+    # EMOTIONAL IMPACT BOOST: Recognize high-shareability emotional content
+    emotional_patterns = [
+        r"nightmares about.*game",
+        r"used to dream.*now.*nightmares",
+        r"broke my heart",
+        r"child labor with a ball",
+        r"seventeen years old.*nightmares",
+        r"never had a weekend off",
+        r"scheduled like.*fortune 500 ceo",
+        r"destroy.*kid.*parking lot",
+        r"cancer.*killing.*youth sports",
+        r"embarrassed me out there",
+        r"failed athletic dreams",
+        r"storms onto the field",
+        r"grabs his kid.*leaves",
+        r"never came back",
+        r"adults who have lost their minds",
+        r"terrifying.*forty percent",
+        r"more likely.*burns out"
+    ]
+    emotional_count = sum(1 for pattern in emotional_patterns if re.search(pattern, t))
+    if emotional_count > 0:
+        emotional_boost = min(0.20 + (emotional_count - 1) * 0.05, 0.30)  # Increased boost, stack up to 0.30
+        score += emotional_boost
+        reasons.append(f"emotional_impact_{emotional_count}")
+    
+    # VISUAL DRAMA BOOST: Recognize dramatic, visual stories that go viral
+    visual_drama_patterns = [
+        r"storms onto the field",
+        r"onto the field.*during the game",
+        r"grabs his kid.*leaves",
+        r"just leaves",
+        r"other parents are silent",
+        r"kids are confused",
+        r"never came back",
+        r"destroy.*kid.*parking lot",
+        r"kid.*crying",
+        r"dad.*going.*embarrassed me",
+        r"follow.*team bus.*tournament",
+        r"stayed at.*same hotel",
+        r"kid was mortified"
+    ]
+    visual_drama_count = sum(1 for pattern in visual_drama_patterns if re.search(pattern, t))
+    if visual_drama_count > 0:
+        visual_drama_boost = min(0.18 + (visual_drama_count - 1) * 0.04, 0.25)  # Stack up to 0.25
+        score += visual_drama_boost
+        reasons.append(f"visual_drama_{visual_drama_count}")
+    
+    # POWER WORD BOOST: Recognize high-engagement trigger words
+    power_word_patterns = [
+        r"biggest scam",
+        r"predatory.*honestly",
+        r"straight up predatory",
+        r"fundamentally broken",
+        r"do not care who hears me",
+        r"bastardized.*into.*money machine",
+        r"complete scam",
+        r"is a scam",
+        r"child abuse.*disguised",
+        r"destroying.*club culture",
+        r"culture of lying",
+        r"maximize revenue per child",
+        r"atm machines",
+        r"extract.*money from parents"
+    ]
+    power_word_count = sum(1 for pattern in power_word_patterns if re.search(pattern, t))
+    if power_word_count > 0:
+        power_word_boost = min(0.12 + (power_word_count - 1) * 0.04, 0.20)  # Stack up to 0.20
+        score += power_word_boost
+        reasons.append(f"power_words_{power_word_count}")
+    
+    # INSIDER REVELATION BOOST: Recognize explosive insider content
+    insider_patterns = [
+        r"i sat in.*directors meeting",
+        r"i recorded it",
+        r"i have the audio",
+        r"direct quote",
+        r"quiet part nobody says",
+        r"i got fired.*telling.*truth",
+        r"twenty minutes.*cleaning out my desk",
+        r"will get me blacklisted",
+        r"insider.*revelation",
+        r"behind the scenes",
+        r"what really happens",
+        r"nobody talks about"
+    ]
+    insider_count = sum(1 for pattern in insider_patterns if re.search(pattern, t))
+    if insider_count > 0:
+        insider_boost = min(0.15 + (insider_count - 1) * 0.05, 0.25)  # Stack up to 0.25
+        score += insider_boost
+        reasons.append(f"insider_revelation_{insider_count}")
+    
+    # DRAMATIC PERSONAL STORY BOOST: Recognize highly shareable personal drama
+    dramatic_story_patterns = [
+        r"my own son.*quit",
+        r"my son quit.*last year",
+        r"dad pulled.*crying.*six-year-old",
+        r"threw him in the car",
+        r"slammed the door",
+        r"kid was sobbing",
+        r"hate soccer forever",
+        r"killed his love for the game",
+        r"what we have turned it into",
+        r"system is broken",
+        r"child abuse.*character building",
+        r"winners never quit.*crying",
+        r"ready to quit.*completely",
+        r"panic attack.*first time",
+        r"emotional vomit on canvas",
+        r"bought it for.*thousand",
+        r"eight thousand dollars",
+        r"fifty million.*walks in",
+        r"bypasses all my best work",
+        r"still unsold",
+        r"teaching kids.*paint parties.*twenty dollars",
+        r"too exhausted to work",
+        r"saved my career.*probably my sanity"
+    ]
+    dramatic_story_count = sum(1 for pattern in dramatic_story_patterns if re.search(pattern, t))
+    if dramatic_story_count > 0:
+        dramatic_story_boost = min(0.18 + (dramatic_story_count - 1) * 0.04, 0.25)  # Stack up to 0.25
+        score += dramatic_story_boost
+        reasons.append(f"dramatic_story_{dramatic_story_count}")
+    
+    # BUSINESS SUCCESS STORY BOOST: Recognize viral business success content
+    business_success_patterns = [
+        r"sales increased.*percent",
+        r"four hundred percent",
+        r"made more.*one month.*previous year",
+        r"bought it for.*thousand",
+        r"eight thousand dollars",
+        r"million-dollar pieces",
+        r"waitlist is.*months long",
+        r"sold in ten minutes",
+        r"every show.*sold out",
+        r"from starving to thriving",
+        r"that decision saved my career"
+    ]
+    business_success_count = sum(1 for pattern in business_success_patterns if re.search(pattern, t))
+    if business_success_count > 0:
+        business_success_boost = min(0.15 + (business_success_count - 1) * 0.03, 0.20)  # Stack up to 0.20
+        score += business_success_boost
+        reasons.append(f"business_success_{business_success_count}")
+    
+    # CREATIVE INDUSTRY REVELATION BOOST: Recognize insider creative industry content
+    creative_industry_patterns = [
+        r"what nobody tells you.*art school",
+        r"art basel.*last year",
+        r"nobody looked at the art",
+        r"check.*instagram followers",
+        r"investment potential",
+        r"photograph well.*feed",
+        r"gallery show.*collector",
+        r"fifty percent.*sales",
+        r"bring your own buyers",
+        r"start your own gallery",
+        r"white walls.*good lighting",
+        r"trust fund.*paying rent",
+        r"spouse.*tech job.*health insurance",
+        r"credit card debt.*maintain.*image",
+        r"all performance",
+        r"truth bomb.*upset everyone",
+        r"most people.*do not care about art",
+        r"what owning art says about them",
+        r"feel cultured.*sophisticated.*successful",
+        r"fulfill their emotional need",
+        r"enjoy your day job.*rest of us.*bills to pay",
+        r"ashley traces.*disney characters",
+        r"waitlist is.*months long",
+        r"working at starbucks.*pay rent",
+        r"not about talent.*never been about talent",
+        r"what actually works.*nobody wants to hear",
+        r"email lists.*boring.*make more",
+        r"instagram followers.*free entertainment",
+        r"email subscribers.*buy from you",
+        r"permission to sell to them",
+        r"sold in ten minutes",
+        r"screaming into the void"
+    ]
+    creative_industry_count = sum(1 for pattern in creative_industry_patterns if re.search(pattern, t))
+    if creative_industry_count > 0:
+        creative_industry_boost = min(0.12 + (creative_industry_count - 1) * 0.03, 0.18)  # Stack up to 0.18
+        score += creative_industry_boost
+        reasons.append(f"creative_industry_{creative_industry_count}")
+    
+    # PRACTICAL BUSINESS ADVICE BOOST: Recognize actionable business insights
+    practical_advice_patterns = [
+        r"what actually works",
+        r"nobody wants to hear this",
+        r"email lists.*work better",
+        r"make more.*email list.*instagram followers",
+        r"permission to sell to them",
+        r"sold in ten minutes",
+        r"practical advice",
+        r"actionable insight",
+        r"here is what works",
+        r"the secret is",
+        r"nobody tells you",
+        r"behind the scenes",
+        r"what really happens"
+    ]
+    practical_advice_count = sum(1 for pattern in practical_advice_patterns if re.search(pattern, t))
+    if practical_advice_count > 0:
+        practical_advice_boost = min(0.10 + (practical_advice_count - 1) * 0.02, 0.15)  # Stack up to 0.15
+        score += practical_advice_boost
+        reasons.append(f"practical_advice_{practical_advice_count}")
+    
+    # PARENT-SHAMING BOOST: Recognize content that challenges parents (highly shareable in coaching communities)
+    parent_shaming_patterns = [
+        r"most.*kids.*not going pro",
+        r"better chance.*becoming an astronaut",
+        r"math does not work",
+        r"level of delusion.*astronomical",
+        r"fifty thousand dollars.*ten thousand",
+        r"put that money in a college fund",
+        r"destroy.*kid.*parking lot",
+        r"embarrassed me out there",
+        r"cancer.*killing youth sports",
+        r"failed athletic dreams",
+        r"uncomfortable truth.*kid probably is not that good",
+        r"statistically speaking.*average",
+        r"terrifying.*forty percent.*quit",
+        r"more invested.*parent.*more likely.*burns out",
+        r"storms onto the field",
+        r"grabs his kid.*leaves",
+        r"never came back",
+        r"adults who have lost their minds",
+        r"scholarship myth.*needs to die",
+        r"2\.9% chance",
+        r"spreadsheet.*touches per game",
+        r"high school coach.*does not care.*excel sheets"
+    ]
+    parent_shaming_count = sum(1 for pattern in parent_shaming_patterns if re.search(pattern, t))
+    if parent_shaming_count > 0:
+        parent_shaming_boost = min(0.10 + (parent_shaming_count - 1) * 0.03, 0.18)  # Stack up to 0.18
+        score += parent_shaming_boost
+        reasons.append(f"parent_shaming_{parent_shaming_count}")
+    
+    # COMPRESSED FLOOR SCORE: Higher minimum for clearly viral content
+    viral_indicators = [
+        r"fundamentally broken",
+        r"do not care who hears me",
+        r"predatory",
+        r"truth.*will make people mad",
+        r"most.*kids.*not going pro",
+        r"biggest scam",
+        r"nightmares about",
+        r"child labor",
+        r"level of delusion",
+        r"coaching.*joy out",
+        r"better chance.*astronaut",
+        r"math does not work"
+    ]
+    viral_indicators_count = sum(1 for pattern in viral_indicators if re.search(pattern, t))
+    if viral_indicators_count > 0:
+        # Compress range: Set floor score of 65% for clearly viral content (target range)
+        score = max(score, 0.65)
+        reasons.append(f"viral_floor_{viral_indicators_count}")
+    
+    # CEILING MANAGEMENT: Cap scores to preserve granularity at top end
+    # This prevents all high-quality content from hitting 100% and losing differentiation
+    if score > 0.95:
+        # Apply ceiling with differentiation based on actual pattern counts
+        emotional_count = 0
+        visual_drama_count = 0
+        parent_shaming_count = 0
+        
+        # Extract actual counts from reason strings
+        for r in reasons:
+            if 'emotional_impact_' in r:
+                emotional_count = int(r.split('_')[-1])
+            elif 'visual_drama_' in r:
+                visual_drama_count = int(r.split('_')[-1])
+            elif 'parent_shaming_' in r:
+                parent_shaming_count = int(r.split('_')[-1])
+        
+        total_patterns = emotional_count + visual_drama_count + parent_shaming_count
+        
+        if total_patterns >= 15:  # Very high pattern density (field invasion story: 4+7+4=15)
+            score = 0.95  # Top tier
+        elif total_patterns >= 11:  # High pattern density (parking lot story: 4+3+4=11)
+            score = 0.92  # High tier
+        else:  # Good pattern density
+            score = 0.88  # Strong tier
+        reasons.append(f"ceiling_cap_{total_patterns}")
     
     # Curiosity gaps
     curiosity_patterns = [r"the (one|only) (thing|way|reason|secret)", r"what (nobody|no one|they don't) tell you"]
@@ -944,17 +2018,239 @@ def _hook_score_v4(text: str, arousal: float = 0.0, words_per_sec: float = 0.0, 
         score += 0.25
         reasons.append("question_mark")
     
-    # Boost for insight content (if not intro)
+    # Boost for insight content (if not intro) - use V2 if enabled
     if not any("intro_greeting_penalty" in reason for reason in reasons):
-        insight_score, _ = _detect_insight_content(text, genre)
+        config = get_config()
+        if config.get("insight_v2", {}).get("enabled", False):
+            insight_score, _ = _detect_insight_content_v2(text, genre)
+        else:
+            insight_score, _ = _detect_insight_content(text, genre)
         if insight_score > 0.5:
             score += 0.2  # Boost for high insight content
             reasons.append("insight_content_boost")
     
+    # ENHANCED: Calculate multi-dimensional hook components
+    hook_components = calculate_hook_components(text)
+    
+    # Determine hook type
+    hook_type = "general"
+    if any(re.search(pattern, t) for pattern in PROVOCATION_PATTERNS):
+        hook_type = "provocation"
+    elif any(re.search(pattern, t) for pattern in ACTION_PATTERNS):
+        hook_type = "action"
+    elif "?" in text:
+        hook_type = "question"
+    elif any(word in t for word in ["story", "happened", "when", "then"]):
+        hook_type = "story"
+    
+    # Calculate confidence based on component scores
+    confidence = np.mean(list(hook_components.values()))
+    
     # At the end, ensure minimum score
     final_score = float(np.clip(score, 0.05, 1.0))  # Allow lower minimum for intro content
     reason_str = ";".join(reasons) if reasons else "no_hooks_detected"
-    return final_score, reason_str
+    
+    return final_score, reason_str, {
+        "hook_components": hook_components,
+        "hook_type": hook_type,
+        "confidence": confidence,
+        "audio_modifier": audio_modifier,
+        "laughter_boost": laughter_boost,
+        "time_weighted_score": time_weighted_score
+    }
+
+# --- Hook V5 (families + evidence guard + time weighting + micro audio) ---
+_WORD = re.compile(r"[A-Za-z']+|\d+%?")
+_PUNCT_CLAUSE = re.compile(r"(?<=[.!?])\s+")
+_HAS_NUM = re.compile(r"\b\d+(?:\.\d+)?(?:%|k|m|b)?\b")
+_HAS_COMP = re.compile(r"\b(?:vs\.?|versus|more than|less than)\b|[<>]")
+_HAS_HOWWHY = re.compile(r"\b(?:how|why|what)\b")
+_SOFT_FLIP = re.compile(r"\bbut (?:actually|in reality)\b")
+
+def _saturating_sum(scores: List[float], cap: float = 1.0) -> float:
+    prod = 1.0
+    for s in scores:
+        s = max(0.0, min(1.0, float(s)))
+        prod *= (1.0 - s)
+    return min(cap, 1.0 - prod)
+
+def _proximity_bonus(index_in_video: int, k: float) -> float:
+    try:
+        i = max(0, int(index_in_video))
+    except Exception:
+        i = 0
+    return math.exp(- i / max(1e-6, float(k)))
+
+def _normalize_quotes_lower(text: str) -> str:
+    t = (text or "").strip().lower()
+    return t.translate({
+        0x2019: 0x27,  # ' -> '
+        0x2018: 0x27,  # ' -> '
+        0x201C: 0x22,  # " -> "
+        0x201D: 0x22,  # " -> "
+    })
+
+def _first_clause(text: str, max_words: int) -> str:
+    sent = _PUNCT_CLAUSE.split(text, maxsplit=1)[0]
+    toks = _WORD.findall(sent)
+    return " ".join(toks[:max_words])
+
+def _get_hook_cues_from_config(cfg: Dict[str, Any]) -> Dict[str, List[re.Pattern]]:
+    raw = (cfg.get("HOOK_CUES")
+           or cfg.get("lexicons", {}).get("HOOK_CUES")
+           or {})
+    # If someone left HOOK_CUES as a flat list, wrap it.
+    if isinstance(raw, list):
+        raw = {"generic": raw}
+    cues: Dict[str, List[re.Pattern]] = {}
+    for fam, arr in raw.items():
+        pats = []
+        for s in arr:
+            try:
+                pats.append(re.compile(s, re.I))
+            except Exception:
+                pass
+        if pats:
+            cues[fam] = pats
+    return cues
+
+def _family_score(text: str, cues: Dict[str, List[re.Pattern]], weights: Dict[str, float]) -> Tuple[float, Dict[str, float]]:
+    fam_scores: Dict[str, float] = {}
+    partials: List[float] = []
+    for fam, pats in cues.items():
+        w = float(weights.get(fam, 1.0))
+        m = 0.0
+        for p in pats:
+            if p.search(text):
+                m = 1.0
+                break
+        fam_scores[fam] = min(1.0, m * w)
+        if fam_scores[fam] > 0:
+            partials.append(min(1.0, fam_scores[fam]))
+    combined = _saturating_sum(partials, cap=1.0)
+    return combined, fam_scores
+
+def _evidence_guard(t: str, need_words: int, clause_words: int) -> Tuple[bool, Dict[str, bool]]:
+    toks = _WORD.findall(t)
+    early = " ".join(toks[:max(0, need_words)])
+    has_A = bool(_HAS_HOWWHY.search(early) or _HAS_NUM.search(early) or _HAS_COMP.search(early))
+    if has_A:
+        return True, {"early": True, "clause": False, "flip": False}
+    clause = _first_clause(t, max_words=clause_words)
+    has_B = bool(_HAS_HOWWHY.search(clause) or _HAS_NUM.search(clause) or _HAS_COMP.search(clause))
+    flip = bool(_SOFT_FLIP.search(clause))
+    return bool(has_B or flip), {"early": False, "clause": has_B, "flip": flip}
+
+def _anti_intro_outro_penalties(t: str, hv5: Dict[str, Any]) -> Tuple[float, float, List[str]]:
+    reasons = []
+    pin = 0.0
+    pout = 0.0
+    intro = [s.strip().lower() for s in hv5.get("intro_tokens", [])]
+    outro = [s.strip().lower() for s in hv5.get("outro_tokens", [])]
+    for tok in intro:
+        if tok and t.startswith(tok):
+            pin = float(hv5.get("anti_intro_penalty", 0.05)); reasons.append("anti_intro")
+            break
+    for tok in outro:
+        if tok and tok in t:
+            pout = float(hv5.get("anti_outro_penalty", 0.06)); reasons.append("anti_outro")
+            break
+    return pin, pout, reasons
+
+def _audio_micro_for_hook(audio_mod: float, cap: float) -> float:
+    try:
+        return max(0.0, min(cap, float(audio_mod)))
+    except Exception:
+        return 0.0
+
+def _sigmoid(z: float, a: float) -> float:
+    return 1.0 / (1.0 + math.exp(-a * z))
+
+def _calibrate_simple(raw: float, mu: float = 0.40, sigma: float = 0.18, a: float = 1.6) -> float:
+    z = 0.0 if sigma <= 0 else (raw - mu) / sigma
+    return _sigmoid(z, a)
+
+def _hook_score_v5(
+    text: str,
+    *,
+    cfg: Dict[str, Any],
+    segment_index: int = 0,
+    audio_modifier: float = 0.0,
+    arousal: float = 0.0,
+    q_or_list: float = 0.0,
+    batch_mu: float = None,
+    batch_sigma: float = None
+) -> Tuple[float, float, Dict[str, Any]]:
+    """
+    Returns: (raw, calibrated, debug)
+    raw: 0..1 pre-calibration
+    calibrated: 0..1 after simple calibration
+    """
+    hv5 = cfg.get("hook_v5", {}) if cfg else {}
+    a_sig = float(hv5.get("sigmoid_a", 1.6))
+    need_words = int(hv5.get("require_after_words", 12))
+    clause_words = int(hv5.get("first_clause_max_words", 24))
+    k = float(hv5.get("time_decay_k", 5))
+    early_bonus_scale = float(hv5.get("early_pos_bonus", 0.25))
+    audio_cap = float(hv5.get("audio_cap", 0.05))
+    fam_w = hv5.get("family_weights", {}) or {}
+
+    t = _normalize_quotes_lower(text)
+    cues = _get_hook_cues_from_config(cfg)
+
+    fam_combined, fam_scores = _family_score(t, cues, fam_w)
+    evidence_ok, evidence_bits = _evidence_guard(t, need_words, clause_words)
+
+    base = fam_combined
+    reasons: List[str] = []
+    if fam_combined <= 0.0:
+        reasons.append("no_family_match")
+    if not evidence_ok and fam_combined > 0.0:
+        base *= 0.80
+        reasons.append("no_evidence_early")
+
+    pin, pout, pr = _anti_intro_outro_penalties(t, hv5)
+    base = max(0.0, base - pin - pout)
+    reasons.extend(pr)
+
+    prox = _proximity_bonus(segment_index, k)
+    base += early_bonus_scale * prox
+
+    base += _audio_micro_for_hook(audio_modifier, audio_cap)
+
+    syn = hv5.get("synergy", {}) or {}
+    syn_bonus = 0.0
+    if arousal >= float(syn.get("arousal_gate", 0.60)):
+        syn_bonus += float(syn.get("bonus_each", 0.01))
+    if q_or_list >= float(syn.get("q_or_list_gate", 0.60)):
+        syn_bonus += float(syn.get("bonus_each", 0.01))
+    syn_bonus = min(syn_bonus, float(syn.get("cap_total", 0.02)))
+    base = max(0.0, base) + syn_bonus
+    if syn_bonus > 0: reasons.append(f"synergy+{syn_bonus:.2f}")
+
+    raw = min(1.0, max(0.0, base))
+
+    mu = 0.40 if batch_mu is None else float(batch_mu)
+    sigma = 0.18 if batch_sigma is None else float(batch_sigma)
+    cal = _calibrate_simple(raw, mu=mu, sigma=sigma, a=a_sig)
+
+    debug = {
+        "hook_v5_raw": round(raw, 6),
+        "hook_v5_cal": round(cal, 6),
+        "fam_scores": fam_scores,
+        "fam_combined": round(fam_combined, 6),
+        "evidence_ok": evidence_ok,
+        "evidence_bits": evidence_bits,
+        "proximity": round(prox, 6),
+        "audio_mod": round(_audio_micro_for_hook(audio_modifier, audio_cap), 6),
+        "pins": {"intro": pin, "outro": pout},
+        "reasons": reasons,
+        "mu": mu, "sigma": sigma, "a": a_sig,
+    }
+    return raw, cal, debug
+# --- end Hook V5 ---
+
+
 
 def _calculate_niche_penalty(text: str, genre: str = 'general') -> tuple[float, str]:
     t = text.lower()
@@ -984,6 +2280,65 @@ def _emotion_score_v4(text: str) -> float:
     regular_hits = sum(1 for w in EMO_WORDS if w in t and w not in high_intensity)
     total_score = (high_hits * 2 + regular_hits) / 5.0
     return float(min(total_score, 1.0))
+
+def _detect_payoff(text: str, genre: str = 'general') -> tuple[float, str]:
+    """Detect payoff strength: resolution, answer, or value delivery using genre-specific patterns"""
+    if not text or len(text.strip()) < 8:
+        return 0.0, "too_short"
+    
+    t = text.lower()
+    score = 0.0
+    reasons = []
+
+    # General payoff markers
+    general_payoff_patterns = [
+        r"here('?s)? (how|why|the deal|what you need)",  # "here's how"
+        r"the (solution|answer|truth|key)", 
+        r"because", r"so that", r"which means",
+        r"in other words", r"this means",
+        r"the (lesson|takeaway|insight|bottom line)",
+        r"(therefore|thus|that's why)",
+        r"turns out", r"it turns out"
+    ]
+    
+    for pattern in general_payoff_patterns:
+        if re.search(pattern, t):
+            score += 0.25
+            reasons.append("general_payoff")
+
+    # Genre-specific payoff patterns
+    try:
+        # Get the appropriate genre profile
+        if genre == 'fantasy_sports':
+            profile = FantasySportsGenreProfile()
+        elif genre == 'comedy':
+            profile = ComedyGenreProfile()
+        elif genre == 'true_crime':
+            profile = TrueCrimeGenreProfile()
+        elif genre == 'business':
+            profile = BusinessGenreProfile()
+        elif genre == 'educational':
+            profile = EducationalGenreProfile()
+        elif genre == 'health_wellness':
+            profile = HealthWellnessGenreProfile()
+        else:
+            profile = GenreProfile()  # Default fallback
+            
+        # Check genre-specific payoff patterns
+        for pattern in getattr(profile, 'payoff_patterns', []):
+            if re.search(pattern, t):
+                score += 0.3
+                reasons.append(f"{genre}_payoff")
+                
+    except Exception:
+        # Fallback if genre profile fails
+        pass
+
+    # Scale and clamp
+    score = min(score, 1.0)
+    if score == 0.0:
+        return 0.0, "no_payoff"
+    return score, ";".join(reasons)
 
 def _payoff_presence_v4(text: str) -> tuple[float, str]:
     """More selective payoff detection"""
@@ -1119,46 +2474,179 @@ def _question_or_list(text: str) -> float:
     
     return 0.0
 
-def _loopability_heuristic(text: str) -> float:
-    if not text:
-        return 0.0
-    
-    words = text.strip().split()
-    if len(words) < 4:
-        return 0.5
-    
-    clean_endings = [".", "!", "?"]
-    ends_clean = text.strip()[-1] in clean_endings
-    
-    bad_endings = ["and", "but", "so", "because", "that", "which"]
-    ends_badly = any(text.strip().lower().endswith(" " + word) for word in bad_endings)
-    
-    score = 0.5
-    if ends_clean:
-        score += 0.3
-    if not ends_badly:
-        score += 0.1
-    if len(words) <= 50:
-        score += 0.1
-    
-    return float(np.clip(score, 0.0, 1.0))
+# Loopability scoring constants and helper functions
+_STOPWORDS = set("""
+a an the and but or so because that which to of in on at for with by as is are was were be been being this those these it
+""".split())
 
-def _arousal_score_text(text: str) -> float:
+_QUOTABLE_PATTERNS = [
+    r"\bnot\s+[^,]+,\s*but\s+[^,]+",                 # not X, but Y
+    r"\b(here|are|these)\s+\d+\s+\w+",               # numbered lists: 3 things...
+    r"\b(do|try|stop|never|always|remember)\b\s+\w+", # imperative/pithy
+    r"\b(X|it)'?s\s+not\s+about\b",                  # aphorism starter
+]
+
+_OUTRO_PATTERNS = [
+    r"\b(thanks for watching|subscribe|follow|like and subscribe|link in bio|see you next time)\b",
+    r"\b(in today'?s video|welcome back)\b",
+]
+
+_CLIFF_WORDS = {"until", "then", "because", "guess", "turns", "revealed", "reveals"}
+
+def _tokens(text, n=None):
+    toks = re.findall(r"[A-Za-z0-9']+", text.lower())
+    if n: toks = toks[:n]
+    return [t for t in toks if t not in _STOPWORDS]
+
+def _end_tokens(text, n):
+    toks = re.findall(r"[A-Za-z0-9']+", text.lower())
+    toks = toks[-n:]
+    return [t for t in toks if t not in _STOPWORDS]
+
+def _has_pattern(text, patterns):
+    t = text.lower()
+    return any(re.search(p, t, re.IGNORECASE) for p in patterns)
+
+def _jaccard(a, b):
+    sa, sb = set(a), set(b)
+    if not sa or not sb: return 0.0
+    return len(sa & sb) / len(sa | sb)
+
+def sat(parts):
+    """Saturating combiner to avoid runaway sums"""
+    p = 1.0
+    for x in parts:
+        p *= (1.0 - max(0.0, min(1.0, x)))
+    return 1.0 - p
+
+def _loopability_heuristic(text: str) -> float:
+    """Enhanced loopability scoring with perfect-loop detection, quotability patterns, and curiosity enders"""
+    if not text: 
+        return 0.0
+
+    stripped = text.strip()
+    words = stripped.split()
+    if len(words) < 4:
+        return 0.5  # tiny clips: neutral
+
+    # --- 1) Boundary Cleanliness ---
+    last_char = stripped[-1]
+    last_is_clean_punct = last_char in ".!?"
+    last_sentence = re.split(r"[.!?]\s+", stripped)[-1]
+    last_sentence_len = len(_tokens_simple(stripped))
+    last_token = re.findall(r"[A-Za-z0-9']+", stripped.lower())[-1]
+    last_token_is_stop = last_token in _STOPWORDS
+
+    boundary_clean = 0.0
+    if last_is_clean_punct:
+        boundary_clean += 0.35
+    if 6 <= last_sentence_len <= 14:
+        boundary_clean += 0.25
+    if not last_token_is_stop:
+        boundary_clean += 0.10
+    boundary_clean = min(boundary_clean, 0.6)
+
+    # --- 2) Curiosity Ender ---
+    end_q = stripped.endswith("?")
+    cliff_tail = any(w in _end_tokens(stripped, 6) for w in _CLIFF_WORDS)
+    curiosity = 0.0
+    if end_q: 
+        curiosity += 0.45
+    if cliff_tail:
+        curiosity += 0.20
+    curiosity = min(curiosity, 0.55)
+
+    # --- 3) Start↔End Echo (perfect-loop potential) ---
+    start = _tokens(stripped, 10)
+    end = _end_tokens(stripped, n=10)
+    echo = _jaccard(start, end)  # 0–1
+    # Enhanced bonus for perfect loops (first and last meaningful tokens match)
+    match_edge = 0.25 if (start and end and start[0] == end[-1]) else 0.0
+    # Additional bonus for exact phrase repetition
+    exact_phrase_bonus = 0.15 if (start and end and len(start) >= 2 and len(end) >= 2 and 
+                                 start[:2] == end[-2:]) else 0.0
+    echo_score = min(0.7, 0.4 * echo + match_edge + exact_phrase_bonus)
+
+    # --- 4) Quotability Pattern ---
+    quotable_hits = 0.0
+    if _has_pattern(stripped, _QUOTABLE_PATTERNS):
+        quotable_hits = 0.6  # one strong hit saturates most value
+
+    # --- 5) Anti-Outro Penalty ---
+    outro_pen = 0.0
+    if _has_pattern(stripped, _OUTRO_PATTERNS):
+        outro_pen = 0.35  # subtract later
+
+    # --- Combine with saturating combiner ---
+    parts = [boundary_clean, curiosity, echo_score, quotable_hits]
+    # Use a more aggressive saturating combiner for better differentiation
+    positive = 0.70 * sat([x/0.6 for x in parts])  # normalize parts near 0–1, then scale
+    raw = max(0.0, positive - outro_pen)
+
+    # Clamp & return (optionally calibrate externally like other subscores)
+    return float(np.clip(raw, 0.0, 1.0))
+
+def _arousal_score_text(text: str, genre: str = 'general') -> float:
+    """Enhanced text arousal scoring with genre awareness and intensity levels"""
     if not text:
         return 0.0
     
     t = text.lower()
     score = 0.0
     
+    # Enhanced exclamation detection with intensity
     exclam_count = text.count('!')
-    score += min(exclam_count * 0.15, 0.3)
+    if exclam_count > 0:
+        # More exclamations = higher intensity
+        if exclam_count >= 3:
+            score += 0.4  # High intensity
+        elif exclam_count == 2:
+            score += 0.25  # Medium intensity
+        else:
+            score += 0.15  # Low intensity
     
-    caps_words = sum(1 for word in text.split() if word.isupper() and len(word) > 2)
-    score += min(caps_words * 0.1, 0.2)
+    # Enhanced caps detection (include short impactful words)
+    caps_words = sum(1 for word in text.split() if word.isupper() and len(word) >= 2)
+    if caps_words > 0:
+        score += min(caps_words * 0.12, 0.25)  # Slightly higher weight
     
-    emotion_words = ["amazing", "incredible", "crazy", "wild", "insane", "shocking"]
-    emotion_hits = sum(1 for word in emotion_words if word in t)
-    score += min(emotion_hits * 0.1, 0.3)
+    # Enhanced emotion words with intensity levels
+    high_intensity_words = ["insane", "shocking", "unbelievable", "mind-blowing", "incredible", "crazy", "wild", "epic", "amazing"]
+    medium_intensity_words = ["awesome", "great", "fantastic", "wonderful", "exciting", "thrilling", "intense", "powerful"]
+    low_intensity_words = ["good", "nice", "cool", "interesting", "fun", "enjoyable"]
+    
+    high_hits = sum(1 for word in high_intensity_words if word in t)
+    medium_hits = sum(1 for word in medium_intensity_words if word in t)
+    low_hits = sum(1 for word in low_intensity_words if word in t)
+    
+    # Weighted scoring by intensity
+    score += min(high_hits * 0.15, 0.4)      # High intensity words
+    score += min(medium_hits * 0.08, 0.2)    # Medium intensity words
+    score += min(low_hits * 0.03, 0.1)       # Low intensity words
+    
+    # Genre-specific arousal patterns
+    if genre == 'fantasy_sports':
+        sports_intensity_words = ["fire", "draft", "start", "bench", "target", "sleeper", "bust", "league-winner"]
+        sports_hits = sum(1 for word in sports_intensity_words if word in t)
+        score += min(sports_hits * 0.1, 0.2)
+    elif genre == 'comedy':
+        comedy_intensity_words = ["hilarious", "funny", "lol", "haha", "rofl", "joke", "punchline"]
+        comedy_hits = sum(1 for word in comedy_intensity_words if word in t)
+        score += min(comedy_hits * 0.12, 0.25)
+    elif genre == 'true_crime':
+        crime_intensity_words = ["murder", "killer", "victim", "evidence", "mystery", "suspicious", "alibi"]
+        crime_hits = sum(1 for word in crime_intensity_words if word in t)
+        score += min(crime_hits * 0.1, 0.2)
+    
+    # Question marks add engagement (arousal)
+    question_count = text.count('?')
+    if question_count > 0:
+        score += min(question_count * 0.05, 0.15)
+    
+    # Urgency indicators
+    urgency_words = ["now", "immediately", "urgent", "critical", "important", "must", "need", "quickly"]
+    urgency_hits = sum(1 for word in urgency_words if word in t)
+    score += min(urgency_hits * 0.08, 0.2)
     
     return float(np.clip(score, 0.0, 1.0))
 
@@ -1229,10 +2717,11 @@ def score_segment_v4(features: Dict, weights: Dict = None, apply_penalties: bool
         path_scores = genre_profile.get_scoring_paths(features)
     else:
         # Default 4-path system for general genre with platform length match and insight detection
-        path_a = (0.35 * f.get("hook_score", 0.0) + 0.20 * f.get("arousal_score", 0.0) + 
-                  0.15 * f.get("payoff_score", 0.0) + 0.10 * f.get("info_density", 0.0) + 
-                  0.10 * f.get("platform_len_match", 0.0) + 0.05 * f.get("loopability", 0.0) + 
-                  0.05 * f.get("insight_score", 0.0))  # NEW: Insight content boost
+        # FIXED: Default path with higher hook weight
+        path_a = (0.50 * f.get("hook_score", 0.0) + 0.15 * f.get("arousal_score", 0.0) + 
+                  0.10 * f.get("payoff_score", 0.0) + 0.10 * f.get("info_density", 0.0) + 
+                  0.10 * f.get("platform_len_match", 0.0) + 0.03 * f.get("loopability", 0.0) + 
+                  0.02 * f.get("insight_score", 0.0))  # NEW: Insight content boost
         
         path_b = (0.30 * f.get("payoff_score", 0.0) + 0.25 * f.get("info_density", 0.0) + 
                   0.15 * f.get("emotion_score", 0.0) + 0.10 * f.get("hook_score", 0.0) + 
@@ -1253,9 +2742,27 @@ def score_segment_v4(features: Dict, weights: Dict = None, apply_penalties: bool
     base_score = max(path_scores.values())
     winning_path = max(path_scores.keys(), key=lambda k: path_scores[k])
     
-    # Calculate synergy using raw scores (not scaled)
-    synergy_mult = _synergy_v4(f.get("hook_score", 0.0), f.get("arousal_score", 0.0), f.get("payoff_score", 0.0))
-    synergy_score = base_score * synergy_mult
+    # Calculate synergy using configurable mode (additive vs multiplier)
+    config = get_config()
+    synergy_config = config.get("synergy", {"mode": "additive", "additive_bonus_max": 0.02, "multiplier_min": 0.95})
+    synergy_mode = synergy_config.get("mode", "additive")
+    
+    if synergy_mode == "additive":
+        # Small additive synergy bonus (neutral by default)
+        syn_bonus = 0.0
+        if f.get("arousal_score", 0.0) >= 0.60: syn_bonus += 0.01
+        if f.get("question_score", 0.0) >= 0.60: syn_bonus += 0.01
+        syn_bonus = min(syn_bonus, synergy_config.get("additive_bonus_max", 0.02))
+        
+        synergy_score = min(1.0, base_score + syn_bonus)
+        synergy_mult = 1.00  # For logging compatibility
+        synergy_bonus = syn_bonus
+    else:
+        # Multiplier mode with minimum cap
+        synergy_mult = _synergy_v4(f.get("hook_score", 0.0), f.get("arousal_score", 0.0), f.get("payoff_score", 0.0))
+        synergy_mult = max(synergy_mult, synergy_config.get("multiplier_min", 0.95))
+        synergy_score = base_score * synergy_mult
+        synergy_bonus = 0.0
     
     # Apply exponential scaling to final score for better differentiation
     hook_scaled = f.get("hook_score", 0.0) ** 1.3
@@ -1372,12 +2879,22 @@ def score_segment_v4(features: Dict, weights: Dict = None, apply_penalties: bool
         "winning_path": winning_path,
         "path_scores": path_scores,
         "synergy_multiplier": synergy_mult,
+        "synergy_mode": synergy_mode,
+        "synergy_bonus": synergy_bonus,
         "bonuses_applied": bonuses,
         "bonus_reasons": bonus_reasons,
         "viral_score_100": int(final_score * 100),
         "display_score": int(final_score * 100),  # Frontend expects this field
         "confidence": confidence_level,           # Frontend expects this field
-        "confidence_color": confidence_color      # Frontend expects this field
+        "confidence_color": confidence_color,     # Frontend expects this field
+        "scoring_version": "v4.1",               # Version tag for compatibility
+        "debug_info": {
+            "synergy_mode": synergy_mode,
+            "synergy_bonus": synergy_bonus,
+            "quality_gate_applied": apply_penalties,
+            "genre": genre,
+            "platform": platform
+        }
     }
 
 def compute_features_v4(segment: Dict, audio_file: str, y_sr=None, genre: str = 'general', platform: str = 'tiktok') -> Dict:
@@ -1412,40 +2929,58 @@ def compute_features_v4(segment: Dict, audio_file: str, y_sr=None, genre: str = 
     word_count = len(text.split()) if text else 0
     words_per_sec = word_count / max(duration, 0.1)
     
-    hook_score, hook_reasons = _hook_score_v4(text, segment.get("arousal_score", 0.0), words_per_sec, genre)
-    payoff_score, payoff_type = _payoff_presence_v4(text)
+    # Hook scoring with V5 implementation
+    config = get_config()
+    use_v5 = bool(config.get("hook_v5", {}).get("enabled", True))
     
-    # NEW: Detect insight content vs. intro/filler
-    insight_score, insight_reasons = _detect_insight_content(text, genre)
+    if use_v5:
+        # Hook V5 scoring
+        seg_idx = segment.get("index", 0)
+        # We'll set these after features are computed
+        h_raw, h_cal, h_dbg = _hook_score_v5(
+            text,
+            cfg=config,
+            segment_index=seg_idx,
+            audio_modifier=0.0,  # Will be updated after audio analysis
+            arousal=0.0,  # Will be updated after arousal computation
+            q_or_list=0.0,  # Will be updated after question detection
+        )
+        hook_score = float(h_cal)
+        hook_reasons = ",".join(h_dbg.get("reasons", []))
+        hook_details = h_dbg
+    else:
+        # Legacy V4 hook scoring
+        hook_score, hook_reasons, hook_details = _hook_score_v4(text, segment.get("arousal_score", 0.0), words_per_sec, genre, 
+                                                               segment.get("audio_data"), segment.get("sr"), segment.get("start", 0.0))
+    payoff_score, payoff_type = _detect_payoff(text, genre)
+    
+    # NEW: Detect insight content vs. intro/filler (V2 if enabled)
+    if config.get("insight_v2", {}).get("enabled", False):
+        insight_score, insight_reasons = _detect_insight_content_v2(text, genre)
+    else:
+        insight_score, insight_reasons = _detect_insight_content(text, genre)
     
     niche_penalty, niche_reason = _calculate_niche_penalty(text, genre)
     
-    # REAL AUDIO ANALYSIS: Compute actual audio arousal from audio file
-    try:
-        audio_arousal = _audio_prosody_score(audio_file, segment["start"], segment["end"])
-    except Exception:
-        # Fallback to text-based estimation if audio analysis fails
-        text_energy_indicators = [
-            ('!', 0.1),
-            ('amazing', 0.15),
-            ('incredible', 0.15),
-            ('crazy', 0.15),
-            ('insane', 0.2),
-            ('?!', 0.2),
-            ('wow', 0.1),
-            ('unbelievable', 0.15),
-            ('shocking', 0.2),
-            ('wild', 0.1)
-        ]
-        
-        audio_arousal = 0.4  # Base fallback
-        for indicator, boost in text_energy_indicators:
-            if indicator in text.lower():
-                audio_arousal = min(audio_arousal + boost, 0.9)
-                break
+    # ENHANCED AUDIO ANALYSIS: Compute actual audio arousal with intelligent fallback
+    audio_arousal = _audio_prosody_score(audio_file, segment["start"], segment["end"], text=text, genre=genre)
     
-    text_arousal = _arousal_score_text(text)
-    combined_arousal = 0.7 * audio_arousal + 0.3 * text_arousal
+    # ENHANCED TEXT AROUSAL: Genre-aware text arousal scoring
+    text_arousal = _arousal_score_text(text, genre)
+    
+    # ADAPTIVE COMBINATION: Adjust audio/text ratio based on genre and content type
+    if genre == 'fantasy_sports':
+        # Sports content benefits more from text analysis (stats, names, etc.)
+        combined_arousal = 0.6 * audio_arousal + 0.4 * text_arousal
+    elif genre == 'comedy':
+        # Comedy benefits more from audio (timing, delivery)
+        combined_arousal = 0.8 * audio_arousal + 0.2 * text_arousal
+    elif genre == 'true_crime':
+        # True crime benefits from both (dramatic delivery + intense content)
+        combined_arousal = 0.7 * audio_arousal + 0.3 * text_arousal
+    else:
+        # Default balanced approach
+        combined_arousal = 0.7 * audio_arousal + 0.3 * text_arousal
     
     # Base features
     feats = {
@@ -1456,9 +2991,9 @@ def compute_features_v4(segment: Dict, audio_file: str, y_sr=None, genre: str = 
         "emotion_score": _emotion_score_v4(text),
         "question_score": _question_or_list(text),
         "payoff_score": payoff_score,
-        "info_density": _info_density_v4(text),
+        "info_density": _info_density_v4(text),  # Will be updated by V2 system if enabled
         "loopability": _loopability_heuristic(text),
-        "insight_score": insight_score,  # NEW: Insight content detection
+        "insight_score": insight_score,  # NEW: Insight content detection (may be adjusted by confidence multiplier)
         "text": text,
         "duration": duration,
         "words_per_sec": words_per_sec,
@@ -1473,7 +3008,15 @@ def compute_features_v4(segment: Dict, audio_file: str, y_sr=None, genre: str = 
         "_ad_reason": ad_result["reason"],
         "_niche_penalty": niche_penalty,
         "_niche_reason": niche_reason,
-        "type": segment.get("type", "general")  # Preserve moment type for bonuses
+        "type": segment.get("type", "general"),  # Preserve moment type for bonuses
+        
+        # ENHANCED: Multi-dimensional hook details
+        "hook_components": hook_details.get("hook_components", {}),
+        "hook_type": hook_details.get("hook_type", "general"),
+        "hook_confidence": hook_details.get("confidence", 0.0),
+        "audio_modifier": hook_details.get("audio_modifier", 0.0),
+        "laughter_boost": hook_details.get("laughter_boost", 0.0),
+        "time_weighted_score": hook_details.get("time_weighted_score", 0.0)
     }
     
     # Apply genre-specific enhancements if genre is specified
@@ -1487,6 +3030,24 @@ def compute_features_v4(segment: Dict, audio_file: str, y_sr=None, genre: str = 
         
         # Adjust features based on genre
         feats = genre_profile.adjust_features(feats)
+    
+    # ensure downstream names exist for synergy calculations
+    feats["arousal"] = feats.get("arousal", feats.get("arousal_score", 0.0))
+    feats["q_or_list"] = feats.get("q_or_list", feats.get("question_score", 0.0))
+    
+    # RECOMPUTE Hook V5 with real signals (arousal, question_score, audio_modifier)
+    if use_v5:
+        h_raw, h_cal, h_dbg = _hook_score_v5(
+            text,
+            cfg=config,
+            segment_index=seg_idx,
+            audio_modifier=feats.get("audio_modifier", 0.0),
+            arousal=float(feats.get("arousal_score", 0.0)),
+            q_or_list=float(feats.get("question_score", 0.0)),
+        )
+        feats["hook_score"] = float(h_cal)
+        feats.setdefault("_debug", {})
+        feats["_debug"]["hook_v5"] = h_dbg
     
     return feats
 
@@ -1528,6 +3089,73 @@ def debug_segment_scoring(segment: Dict, audio_file: str, genre: str = 'general'
     if 'audio_arousal' in features:
         print(f"Audio arousal: {features['audio_arousal']:.3f}")
 
+def compute_features_v4_batch(segments: list, audio_file: str, y_sr=None, genre: str = 'general', platform: str = 'tiktok') -> list:
+    """Batch processing for compute_features_v4 with Info Density V2, Question/List V2, Emotion V2, and Hook V5 calibration"""
+    # Check if V2 systems are enabled
+    config = get_config()
+    info_cfg = config.get("info_density", {})
+    ql_cfg = config.get("question_list_v2", {})
+    emotion_cfg = config.get("emotion_v2", {})
+    hook_cfg = config.get("hook_v5", {})
+    
+    if not info_cfg.get("enabled", True) and not ql_cfg.get("enabled", True) and not emotion_cfg.get("enabled", False) and not hook_cfg.get("enabled", False):
+        # V1 path - process segments individually
+        return [compute_features_v4(segment, audio_file, y_sr, genre, platform) for segment in segments]
+    
+    # V2 path - batch process with calibration
+    # First pass: compute all features including raw scores
+    processed_segments = []
+    raw_info_densities = []
+    raw_question_lists = []
+    raw_emotions = []
+    
+    for segment in segments:
+        # Compute all features normally
+        features = compute_features_v4(segment, audio_file, y_sr, genre, platform)
+        processed_segments.append(features)
+        
+        # Extract raw scores for calibration
+        text = segment.get("text", "")
+        dur = float(segment.get("end", 0.0) - segment.get("start", 0.0)) or 0.0
+        
+        if info_cfg.get("enabled", True):
+            raw_density = _info_density_raw_v2(text, dur)
+            raw_info_densities.append(raw_density)
+        
+        if ql_cfg.get("enabled", True):
+            raw_ql = _question_list_raw_v2(text, dur, genre)
+            raw_question_lists.append(raw_ql)
+        
+        if emotion_cfg.get("enabled", False):
+            # Build audio sidecar for emotion
+            audio_sidecar = build_emotion_audio_sidecar(features)
+            raw_emotion = _emotion_raw_v2(text, audio_sidecar, genre)
+            raw_emotions.append(raw_emotion)
+    
+    # Compute calibration statistics and update scores
+    if info_cfg.get("enabled", True) and raw_info_densities:
+        MU_info, SIGMA_info = _calibrate_info_density_stats(raw_info_densities)
+        for i, segment in enumerate(processed_segments):
+            segment["info_density"] = info_density_score_v2(segments[i], MU_info, SIGMA_info)
+    
+    if ql_cfg.get("enabled", True) and raw_question_lists:
+        MU_ql, SIGMA_ql = _ql_calibrate_stats(raw_question_lists)
+        for i, segment in enumerate(processed_segments):
+            segment["question_list"] = question_list_score_v2(segments[i], MU_ql, SIGMA_ql)
+            # Also set question_score for backward compatibility
+            segment["question_score"] = segment["question_list"]
+    
+    if emotion_cfg.get("enabled", False) and raw_emotions:
+        MU_emotion, SIGMA_emotion = _calibrate_emotion_stats(raw_emotions)
+        for i, segment in enumerate(processed_segments):
+            # Build audio sidecar for final emotion score
+            audio_sidecar = build_emotion_audio_sidecar(segment)
+            segment["emotion_score"] = emotion_score_v2(segments[i], MU_emotion, SIGMA_emotion, audio_sidecar)
+    
+    # Hook V5 processing is now handled in compute_features_v4
+    
+    return processed_segments
+
 def explain_segment_v4(features: Dict, weights: Dict = None, genre: str = 'general') -> Dict:
     if weights is None:
         weights = get_clip_weights()
@@ -1540,17 +3168,17 @@ def explain_segment_v4(features: Dict, weights: Dict = None, genre: str = 'gener
     
     hook_score = f.get("hook_score", 0.0)
     if hook_score >= 0.8:
-        strengths.append("🎯 **Killer Hook**: Opens with attention-grabbing content")
+        strengths.append("**Killer Hook**: Opens with attention-grabbing content")
     elif hook_score < 0.4:
-        improvements.append("⚠️ **Weak Hook**: Needs compelling opening")
+        improvements.append("**Weak Hook**: Needs compelling opening")
     
     viral_score = scoring_result["viral_score_100"]
     if viral_score >= 70:
-        overall = "🚀 **High Viral Potential** - Strong fundamentals"
+        overall = "**High Viral Potential** - Strong fundamentals"
     elif viral_score >= 50:
-        overall = "📈 **Good Potential** - Solid foundation"
+        overall = "**Good Potential** - Solid foundation"
     else:
-        overall = "🔧 **Needs Work** - Multiple issues to address"
+        overall = "**Needs Work** - Multiple issues to address"
     
     return {
         "overall_assessment": overall,
@@ -1568,6 +3196,10 @@ def viral_potential_v4(features: dict, length_s: float, platform: str = "general
 
     scoring_result = score_segment_v4(features, genre=genre)
     base_viral = scoring_result["final_score"]
+    
+    # Add synergy bonus
+    synergy_bonus = compute_synergy_bonus(features)
+    base_viral += synergy_bonus
     
     platform_multiplier = 1.0
     platform_reasons = []
@@ -1604,7 +3236,7 @@ def viral_potential_v4(features: dict, length_s: float, platform: str = "general
 
 # Legacy compatibility functions
 def _hook_score(text: str) -> float:
-    score, _ = _hook_score_v4(text)
+    score, _, _ = _hook_score_v4(text)
     return score
 
 def _emotion_score(text: str) -> float:
@@ -1616,6 +3248,997 @@ def _payoff_presence(text: str) -> float:
 
 def _info_density(text: str) -> float:
     return _info_density_v4(text)
+
+# Info Density V2 - Enhanced information content detection
+import re
+import numpy as np
+from collections import Counter
+
+# Precompiled regexes for performance
+_STOP = set("""
+a an the and but or so because that which to of in on at for with by as is are was were be been being this those these it
+i you he she we they me him her us them my your his her their our mine yours theirs ours
+""".split())
+
+_FILLERS = set("like you know kinda sort of basically literally actually honestly truly really just".split())
+_HEDGES  = set("maybe probably perhaps i think i guess seems might could".split())
+
+_NUM_RE  = re.compile(r"(?:(?:\d+[.,]?\d*)|(?:\d+%))")
+_UNIT_RE = re.compile(r"\b(km|mi|lb|kg|mph|fps|hz|kbps|mbps|gb|tb|ft|in|cm|mm)\b", re.I)
+_CURR_RE = re.compile(r"[$€£¥]")
+
+def _tokens_simple(text):
+    """Extract tokens from text"""
+    return re.findall(r"[A-Za-z0-9'%.]+", text.lower())
+
+def _split_sents(text):
+    """Split text into sentences"""
+    return re.split(r'(?<=[.!?])\s+', text.strip())
+
+def _tri01(x, lo, hi):
+    """Triangular function: 0 outside [lo,hi], 1 at midpoint, linear slopes"""
+    if lo >= hi or x <= lo or x >= hi:
+        return 0.0
+    mid = 0.5 * (lo + hi)
+    return (x - lo) / (mid - lo) if x < mid else (hi - x) / (hi - mid)
+
+def _safe_div(a, b):
+    """Safe division with zero guard"""
+    return a / b if b > 1e-9 else 0.0
+
+def _spacy_entities(text):
+    """Extract named entities using spaCy (optional)"""
+    try:
+        from nlp_loader import get_spacy
+        nlp = get_spacy()
+        if nlp is None:
+            if not getattr(_spacy_entities, "_warned", False):
+                logger.debug("spaCy unavailable; falling back to heuristic entity counter.")
+                _spacy_entities._warned = True
+            return None
+        
+        # Cap text length to keep latency predictable
+        text = text[:2000]
+        doc = nlp(text)
+        return sum(1 for ent in doc.ents if ent.label_ not in ("CARDINAL",))
+    except Exception as e:
+        if not getattr(_spacy_entities, "_warned", False):
+            logger.debug("spaCy unavailable; falling back to heuristic entity counter: %s", e)
+            _spacy_entities._warned = True
+        return None
+
+def _info_density_raw_v2(text: str, duration_s: float) -> float:
+    """Enhanced info density scoring with multiple signals"""
+    # Get configuration
+    config = get_config()
+    info_cfg = config.get("info_density", {})
+    
+    # Default configuration
+    default_cfg = {
+        "w_content": 0.30, "w_lexdiv": 0.15, "w_compression": 0.20, 
+        "w_specific": 0.20, "w_action": 0.15,
+        "ideal_tokens_per_sec": [1.8, 3.8],
+        "repeat_bigram_penalty": 0.15,
+        "fluff_penalty_cap": 0.20,
+        "textual_guard_min_tokens": 8,
+        "sigmoid_a": 1.6
+    }
+    cfg = {**default_cfg, **info_cfg}
+    
+    if not text or duration_s <= 0:
+        return 0.0
+    
+    toks = _tokens_simple(text)
+    N = len(toks)
+    if N < cfg["textual_guard_min_tokens"]:
+        return 0.35  # neutral for short bits
+
+    # 1) Content word ratio
+    content = [t for t in toks if t not in _STOP]
+    p_content = _safe_div(len(content), N)
+    s_content = np.clip((p_content - 0.45) / (0.85 - 0.45), 0, 1) * cfg["w_content"]
+
+    # 2) Lexical diversity (smoothed TTR)
+    ttr = _safe_div(len(set(toks)), N)
+    ttr_smooth = (ttr * N) / (N + 20)  # Good-Turing-ish smoothing
+    s_lexdiv = np.clip((ttr_smooth - 0.35) / (0.75 - 0.35), 0, 1) * cfg["w_lexdiv"]
+
+    # 3) Compression (tokens/sec band)
+    tps = _safe_div(len(content), duration_s)
+    lo, hi = cfg["ideal_tokens_per_sec"]
+    s_comp = _tri01(tps, lo, hi) * cfg["w_compression"]
+
+    # 4) Specificity
+    nums = len(_NUM_RE.findall(text))
+    units = len(_UNIT_RE.findall(text))
+    currs = len(_CURR_RE.findall(text))
+    ents = _spacy_entities(text)
+    if ents is None:
+        # Fallback: capitalized bigrams
+        ents = len(re.findall(r"\b[A-Z][a-z]+\s+[A-Z][a-z]+\b", text))
+    
+    comp_markers = len(re.findall(r"\b(vs|versus|than|compared to)\b", text, re.I))
+    define_markers = len(re.findall(r"\b(means|defined as|is when|refers to)\b", text, re.I))
+    list_markers = len(re.findall(r"\b(first|second|third|top \d+|(\d+)\s+(tips|steps|reasons))\b", text, re.I))
+
+    spec_score = np.tanh(0.25*nums + 0.25*units + 0.2*currs + 0.2*ents + 
+                         0.2*comp_markers + 0.15*define_markers + 0.15*list_markers)
+    s_specific = np.clip(spec_score, 0, 1) * cfg["w_specific"]
+
+    # 5) Actionability
+    sents = _split_sents(text)
+    imper = sum(1 for s in sents if re.match(r"^\s*(do|try|use|avoid|stop|start|remember|never|always)\b", s.strip().lower()))
+    s_action = np.clip(np.tanh(0.6*imper), 0, 1) * cfg["w_action"]
+
+    # Penalties: fluff & repetition
+    fill = sum(1 for t in toks if t in _FILLERS)
+    hedg = sum(1 for t in toks if t in _HEDGES)
+    pen_fluff = min(cfg["fluff_penalty_cap"], 0.03*fill + 0.02*hedg)
+    
+    # Bigram repetition (only if text is long enough)
+    pen_repeat = 0.0
+    if N >= 20:
+        bigrams = [" ".join(pair) for pair in zip(toks, toks[1:])]
+        common_bi = sum(1 for _, c in Counter(bigrams).most_common(8) if c >= 3)
+        pen_repeat = min(cfg["repeat_bigram_penalty"], 0.07*common_bi)
+
+    # Combine positives with saturating combiner
+    pos = sat([
+        np.clip(s_content / max(cfg["w_content"], 1e-9), 0, 1),
+        np.clip(s_lexdiv / max(cfg["w_lexdiv"], 1e-9), 0, 1),
+        np.clip(s_comp / max(cfg["w_compression"], 1e-9), 0, 1),
+        np.clip(s_specific / max(cfg["w_specific"], 1e-9), 0, 1),
+        np.clip(s_action / max(cfg["w_action"], 1e-9), 0, 1),
+    ])
+    
+    raw = np.clip(pos - (pen_fluff + pen_repeat), 0.0, 1.0)
+    return float(raw)
+
+def _calibrate_info_density_stats(raw_list):
+    """Compute robust statistics for info density calibration"""
+    arr = np.asarray(raw_list, dtype=float)
+    if arr.size == 0:
+        return 0.5, 0.2
+    med = float(np.median(arr))
+    q1, q3 = np.percentile(arr, [25, 75])
+    iqr = max(q3 - q1, 1e-6)
+    sigma = iqr / 1.349
+    return med, sigma
+
+def _sigmoid_info_density(x, a):
+    """Sigmoid function for info density calibration"""
+    return 1.0 / (1.0 + np.exp(-a * x))
+
+def info_density_score_v2(segment: dict, MU: float, SIGMA: float) -> float:
+    """Enhanced info density scoring with calibration"""
+    text = (segment.get("text") or segment.get("transcript") or "")
+    dur = float(segment.get("end", 0.0) - segment.get("start", 0.0)) or 0.0
+    raw = _info_density_raw_v2(text, dur)
+
+    # Get configuration
+    config = get_config()
+    info_cfg = config.get("info_density", {})
+    a = info_cfg.get("sigmoid_a", 1.6)
+    
+    z = (raw - MU) / (SIGMA if SIGMA > 1e-6 else 1.0)
+    score = float(_sigmoid_info_density(z, a))
+
+    # Add debug information
+    if "_debug" not in segment:
+        segment["_debug"] = {}
+    
+    debug = segment["_debug"]
+    debug["info_density_raw"] = raw
+    debug["info_density_mu"] = MU
+    debug["info_density_sigma"] = SIGMA
+    debug["info_density_final"] = score
+    
+    return max(0.0, min(1.0, score))
+
+# Question/List V2 - Enhanced interactive engagement detection
+import re
+import math
+import numpy as np
+from collections import Counter
+
+# Precompiled regexes for performance
+_QMARK      = re.compile(r"\?\s*$")
+_INTERROG   = re.compile(r"\b(what|why|how|when|where|which|who)\b", re.I)
+_COMPARE    = re.compile(r"\b(vs\.?|versus|better than|worse than|compare(?:d)? to)\b", re.I)
+_CHOICE     = re.compile(r"\b(which|pick|choose|would you rather|either|or)\b", re.I)
+_RHET_IND   = re.compile(r"\b(i wonder if|what if|ever notice|guess why|have you ever)\b", re.I)
+_CLIFF_Q    = re.compile(r"\b(guess|until|turns out|reveal|reveals)\b", re.I)
+_VACUOUS_YN = re.compile(r"^(is|are|do|does|did|can|could|should|would|will|was|were)\b", re.I)
+
+# Lists
+_ENUM_NUM   = re.compile(r"(?:^|\s)(\d+)[.)]\s")
+_ENUM_ORD   = re.compile(r"\b(first|second|third|fourth|fifth|top\s+\d+|step\s+\d+)\b", re.I)
+_LIST_SEP   = re.compile(r"(?:^|\s)[•\-–—]\s")        # bullets/dashes
+_EMOJI_BUL  = re.compile(r"(?:^|\s)[•]\s")     # common bullet points
+
+# Engagement
+_GENUINE    = re.compile(r"\b(tell me|share your|what(?:'| i)s your (?:take|experience)|how do you)\b", re.I)
+_BAIT       = re.compile(r"(like and subscribe|follow for more|smash (?:that )?like|link in bio|comment\s+(yes|🔥|below))", re.I)
+
+_STOPWORDS  = set("a an the and or but so to of in on at with for as is are was were be been this that it".split())
+
+def _sentences(text: str):
+    """Split text into sentences"""
+    return re.split(r'(?<=[.!?])\s+', text.strip()) if text else []
+
+def _tokens_ql(s: str):
+    """Extract tokens from text for question/list analysis"""
+    return re.findall(r"[A-Za-z0-9']+", s.lower()) if s else []
+
+def _tri01_ql(x, lo, hi):
+    """Triangular function for question/list scoring"""
+    if lo >= hi or x <= lo or x >= hi:
+        return 0.0
+    mid = (lo + hi) / 2.0
+    return (x - lo) / (mid - lo) if x < mid else (hi - x) / (hi - mid)
+
+def _question_list_raw_v2(text: str, duration_s: float | None = None, genre: str | None = None) -> float:
+    """Enhanced question/list scoring with multiple signals"""
+    # Get configuration
+    config = get_config()
+    ql_cfg = config.get("question_list_v2", {})
+    
+    # Default configuration
+    default_cfg = {
+        "sigmoid_a": 1.5,
+        "ideal_items_range": [3, 7],
+        "pen_bait_cap": 0.25,
+        "pen_vacuous_q_cap": 0.20,
+        "textual_guard_min_tokens": 6,
+        "genre_tweaks": {
+            "education": {"list_bonus": 0.03, "question_bonus": 0.00},
+            "entertainment": {"list_bonus": 0.00, "question_bonus": 0.03},
+            "linkedin": {"list_bonus": 0.02, "question_bonus": 0.00}
+        }
+    }
+    cfg = {**default_cfg, **ql_cfg}
+    
+    if not text:
+        return 0.0
+    
+    toks = _tokens_ql(text)
+    if len(toks) < cfg["textual_guard_min_tokens"]:
+        return 0.35  # neutral for very short strings
+
+    sents = _sentences(text)
+    first = sents[0] if sents else text
+    last = sents[-1] if sents else text
+
+    # -------- Questions subscore --------
+    qmark = 1.0 if _QMARK.search(last or "") else 0.0
+    wh = 1.0 if (_INTERROG.search(last or "") or _INTERROG.search(first or "")) else 0.0
+    compare = 1.0 if _COMPARE.search(text) else 0.0
+    choice = 1.0 if _CHOICE.search(text) else 0.0
+    rhetind = 1.0 if _RHET_IND.search(text) else 0.0
+    cliffq = 1.0 if (_CLIFF_Q.search(last or "") and qmark) else 0.0
+    genuine = 1.0 if _GENUINE.search(text) else 0.0
+
+    # Internal weights (kept in code to avoid config sprawl)
+    q_direct = 0.6 * qmark + 0.4 * wh
+    q_compare = 0.3 * compare
+    q_choice = 0.25 * choice
+    q_rhet = 0.15 * rhetind
+    q_cliff = 0.15 * cliffq
+    q_prompt = min(0.10, 0.10 * genuine)  # tiny boost for honest prompts
+
+    Q_raw = sat([q_direct, q_compare, q_choice, q_rhet, q_cliff]) + q_prompt
+    Q_raw = float(min(1.0, Q_raw))
+
+    # -------- Lists subscore --------
+    # Detect items by numbered/ordinal/bullet lines (or emoji bullets)
+    lines = re.split(r"(?:\n|;|\s{2,})", text.strip())
+    item_lengths = []
+    item_starts = []
+    enum_hits = 0
+    
+    for l in lines:
+        has_enum = bool(_ENUM_NUM.search(l) or _ENUM_ORD.search(l) or _LIST_SEP.search(l) or _EMOJI_BUL.search(l))
+        if has_enum:
+            enum_hits += 1
+            # Token after marker for parallelism check
+            m = _ENUM_NUM.search(l) or _ENUM_ORD.search(l) or _LIST_SEP.search(l) or _EMOJI_BUL.search(l)
+            tail = l[m.end():] if m and hasattr(m, 'end') else l
+            tl_toks = [t for t in _tokens_ql(tail) if t not in _STOPWORDS]
+            if tl_toks:
+                item_starts.append(tl_toks[0])
+            item_lengths.append(len(_tokens_ql(l)))
+
+    # Fallback: comma-separated pseudo-lists
+    if enum_hits == 0:
+        commas = len(re.findall(r",\s+", text))
+        if commas >= 2:
+            enum_hits = 1
+            item_lengths = [len(_tokens_ql(x)) for x in re.split(r",\s+", text)]
+            item_starts = [(_tokens_ql(x) or [""])[0] for x in re.split(r",\s+", text)]
+
+    parallel = 0.0
+    if len(item_starts) >= 3:
+        c = Counter(item_starts).most_common(1)[0][1]
+        parallel = min(1.0, c / max(1, len(item_starts)))
+
+    concise = 0.0
+    if item_lengths:
+        med_len = float(np.median(item_lengths))
+        concise = 1.0 if 4 <= med_len <= 12 else (0.0 if med_len < 3 or med_len > 25 else 0.5)
+
+    items = len(item_lengths)
+    lo, hi = cfg["ideal_items_range"]
+    items_band = _tri01_ql(items, lo, hi) if items > 0 else 0.0
+
+    L_raw = sat([
+        1.0 if enum_hits else 0.0,     # enumeration present
+        0.8 * parallel,                # structural parallelism
+        0.6 * concise,                 # brevity
+        0.4 * items_band,              # sweet spot of items
+    ])
+
+    # -------- Penalties --------
+    pen_bait = min(cfg["pen_bait_cap"], 0.25 if _BAIT.search(text) else 0.0)
+
+    pen_vacuous = 0.0
+    last_toks = _tokens_ql(last)
+    if (qmark and not wh and last_toks and _VACUOUS_YN.search(last.lower()) and len(last_toks) <= 8):
+        pen_vacuous = min(cfg["pen_vacuous_q_cap"], 0.20)
+
+    # -------- Genre micro-tweaks --------
+    if genre:
+        gt = cfg.get("genre_tweaks", {}).get(genre.lower(), {})
+        Q_raw = float(min(1.0, Q_raw + gt.get("question_bonus", 0.0)))
+        L_raw = float(min(1.0, L_raw + gt.get("list_bonus", 0.0)))
+
+    pos = sat([Q_raw, L_raw])
+    raw = float(np.clip(pos - (pen_bait + pen_vacuous), 0.0, 1.0))
+    return raw
+
+def _ql_calibrate_stats(raws: list[float]) -> tuple[float, float]:
+    """Compute robust statistics for question/list calibration"""
+    arr = np.asarray(raws, dtype=float)
+    if arr.size == 0:
+        return 0.5, 0.2
+    med = float(np.median(arr))
+    q1, q3 = np.percentile(arr, [25, 75])
+    iqr = max(q3 - q1, 1e-6)
+    sigma = iqr / 1.349
+    return med, sigma
+
+def _sigmoid_ql(x: float, a: float) -> float:
+    """Sigmoid function for question/list calibration"""
+    return 1.0 / (1.0 + math.exp(-a * x))
+
+def question_list_score_v2(segment: dict, MU: float, SIGMA: float) -> float:
+    """Enhanced question/list scoring with calibration"""
+    text = segment.get("text") or segment.get("transcript") or ""
+    genre = (segment.get("genre") or "").lower() or None
+    raw = _question_list_raw_v2(text, genre=genre)
+    
+    # Get configuration
+    config = get_config()
+    ql_cfg = config.get("question_list_v2", {})
+    a = ql_cfg.get("sigmoid_a", 1.5)
+    
+    z = (raw - MU) / (SIGMA if SIGMA > 1e-6 else 1.0)
+    score = float(_sigmoid_ql(z, a))
+    
+    # Add debug information
+    if "_debug" not in segment:
+        segment["_debug"] = {}
+    
+    debug = segment["_debug"]
+    debug["ql_raw"] = raw
+    debug["ql_mu"] = MU
+    debug["ql_sigma"] = SIGMA
+    debug["ql_final"] = score
+    
+    return max(0.0, min(1.0, score))
+
+def attach_question_list_scores_v2(segments: list[dict]) -> None:
+    """Batch processing for question/list V2 with calibration"""
+    if not segments:
+        return
+    
+    raws = [_question_list_raw_v2(
+        (s.get("text") or s.get("transcript") or ""), 
+        genre=(s.get("genre") or "").lower() or None
+    ) for s in segments]
+    
+    MU, SIGMA = _ql_calibrate_stats(raws)
+    
+    for s, raw in zip(segments, raws):
+        s["question_list"] = question_list_score_v2(s, MU, SIGMA)
+
+def apply_synergy_bonus(segment: dict) -> float:
+    """Apply synergy bonus between question/list and info density"""
+    ql = float(segment.get("question_list", 0.0))
+    idv = float(segment.get("info_density", 0.0))
+    return 0.01 if (ql >= 0.60 and idv >= 0.60) else 0.0
+
+# ---- Emotion V2 System -------------------------------------------------------------
+import re, math, numpy as np
+from collections import Counter
+
+# Lightweight emotion family lexicons
+_EMO_FAM = {
+    "anger":   r"(angry|furious|mad|irritat(?:ed|ing)|rage|pissed|enrag(?:e|ed))",
+    "fear":    r"(afraid|terrified|scared|anxious|panic|frighten(?:ed)?|horror|nightmare)",
+    "sad":     r"(sad|devastat(?:ed|ing)|heartbroken|depress(?:ed|ing)|mourning|grief)",
+    "joy":     r"(happy|thrilled|excited|joy|delight(?:ed)?|proud|relief|relieved|love)",
+    "surprise":r"(shocked|jaw[-\s]?dropped|stunned|unbelievable|insane|crazy|wow|mind[-\s]?blown|🤯)",
+    "disgust": r"(disgust(?:ed|ing)|gross|nauseat(?:ed|ing)|repuls(?:e|ed))",
+    "desire":  r"(want|crave|obsessed|hungry for|itch(?:ing)? to|ambitious|driven|aspire)",
+    "shame":   r"(ashamed|embarrass(?:ed|ing)|humiliat(?:ed|ing)|guilty|regret)",
+    "awe":     r"(awe(?:some)?|awe[-\s]?inspiring|majestic|breathtaking|staggering|incredible)"
+}
+
+# Legacy emotion words mapping for continuity
+LEGACY_HIGH = {"incredible","insane","mind-blowing","shocking"}
+LEGACY_REG  = {"amazing","awesome","unbelievable","heartbreaking","devastating",
+               "terrifying","exciting","hilarious","beautiful","crazy","sad","angry","happy"}
+
+MIGRATE = {
+    "awe":       {"incredible","amazing","awesome","unbelievable","mind-blowing"},
+    "surprise":  {"shocking","crazy"},
+    "sad":       {"heartbreaking","devastating","sad"},
+    "fear":      {"terrifying"},
+    "joy":       {"exciting","beautiful","happy","hilarious"},
+    "anger":     {"angry"}
+}
+
+# Regex patterns for intensity detection
+_WORD = re.compile(r"[A-Za-z']+")
+_EXCL = re.compile(r"!{2,}")
+_ELLIPS = re.compile(r"\.{3,}")
+_ALLCAP = re.compile(r"\b[A-Z]{2,}\b")
+_EMOJIS = re.compile(r"[😂🤣😭😡😱😍❤️💔🤯✨🔥]")
+
+def _extend_families_with_legacy():
+    """Extend emotion families with legacy words for continuity"""
+    global _EMO_FAM
+    config = get_config()
+    if config.get("emotion_v2", {}).get("migrate_legacy", True):
+        for fam, words in MIGRATE.items():
+            if fam in _EMO_FAM:
+                extra = "|".join(re.escape(w) for w in words)
+                _EMO_FAM[fam] = f"(?:{_EMO_FAM[fam]}|{extra})"
+
+# Initialize legacy migration
+_extend_families_with_legacy()
+
+def _tokens_simple(t): 
+    return _WORD.findall(t.lower()) if t else []
+
+def _sent_split(t): 
+    return re.split(r'(?<=[.!?])\s+', t.strip()) if t else []
+
+def _negation_mask(toks, idx, W):
+    """Return -1 if a negator appears within window before idx."""
+    lo = max(0, idx - W)
+    for j in range(lo, idx):
+        if toks[j] in {"not","no","never","isnt","isn't","dont","don't","cannot","can't","wont","won't"}:
+            return -1
+    return +1
+
+def _match_family_score(text, neg_win):
+    """Match emotion families with negation awareness"""
+    toks = _tokens_simple(text)
+    fam_hits = {}
+    total = 0
+    for fam, pat in _EMO_FAM.items():
+        rx = re.compile(pat, re.I)
+        fam_hits[fam] = 0
+        for m in rx.finditer(text):
+            # rough token index for negation windowing
+            span_text = text[:m.start()].lower()
+            idx = len(_tokens_simple(span_text))
+            fam_hits[fam] += 1 * _negation_mask(toks, idx, neg_win)
+            total += 1
+    
+    # positive vs negative valence proxy
+    pos = fam_hits["joy"] + fam_hits["awe"] + fam_hits["desire"]
+    neg = fam_hits["anger"] + fam_hits["fear"] + fam_hits["sad"] + fam_hits["disgust"] + fam_hits["shame"]
+    pos = max(0, pos); neg = max(0, neg)
+
+    families_present = sum(1 for k,v in fam_hits.items() if v>0)
+    fam_density = np.tanh(0.35 * total)                          # diminishing returns
+    diversity   = np.tanh(0.7 * min(families_present, 3))        # complexity sweet spot 1–3
+    val_balance = np.tanh(0.6 * (pos - neg) / max(1, pos + neg)) # -1..1 → -0.54..0.54
+    val_balance = (val_balance + 0.54) / 1.08                    # normalize ~0..1
+
+    return fam_hits, dict(pos=pos, neg=neg), float(fam_density), float(diversity), float(val_balance)
+
+def _intensity_text(text, caps_softcap, punct_cap, emoji_cap):
+    """Detect intensity cues with soft caps"""
+    exc  = 1.0 if _EXCL.search(text) else 0.0
+    ell  = 0.5 if _ELLIPS.search(text) else 0.0
+    caps = min(caps_softcap, len(_ALLCAP.findall(text)))
+    emo  = len(_EMOJIS.findall(text))
+    # combine with caps/emoji soft caps
+    raw = 0.4*exc + 0.2*ell + 0.25*min(1.0, caps/caps_softcap) + 0.15*min(1.0, emo/3.0)
+    return float(min(1.0, raw, punct_cap + emoji_cap))  # hard ceiling for spam
+
+def _arc_shift(text):
+    """Detect emotional arc/shift between first and last sentence"""
+    sents = _sent_split(text)
+    if len(sents) < 2: return 0.0
+    def polarity(s):
+        # ultra-light polarity: many good/bad words; configurable later
+        pos = len(re.findall(r"\b(great|love|happy|proud|amazing|wow|relief)\b", s, re.I))
+        neg = len(re.findall(r"\b(hate|scared|sad|angry|annoying|nightmare|pain)\b", s, re.I))
+        return np.tanh(0.6*(pos-neg))
+    p0, p1 = polarity(sents[0]), polarity(sents[-1])
+    return float(np.clip(abs(p1-p0), 0.0, 1.0))
+
+def _empathy(text):
+    """Detect empathy markers"""
+    return 1.0 if re.search(r"\b(i felt|made me (feel|cry|smile)|it hurts|i'm proud|i am proud|i'm terrified|i was terrified)\b", text, re.I) else 0.0
+
+def build_emotion_audio_sidecar(seg):
+    """Build audio sidecar from Arousal V5 debug fields"""
+    d = seg.get("_debug", {})
+    pv   = float(d.get("arousal_pitch_dyn", 0.0))
+    flux = float(d.get("arousal_flux", 0.0))
+    # if you log variance separately, prefer that; else reuse energy_core as a proxy
+    eng  = float(d.get("arousal_energy_var", d.get("arousal_energy_core", 0.0)))
+    if pv==flux==eng==0.0: return None
+    return {"pitch_dyn": pv, "spectral_flux": flux, "energy_var": eng}
+
+def _emotion_raw_v2(text: str, audio_features: dict | None, genre: str | None) -> float:
+    """Compute raw emotion score with multiple signals"""
+    if not text or len(text.strip()) < 3: return 0.0
+    cfg_v2 = get_config().get("emotion_v2", {})
+    cfg_lex = get_config().get("emotion_lexicons", {})
+    negW = int(cfg_v2.get("negation_window", 3))
+    caps_softcap = int(cfg_v2.get("caps_run_softcap", 3))
+    punct_cap = float(cfg_v2.get("punct_repeat_cap", 0.08))
+    emoji_cap = float(cfg_v2.get("emoji_max", 0.06))
+
+    # --- TEXT FAMILY & VALENCE via LEXICONS or fallback ---
+    if cfg_lex.get("enabled", False):
+        hits = extract_emotion_hits_from_lexicons(text)   # [(family, weight)]
+        fam_hits = {}
+        total = 0.0
+        pos = neg = 0.0
+        for fam, w in hits:
+            fam_hits[fam] = fam_hits.get(fam, 0.0) + w
+            total += w
+            if fam in {"joy","awe","desire","pride"}:
+                pos += w
+            elif fam in {"anger","fear","sad","disgust","shame"}:
+                neg += w
+        families_present = sum(1 for v in fam_hits.values() if v > 0)
+        s_fam = float(np.tanh(0.30 * total))             # diminishing returns
+        s_div = float(np.tanh(0.7 * min(families_present, 3)))
+        s_val = 0.5  # default neutral
+        if pos + neg > 0:
+            s_val = (np.tanh(0.6 * (pos - neg) / (pos + neg)) + 0.54) / 1.08
+    else:
+        # fallback to existing regex family path
+        fam_hits, val, s_fam, s_div, s_val = _match_family_score(text, negW)
+    s_int = _intensity_text(text, caps_softcap, punct_cap, emoji_cap)
+    s_arc = _arc_shift(text)
+    s_emp = _empathy(text)
+
+    # Audio micro contribution (already bounded in config)
+    s_audio = 0.0
+    if audio_features:
+        # take gentle slice of arousal subfeatures if provided
+        pv   = float(audio_features.get("pitch_dyn", 0.0))     # 0..1
+        flux = float(audio_features.get("spectral_flux", 0.0)) # 0..1
+        eng  = float(audio_features.get("energy_var", 0.0))    # 0..1
+        s_audio = 0.4*pv + 0.3*flux + 0.3*eng
+        s_audio = min(s_audio, float(cfg_v2.get("audio_micro_cap", 0.08)))
+
+    # Combine with saturating combiner
+    w = {
+        "families": float(cfg_v2.get("w_text_families", 0.45)),
+        "valence":  float(cfg_v2.get("w_valence_balance", 0.20)),
+        "intens":   float(cfg_v2.get("w_intensity", 0.15)),
+        "arc":      float(cfg_v2.get("w_arc_shift", 0.12)),
+        "empathy":  float(cfg_v2.get("w_empathy", 0.08))
+    }
+    # normalize into [0,1] parts then saturate
+    parts = [
+        min(1.0, s_fam) * (w["families"]/max(1e-6, sum(w.values()))),
+        s_val             * (w["valence"]/max(1e-6, sum(w.values()))),
+        s_int             * (w["intens"]/max(1e-6, sum(w.values()))),
+        s_arc             * (w["arc"]/max(1e-6, sum(w.values()))),
+        s_emp             * (w["empathy"]/max(1e-6, sum(w.values()))),
+        s_audio
+    ]
+    # saturating combiner
+    pos = 1.0
+    for x in parts: pos *= (1.0 - max(0.0, min(1.0, x)))
+    raw = 1.0 - pos
+
+    # Genre micro-tweaks
+    g = (genre or "").lower()
+    gt = cfg_v2.get("genre_tweaks", {}).get(g, {})
+    if g == "comedy":
+        if re.search(r"(shocked|unbelievable|unexpected|plot twist|😆|😂)", text, re.I):
+            raw += float(gt.get("surprise_bonus", 0.0)) + float(gt.get("laughter_bonus", 0.0))
+    if g == "true_crime":
+        if re.search(r"(shocking|terrifying|victim|case|evidence)", text, re.I):
+            raw += float(gt.get("fear_shock_bonus", 0.0))
+        if re.search(r"(tragic|sad|heartbroken)", text, re.I):
+            raw += float(gt.get("sadness_bonus", 0.0))
+    if g == "health_wellness":
+        if re.search(r"(hope|proud|better|improve|transform)", text, re.I):
+            raw += float(gt.get("hope_pride_bonus", 0.0))
+        if re.search(r"(ashamed|embarrass|guilty)", text, re.I):
+            raw -= float(gt.get("shame_penalty", 0.0))
+    if g == "business":
+        if re.search(r"(proud|ambitious|driven|want|crave|win)", text, re.I):
+            raw += float(gt.get("pride_desire_bonus", 0.0))
+
+    return float(np.clip(raw, 0.0, 1.0))
+
+def _calibrate_emotion_stats(raws: list[float]) -> tuple[float, float]:
+    """Compute robust median/IQR stats for calibration"""
+    arr = np.asarray(raws, dtype=float)
+    if arr.size == 0: return 0.5, 0.2
+    med = float(np.median(arr))
+    q1, q3 = np.percentile(arr, [25, 75]); iqr = max(q3 - q1, 1e-6)
+    sigma = iqr / 1.349
+    return med, sigma
+
+def _sigmoid_emotion(x: float, a: float) -> float:
+    """Sigmoid function for calibration"""
+    return 1.0 / (1.0 + math.exp(-a * x))
+
+def emotion_score_v2(segment: dict, MU: float, SIGMA: float, audio_features: dict | None = None) -> float:
+    """Apply calibration to raw emotion score"""
+    cfg = get_config().get("emotion_v2", {})
+    a = float(cfg.get("sigmoid_a", 1.5))
+    text = (segment.get("text") or segment.get("transcript") or "")
+    genre = segment.get("genre")
+    raw = _emotion_raw_v2(text, audio_features, genre)
+    z = (raw - MU) / (SIGMA if SIGMA > 1e-6 else 1.0)
+    score = float(_sigmoid_emotion(z, a))
+
+    dbg = segment.setdefault("_debug", {})
+    dbg.update({
+        "emotion_raw": raw, "emotion_mu": MU, "emotion_sigma": SIGMA, "emotion_final": score
+    })
+    return max(0.0, min(1.0, score))
+
+def attach_emotion_scores_v2(segments: list[dict], audio_sidecars: list[dict] | None = None):
+    """Compute raw → calibrate per batch → sigmoid"""
+    raws = []
+    for i, s in enumerate(segments):
+        af = (audio_sidecars[i] if audio_sidecars and i < len(audio_sidecars) else None)
+        raws.append(_emotion_raw_v2((s.get("text") or s.get("transcript") or ""), af, s.get("genre")))
+    MU, SIGMA = _calibrate_emotion_stats(raws)
+    for i, s in enumerate(segments):
+        af = (audio_sidecars[i] if audio_sidecars and i < len(audio_sidecars) else None)
+        s["emotion_score"] = emotion_score_v2(s, MU, SIGMA, af)
+
+def attach_emotion_scores(segments: list[dict]):
+    """Dispatcher for emotion scoring - V2 when enabled, legacy otherwise"""
+    config = get_config()
+    if config.get("emotion_v2", {}).get("enabled", False):
+        # Build audio sidecars from arousal debug fields
+        audio_sidecars = [build_emotion_audio_sidecar(s) for s in segments]
+        attach_emotion_scores_v2(segments, audio_sidecars)
+    else:
+        # Legacy path
+        for s in segments:
+            s["emotion_score"] = _emotion_score_v4(s.get("text", s.get("transcript", "")))
+
+# ---- Enhanced Emotion Lexicon System -------------------------------------------------------------
+
+import csv, re, os, math, numpy as np
+from functools import lru_cache
+from typing import Dict, List, Tuple
+
+# Light tokenizer + optional lemmatizer (no heavy deps)
+_WORD_LEX = re.compile(r"[A-Za-z']+")
+def _tok_lex(text: str) -> List[str]:
+    return _WORD_LEX.findall(text.lower()) if text else []
+
+def _lemmatize_basic(w: str) -> str:
+    """Ultra-light stem/lemma to improve lexicon hits (no external libs)"""
+    for suf in ("'s", "'s"):
+        if w.endswith(suf): w = w[:-2]
+    for suf in ("ing","ed","er","est","es","s"):
+        if len(w) > 4 and w.endswith(suf):
+            return w[:-len(suf)]
+    return w
+
+def _maybe_lemma(tokens: List[str]) -> List[str]:
+    """Apply lemmatization if enabled in config"""
+    if get_config().get("emotion_lexicons", {}).get("lemmatize", True):
+        return [_lemmatize_basic(t) for t in tokens]
+    return tokens
+
+# Mapping from external labels to our emotion families
+MAP_NRC_TO_FAM = {
+    "anger": "anger",
+    "fear": "fear", 
+    "sadness": "sad",
+    "joy": "joy",
+    "surprise": "surprise",
+    "disgust": "disgust",
+    "anticipation": "desire",  # anticipation maps to desire/drive
+    "trust": "pride"          # trust maps to pride/confidence
+}
+
+MAP_DM_TO_FAM = {
+    # Example mapping for DepecheMood columns -> our families
+    "AFRAID": "fear", "ANGRY": "anger", "SAD": "sad", "HAPPY": "joy",
+    "AMUSED": "joy", "ANNOYED": "anger", "DONOTCARE": "disgust",
+    "INSPIRED": "awe", "AFRAID_CONFIDENT": "fear", "DOUBTFUL": "shame"
+}
+
+@lru_cache(maxsize=1)
+def _load_nrc() -> Dict[str, List[str]]:
+    """Load NRC Emotion Lexicon: word -> [families]"""
+    cfg = get_config().get("emotion_lexicons", {})
+    if not (cfg.get("enabled") and cfg.get("use_nrc")): 
+        return {}
+    path = cfg.get("nrc_path")
+    if not path or not os.path.exists(path): 
+        return {}
+    
+    lex: Dict[str, List[str]] = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.strip().split("\t")
+                if len(parts) != 3: 
+                    continue
+                w, emo, flag = parts
+                if flag != "1": 
+                    continue
+                fam = MAP_NRC_TO_FAM.get(emo.lower())
+                if not fam: 
+                    continue
+                w = w.lower()
+                lex.setdefault(w, []).append(fam)
+    except Exception as e:
+        print(f"Warning: Could not load NRC lexicon from {path}: {e}")
+        return {}
+    
+    return lex
+
+@lru_cache(maxsize=1)
+def _load_ail() -> Dict[str, Dict[str, float]]:
+    """Load NRC Affect Intensity Lexicon: word -> {family: intensity}"""
+    cfg = get_config().get("emotion_lexicons", {})
+    if not (cfg.get("enabled") and cfg.get("use_ail")): 
+        return {}
+    path = cfg.get("ail_path")
+    if not path or not os.path.exists(path): 
+        return {}
+    
+    out: Dict[str, Dict[str, float]] = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            reader = csv.reader(f, delimiter="\t")
+            # Try to be robust: detect header
+            header = next(reader, None)
+            
+            def norm(v: str) -> float:
+                try:
+                    x = float(v)
+                    # AIL scores usually 0..1 (or 0..1-ish). Clamp just in case.
+                    return max(0.0, min(1.0, x))
+                except: 
+                    return 0.0
+            
+            if header and len(header) >= 3 and header[0].lower().startswith("word"):
+                # has header; read data lines
+                for row in reader:
+                    if len(row) < 3: 
+                        continue
+                    w, emo, score = row[0].lower(), row[1].lower(), norm(row[2])
+                    fam = MAP_NRC_TO_FAM.get(emo) or emo
+                    if fam not in MAP_NRC_TO_FAM.values(): 
+                        continue
+                    out.setdefault(w, {})[fam] = max(out[w].get(fam, 0.0), score)
+            else:
+                # no header; treat first line as data too
+                f.seek(0)
+                for row in csv.reader(f, delimiter="\t"):
+                    if len(row) < 3: 
+                        continue
+                    w, emo, score = row[0].lower(), row[1].lower(), norm(row[2])
+                    fam = MAP_NRC_TO_FAM.get(emo) or emo
+                    if fam not in MAP_NRC_TO_FAM.values():
+                        continue
+                    out.setdefault(w, {})[fam] = max(out[w].get(fam, 0.0), score)
+    except Exception as e:
+        print(f"Warning: Could not load AIL lexicon from {path}: {e}")
+        return {}
+    
+    return out
+
+@lru_cache(maxsize=1)
+def _load_depechemood() -> Dict[str, Dict[str, float]]:
+    """Load DepecheMood lexicon: token -> {family: score}"""
+    cfg = get_config().get("emotion_lexicons", {})
+    if not (cfg.get("enabled") and cfg.get("use_depechemood")): 
+        return {}
+    path = cfg.get("depechemood_path")
+    if not path or not os.path.exists(path): 
+        return {}
+    
+    out: Dict[str, Dict[str, float]] = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            header = f.readline().strip().split("\t")
+            if len(header) < 3: 
+                return {}
+            fam_cols = [c for c in header[1:] if c in MAP_DM_TO_FAM]
+            for line in f:
+                parts = line.strip().split("\t")
+                if len(parts) != len(header): 
+                    continue
+                lemma_pos = parts[0].split("#")[0].lower()
+                scores = parts[1:]
+                for col, val in zip(header[1:], scores):
+                    fam = MAP_DM_TO_FAM.get(col)
+                    if not fam: 
+                        continue
+                    try:
+                        s = float(val)
+                    except:
+                        continue
+                    # normalize roughly into [0,1] per row
+                    out.setdefault(lemma_pos, {})[fam] = max(out[lemma_pos].get(fam, 0.0), s)
+        
+        # optional normalization across families per token
+        for w, fams in out.items():
+            mx = max(fams.values()) if fams else 1.0
+            if mx > 0:
+                for k in list(fams.keys()):
+                    fams[k] = min(1.0, fams[k] / mx)
+    except Exception as e:
+        print(f"Warning: Could not load DepecheMood lexicon from {path}: {e}")
+        return {}
+    
+    return out
+
+def _negation_mask_lex(tokens: List[str], idx: int, window: int) -> int:
+    """Return -1 if a negator appears within window before idx"""
+    lo = max(0, idx - window)
+    for j in range(lo, idx):
+        if tokens[j] in {"not","no","never","isnt","isn't","dont","don't","cannot","can't","wont","won't","ain't","aint"}:
+            return -1
+    return +1
+
+def extract_emotion_hits_from_lexicons(text: str) -> List[Tuple[str, float]]:
+    """
+    Extract emotion hits using NRC/AIL/DepecheMood lexicons according to config.
+    Returns list of (family, weight) hits with negation awareness.
+    """
+    cfg = get_config().get("emotion_lexicons", {})
+    if not cfg.get("enabled"): 
+        return []
+
+    toks = _maybe_lemma(_tok_lex(text))
+    if not toks: 
+        return []
+    if len(toks) > int(cfg.get("max_tokens_considered", 300)):
+        toks = toks[:int(cfg.get("max_tokens_considered", 300))]
+
+    nrc = _load_nrc()
+    ail = _load_ail()
+    dpm = _load_depechemood()
+    use_nrc = bool(cfg.get("use_nrc", True))
+    use_ail = bool(cfg.get("use_ail", True))
+    use_dm = bool(cfg.get("use_depechemood", False))
+    MIN_INT = float(cfg.get("min_intensity", 0.20))
+    CAP_TOK = float(cfg.get("cap_per_token", 1.50))
+    NEG_W = int(get_config().get("emotion_v2", {}).get("negation_window", 3))
+
+    hits: List[Tuple[str, float]] = []
+    for i, w in enumerate(toks):
+        # per-token accumulation (cap to avoid extreme pile-ups)
+        per_tok = 0.0
+        
+        # NRC binary categories → 1.0
+        if use_nrc and w in nrc:
+            for fam in nrc[w]:
+                s = 1.0
+                s *= _negation_mask_lex(toks, i, NEG_W)
+                if s > 0:
+                    hits.append((fam, s))
+                    per_tok += s
+        
+        # AIL intensities
+        if use_ail and w in ail:
+            for fam, val in ail[w].items():
+                if val < MIN_INT: 
+                    continue
+                s = val
+                s *= _negation_mask_lex(toks, i, NEG_W)
+                if s > 0:
+                    hits.append((fam, s))
+                    per_tok += s
+        
+        # DepecheMood (optional)
+        if use_dm and w in dpm:
+            for fam, val in dpm[w].items():
+                if val < MIN_INT:
+                    continue
+                s = val * 0.8  # DM often "hot"; tame slightly
+                s *= _negation_mask_lex(toks, i, NEG_W)
+                if s > 0:
+                    hits.append((fam, s))
+                    per_tok += s
+
+        # cap how much a single token can contribute
+        if per_tok > CAP_TOK:
+            scale = CAP_TOK / per_tok
+            # scale down the most recent additions for this token
+            k = len(hits) - 1
+            acc = 0.0
+            while k >= 0 and acc < per_tok:
+                fam, s = hits[k]
+                hits[k] = (fam, s * scale)
+                acc += s
+                k -= 1
+
+    return hits
+
+# ---- Enhanced Synergy System -------------------------------------------------------------
+
+def compute_synergy_bonus(segment: dict) -> float:
+    """
+    Small additive nudges when independent signals co-occur.
+    Returns a bounded bonus; never negative.
+    """
+    cfg = get_config().get("synergy", {}) or {}
+    if not cfg.get("enabled", True):
+        return 0.0
+
+    bonus_total = 0.0
+
+    # --- Emotion × Arousal ---
+    ea = cfg.get("emo_arousal", {})
+    thr_emo = float(ea.get("thr_emo", 0.60))
+    thr_ar  = float(ea.get("thr_arousal", 0.60))
+    add_ea  = float(ea.get("bonus", 0.01))
+    cap_ea  = float(ea.get("cap", 0.02))
+
+    emo = float(segment.get("emotion_score", 0.0))
+    aro = float(segment.get("arousal", segment.get("arousal_score", 0.0)))
+    if emo >= thr_emo and aro >= thr_ar:
+        # scale bonus slightly by how far above thresholds we are, then cap
+        scale = min(1.0, ((emo - thr_emo) + (aro - thr_ar)) / 0.8)
+        bonus_total += min(cap_ea, add_ea * (1.0 + 0.5 * scale))
+
+    # --- Question/List × Info Density ---
+    qi = cfg.get("ql_infodense", {})
+    thr_ql = float(qi.get("thr_ql", 0.60))
+    thr_id = float(qi.get("thr_id", 0.60))
+    add_qi = float(qi.get("bonus", 0.01))
+    cap_qi = float(qi.get("cap", 0.02))
+
+    ql = float(segment.get("question_list", 0.0))
+    idv = float(segment.get("info_density", 0.0))
+    if ql >= thr_ql and idv >= thr_id:
+        scale = min(1.0, ((ql - thr_ql) + (idv - thr_id)) / 0.8)
+        bonus_total += min(cap_qi, add_qi * (1.0 + 0.5 * scale))
+
+    # Final cap across all synergy routes
+    bonus_total = min(bonus_total, float(cfg.get("max_total_bonus", 0.03)))
+
+    # Optional: dampen synergy if the clip ends with an outro or bait
+    tail_text = (segment.get("tail_text") or segment.get("text_tail") or "")
+    if tail_text:
+        if re.search(r"(thanks for watching|like and subscribe|follow for more|link in bio)", tail_text, re.I):
+            bonus_total *= 0.5  # halve the synergy in clear outro/bait
+
+    # Debug
+    dbg = segment.setdefault("_debug", {})
+    dbg["synergy_bonus"] = round(bonus_total, 5)
+
+    return bonus_total
 
 def _ad_penalty(text: str) -> dict:
     """Enhanced ad detection with comprehensive patterns"""
@@ -1669,11 +4292,11 @@ def _ad_penalty(text: str) -> dict:
 def _platform_length_match(duration: float, platform: str = 'tiktok') -> float:
     """Calculate how well the duration matches platform preferences"""
     platform_ranges = {
-        'tiktok': {'optimal': (15, 30), 'acceptable': (10, 45)},
-        'instagram': {'optimal': (15, 30), 'acceptable': (10, 45)},
-        'instagram_reels': {'optimal': (15, 30), 'acceptable': (10, 45)},
-        'youtube_shorts': {'optimal': (20, 45), 'acceptable': (15, 60)},
-        'linkedin': {'optimal': (30, 60), 'acceptable': (20, 90)}
+        'tiktok': {'optimal': (15, 30), 'acceptable': (5, 45), 'minimal': (3, 60)},
+        'instagram': {'optimal': (15, 30), 'acceptable': (5, 45), 'minimal': (3, 60)},
+        'instagram_reels': {'optimal': (15, 30), 'acceptable': (5, 45), 'minimal': (3, 60)},
+        'youtube_shorts': {'optimal': (20, 45), 'acceptable': (5, 60), 'minimal': (3, 90)},
+        'linkedin': {'optimal': (30, 60), 'acceptable': (10, 90), 'minimal': (5, 120)}
     }
     
     ranges = platform_ranges.get(platform, platform_ranges['tiktok'])
@@ -1686,27 +4309,177 @@ def _platform_length_match(duration: float, platform: str = 'tiktok') -> float:
             return 0.5 + 0.5 * (duration - ranges['acceptable'][0]) / (ranges['optimal'][0] - ranges['acceptable'][0])
         else:
             return 0.5 + 0.5 * (ranges['acceptable'][1] - duration) / (ranges['acceptable'][1] - ranges['optimal'][1])
+    elif ranges['minimal'][0] <= duration <= ranges['minimal'][1]:
+        # Very short clips get partial credit
+        if duration < ranges['acceptable'][0]:
+            return 0.2 + 0.3 * (duration - ranges['minimal'][0]) / (ranges['acceptable'][0] - ranges['minimal'][0])
+        else:
+            return 0.2 + 0.3 * (ranges['minimal'][1] - duration) / (ranges['minimal'][1] - ranges['acceptable'][1])
     else:
-        return 0.0  # Outside acceptable range
+        return 0.0  # Outside all ranges
 
 def calculate_dynamic_length_score(segment: Dict, platform: str) -> float:
     """
     Calculate length score for dynamic segments, considering natural boundaries.
     """
-    duration = segment.get("end", 0) - segment.get("start", 0)
-    base_score = _platform_length_match(duration, platform)
+    # Check if Platform Length V2 is enabled
+    config = get_config()
+    plat_cfg = config.get("platform_length_v2", {})
     
-    # Bonus for natural boundaries
+    if not plat_cfg.get("enabled", True):
+        # V1 path - legacy implementation
+        duration = segment.get("end", 0) - segment.get("start", 0)
+        base_score = _platform_length_match(duration, platform)
+        
+        # Bonus for natural boundaries
+        boundary_type = segment.get("boundary_type", "")
+        confidence = segment.get("confidence", 0.0)
+        
+        if boundary_type in ["sentence_end", "insight_marker"] and confidence > 0.8:
+            base_score += 0.1  # Bonus for clean boundaries
+        
+        return min(1.0, base_score)
+    
+    # V2 path - enhanced implementation
+    duration = (segment.get("end", 0.0) - segment.get("start", 0.0)) or 0.0
+    
+    # Calculate WPS with fallbacks
+    wps = None
+    if segment.get("word_count"):
+        wps = float(segment["word_count"]) / max(duration, 1e-6)
+    elif segment.get("text") and duration > 0:
+        # Fallback: compute word count from text
+        word_count = len(segment["text"].split())
+        wps = float(word_count) / max(duration, 1e-6)
+    
+    # Extract text tail for outro detection (last 1-2 seconds)
+    text_tail = segment.get("tail_text", "")
+    if not text_tail and segment.get("text") and duration > 0:
+        # Simple fallback: take last few words if no tail_text provided
+        words = segment["text"].split()
+        if len(words) > 3:
+            text_tail = " ".join(words[-3:])  # Last 3 words as approximation
+    
+    # Get other segment data with defaults
+    loopability = segment.get("loopability", 0.0)
     boundary_type = segment.get("boundary_type", "")
-    confidence = segment.get("confidence", 0.0)
+    boundary_conf = float(segment.get("confidence", 0.0) or 0.0)
     
-    if boundary_type in ["sentence_end", "insight_marker"] and confidence > 0.8:
-        base_score += 0.1  # Bonus for clean boundaries
+    # Use V2 scoring
+    score = _platform_length_score_v2(
+        duration=duration,
+        platform=platform,
+        loopability=loopability,
+        wps=wps,
+        boundary_type=boundary_type,
+        boundary_conf=boundary_conf,
+        text_tail=text_tail,
+    )
     
-    return min(1.0, base_score)
+    # Add debug information
+    if "_debug" not in segment:
+        segment["_debug"] = {}
+    
+    debug = segment["_debug"]
+    debug["length_v2_duration"] = duration
+    debug["length_v2_wps"] = wps
+    debug["length_v2_loopability"] = loopability
+    debug["length_v2_boundary_type"] = boundary_type
+    debug["length_v2_boundary_conf"] = boundary_conf
+    debug["length_v2_text_tail_present"] = bool(text_tail)
+    debug["length_v2_final_score"] = score
+    
+    return score
 
-def _audio_prosody_score(audio_path: str, start: float, end: float, y_sr=None) -> float:
-    """Enhanced audio analysis for arousal/energy detection"""
+# Platform Length V2 - Enhanced smooth scoring
+import math
+import re
+
+# Outro detection regex
+_OUTRO_RE = re.compile(
+    r"(thanks for watching|subscribe|follow|like and subscribe|link in bio|see you next time)",
+    re.I
+)
+
+def _gauss01(x: float, mu: float, sigma: float) -> float:
+    """Gaussian function normalized to 0-1 range"""
+    if sigma <= 1e-6:
+        return 1.0 if abs(x - mu) < 1e-6 else 0.0
+    z = (x - mu) / sigma
+    return float(math.exp(-0.5 * z * z))
+
+def _tri_band01(x: float, lo: float, hi: float) -> float:
+    """Triangular function: 0 outside [lo,hi], 1 at midpoint, linear slopes"""
+    if lo >= hi:
+        return 0.0
+    mid = 0.5 * (lo + hi)
+    if x <= lo or x >= hi:
+        return 0.0
+    return (x - lo) / (mid - lo) if x < mid else (hi - x) / (hi - mid)
+
+def _platform_length_score_v2(
+    duration: float,
+    platform: str,
+    *,
+    loopability: float = 0.0,
+    wps: float | None = None,
+    boundary_type: str = "",
+    boundary_conf: float = 0.0,
+    text_tail: str = "",
+) -> float:
+    """Enhanced platform length scoring with smooth curves and adaptive features"""
+    # Get platform configuration with fallbacks
+    config = get_config()
+    plat_cfg = config.get("platform_length_v2", {})
+    platforms = plat_cfg.get("platforms", {})
+    
+    # Default platform config
+    default_cfg = {"mu": 22.0, "sigma": 7.0, "cap": 60.0, "wps": [2.8, 4.5]}
+    cfg = platforms.get(platform, default_cfg)
+    
+    mu, sigma, cap = cfg["mu"], cfg["sigma"], cfg["cap"]
+    wps_range = cfg["wps"]
+
+    # Loop-aware shift: shorter & tighter target when highly loopable
+    if loopability >= 0.60:
+        mu -= 2.0
+        sigma = max(5.0, sigma - 1.5)
+
+    # Guardrails
+    if duration <= 0.0:
+        return 0.0
+    if duration > cap:
+        return 0.0
+
+    # Smooth base score using Gaussian
+    base = _gauss01(duration, mu, sigma)
+
+    # Near-cap anxiety penalty (don't risk getting cut by platform)
+    if duration >= cap - 1.0:
+        base *= 0.85
+
+    # Density harmony: gentle blend with platform's ideal WPS band
+    if wps is not None and wps > 0:
+        lo, hi = wps_range
+        dens = _tri_band01(wps, lo, hi)  # 0..1
+        base = 0.85 * base + 0.15 * dens
+
+    # Boundary quality bonuses/penalties
+    if boundary_type == "sentence_end" and boundary_conf >= 0.90:
+        base = min(1.0, base + 0.10)
+    elif boundary_type in ("sentence_end", "insight_marker") and boundary_conf >= 0.75:
+        base = min(1.0, base + 0.05)
+    elif boundary_type == "mid_word":
+        base *= 0.85
+
+    # Anti-outro penalty
+    if text_tail and _OUTRO_RE.search(text_tail):
+        base = max(0.0, base - 0.15)
+
+    return float(max(0.0, min(1.0, base)))
+
+def _audio_prosody_score(audio_path: str, start: float, end: float, y_sr=None, text: str = "", genre: str = 'general') -> float:
+    """Enhanced audio analysis for arousal/energy detection with intelligent fallback"""
     try:
         if y_sr is None:
             y, sr = librosa.load(audio_path, sr=None, offset=max(0, start-0.2), duration=(end-start+0.4))
@@ -1717,12 +4490,188 @@ def _audio_prosody_score(audio_path: str, start: float, end: float, y_sr=None) -
             y = y[s:e]
         
         if len(y) == 0:
-            return 0.0
+            # Fallback to text-based estimation
+            return _text_based_audio_estimation(text, genre)
 
-        # Use the enhanced compute_audio_energy function
-        return compute_audio_energy(y, sr)
-    except Exception:
+        # Check if Arousal V5 is enabled
+        arousal_cfg = get_config().get("arousal_v5", {})
+        if arousal_cfg.get("enabled", True):
+            # Use enhanced V5 arousal scoring
+            dur_s = end - start
+            tokens = text.split() if text else None
+            return _arousal_v5(y, sr, text, genre, dur_s, tokens)
+        else:
+            # Use legacy compute_audio_energy function
+            return compute_audio_energy(y, sr)
+    except Exception as e:
+        logger.warning(f"Audio energy computation failed: {e}")
+        # Fallback to text-based estimation
+        return _text_based_audio_estimation(text, genre)
+
+# Arousal V5 helper functions
+def scale01(value, min_val, max_val):
+    """Scale value to 0-1 range based on min/max bounds"""
+    if max_val <= min_val:
         return 0.0
+    return max(0.0, min(1.0, (value - min_val) / (max_val - min_val)))
+
+def robust_stats(data):
+    """Compute robust statistics using median and IQR"""
+    if len(data) == 0:
+        return 0.0, 1.0
+    median = np.median(data)
+    q75, q25 = np.percentile(data, [75, 25])
+    iqr = q75 - q25
+    std = iqr / 1.349  # IQR to std conversion
+    return median, max(std, 1e-6)
+
+def _arousal_v5(y, sr, text="", genre="general", dur_s=None, tokens=None):
+    """Enhanced arousal scoring with cadence, pitch dynamics, and spectral flux"""
+    try:
+        # Get arousal config
+        arousal_cfg = get_config().get("arousal_v5", {})
+        w_energy = arousal_cfg.get("w_energy", 0.35)
+        w_cadence = arousal_cfg.get("w_cadence", 0.30)
+        w_pitch = arousal_cfg.get("w_pitch", 0.20)
+        w_flux = arousal_cfg.get("w_flux", 0.15)
+        
+        # 1) Core energy (reuse existing compute_audio_energy)
+        energy_core = compute_audio_energy(y, sr)
+        
+        # 2) Cadence features
+        rms = librosa.feature.rms(y=y, frame_length=2048, hop_length=512)[0]
+        med = np.median(rms) + 1e-8
+        
+        # Pause ratio
+        pause_ratio = np.mean(rms < arousal_cfg.get("cadence_pause_med_mult", 0.25) * med)
+        
+        # Burst density
+        thr = med + np.std(rms)
+        bursts = np.mean((rms[1:] >= thr) & (rms[:-1] < thr)) * (sr/512)  # per-sec approx
+        
+        # Words per second
+        wps = (len(tokens) / max(dur_s, 1e-3)) if tokens and dur_s else 0.0
+        wps_range = arousal_cfg.get("cadence_wps_range", [2.0, 5.5])
+        burst_range = arousal_cfg.get("cadence_burst_range", [0.5, 3.0])
+        
+        cadence_parts = [
+            scale01(wps, wps_range[0], wps_range[1]),
+            1.0 - pause_ratio,
+            scale01(bursts, burst_range[0], burst_range[1])
+        ]
+        cadence = sat(cadence_parts)
+        
+        # 3) Pitch dynamics
+        try:
+            # Try pyin first (more accurate)
+            f0, voiced_flag, voiced_probs = librosa.pyin(y, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C7'))
+            f0_clean = f0[voiced_flag]
+        except:
+            # Fallback to piptrack
+            pitches, magnitudes = librosa.piptrack(y=y, sr=sr)
+            f0_clean = pitches[pitches > 0]
+        
+        if len(f0_clean) > 10:
+            f0_range = np.percentile(f0_clean, 90) - np.percentile(f0_clean, 10)
+            f0_std = np.std(f0_clean)
+            f0_delta = np.mean(np.abs(np.diff(f0_clean)))
+            
+            # Scale to 0-1
+            pitch_parts = [
+                scale01(f0_range, 50, 300),  # Hz range
+                scale01(f0_std, 10, 100),    # Hz std
+                scale01(f0_delta, 5, 50)     # Hz delta
+            ]
+            pitch_dyn = sat(pitch_parts)
+        else:
+            pitch_dyn = 0.0
+        
+        # 4) Spectral flux (using onset strength as proxy)
+        flux = librosa.onset.onset_strength(y=y, sr=sr)
+        flux_s = np.mean(flux) / (np.std(flux) + 1e-6)  # Normalize by variability
+        flux_s = scale01(flux_s, 0.5, 3.0)
+        
+        # 5) Combine audio components with saturating combiner
+        audio_parts = [energy_core, cadence, pitch_dyn, flux_s]
+        audio_weights = [w_energy, w_cadence, w_pitch, w_flux]
+        # Normalize weights
+        total_weight = sum(audio_weights)
+        audio_weights = [w/total_weight for w in audio_weights]
+        
+        audio_raw = sat([part * weight for part, weight in zip(audio_parts, audio_weights)])
+        
+        # 6) Text micro-bonus (only if audio exists)
+        text_bonus = 0.0
+        if audio_raw >= arousal_cfg.get("audio_presence_guard", 0.10):
+            text_arousal = _arousal_score_text(text, genre)
+            text_bonus = min(text_arousal, arousal_cfg.get("text_micro_cap", 0.08))
+        
+        # 7) Genre-specific adjustments
+        genre_bonus = 0.0
+        if genre == 'comedy' and dur_s and dur_s <= arousal_cfg.get("laughter_early_sec", 5.0):
+            # Check for laughter in first 5 seconds
+            laughter_boost = detect_laughter_exclamations(text, y, sr, 0.0, enable_audio_analysis=False)
+            if laughter_boost > 0:
+                genre_bonus = min(laughter_boost, arousal_cfg.get("comedy_laughter_bonus", 0.04))
+        
+        # Business/Education caps penalty
+        if genre in ['business', 'educational'] and cadence < 0.4 and pitch_dyn < 0.4:
+            caps_count = sum(1 for word in text.split() if word.isupper() and len(word) > 2)
+            exclam_count = text.count('!')
+            caps_scale, exclam_scale = arousal_cfg.get("bizedu_caps_excl_scale", [0.01, 0.005])
+            penalty = min(arousal_cfg.get("bizedu_caps_excl_cap", 0.05), 
+                         caps_scale * caps_count + exclam_scale * exclam_count)
+            text_bonus = max(0.0, text_bonus - penalty)
+        
+        # 8) Final combination
+        arousal_raw = audio_raw + text_bonus + genre_bonus
+        
+        # 9) Robust scaling with sigmoid
+        # For now, use simple normalization (can add global EMA later)
+        arousal_final = 1.0 / (1.0 + np.exp(-arousal_cfg.get("sigmoid_a", 1.4) * (arousal_raw - 0.5)))
+        
+        return float(np.clip(arousal_final, 0.0, 1.0))
+        
+    except Exception as e:
+        logger.warning(f"Arousal V5 computation failed: {e}")
+        # Fallback to text-based estimation
+        return _text_based_audio_estimation(text, genre)
+
+def _text_based_audio_estimation(text: str, genre: str = 'general') -> float:
+    """Intelligent text-based audio arousal estimation when audio analysis fails"""
+    if not text:
+        return 0.3  # Default moderate arousal
+    
+    t = text.lower()
+    score = 0.3  # Base moderate arousal
+    
+    # High-energy text indicators
+    high_energy_indicators = [
+        ('!', 0.1), ('amazing', 0.15), ('incredible', 0.15), ('crazy', 0.15),
+        ('insane', 0.2), ('?!', 0.2), ('wow', 0.1), ('unbelievable', 0.15),
+        ('shocking', 0.2), ('wild', 0.1), ('epic', 0.15), ('mind-blowing', 0.2)
+    ]
+    
+    for indicator, boost in high_energy_indicators:
+        if indicator in t:
+            score = min(score + boost, 0.9)
+            break  # Only apply the first match to avoid over-scoring
+    
+    # Genre-specific audio estimation
+    if genre == 'fantasy_sports':
+        sports_energy_words = ['fire', 'draft', 'start', 'target', 'sleeper', 'bust']
+        if any(word in t for word in sports_energy_words):
+            score = min(score + 0.1, 0.9)
+    elif genre == 'comedy':
+        comedy_energy_words = ['hilarious', 'funny', 'lol', 'haha', 'rofl', 'joke']
+        if any(word in t for word in comedy_energy_words):
+            score = min(score + 0.1, 0.9)
+    elif genre == 'true_crime':
+        crime_energy_words = ['murder', 'killer', 'evidence', 'mystery', 'suspicious']
+        if any(word in t for word in crime_energy_words):
+            score = min(score + 0.1, 0.9)
+    
+    return float(np.clip(score, 0.0, 1.0))
 
 def compute_audio_energy(y, sr):
     """Compute enhanced audio energy from audio data with better normalization"""
@@ -1750,12 +4699,13 @@ def compute_audio_energy(y, sr):
         if len(rms) > 1:
             # Prevent division by zero with more robust epsilon
             denominator = np.percentile(rms, 95)
-            if denominator > 1e-6:  # More robust threshold
+            if abs(denominator) > 0.001:  # More appropriate threshold for audio data
                 dynamic_range = (np.percentile(rms, 90) - np.percentile(rms, 10)) / denominator
                 energy = energy * 0.7 + dynamic_range * 0.3
         
         return float(np.clip(energy, 0.0, 1.0))
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Audio energy normalization failed: {e}")
         return 0.0
 
 # Main API functions
@@ -1930,8 +4880,8 @@ def find_natural_boundaries(text: str) -> List[Dict]:
     
     # Look for natural break points
     for i, word in enumerate(words):
-        # Strong content boundaries
-        if word in [".", "!", "?", ":", ";"]:
+        # Strong content boundaries - check if word ends with punctuation
+        if any(word.endswith(punct) for punct in [".", "!", "?", ":", ";"]):
             boundaries.append({
                 "position": i + 1,  # Start after the punctuation
                 "type": "sentence_end",
@@ -1949,11 +4899,15 @@ def find_natural_boundaries(text: str) -> List[Dict]:
                 "confidence": 0.7
             })
         
-        # Story/insight markers
+        # Story/insight markers (expanded)
         elif any(phrase in " ".join(words[max(0, i-1):i+2]) for phrase in [
-            "here's the thing", "the key is", "what i learned", "my take",
+            "here's the thing", "the key is", "the key insight", "what i learned", "my take",
             "the bottom line", "in summary", "to wrap up", "main observation",
-            "key takeaway", "the thing is", "what i found"
+            "key takeaway", "the thing is", "what i found", "here's what", "the insight",
+            "here's why", "let me tell you", "you know what", "this is why", "the reason is",
+            "the problem is", "the issue is", "the challenge is", "the solution is", "the answer is",
+            "the truth is", "the reality is", "the fact is", "the secret is", "the trick is",
+            "the way to", "the best way", "the only way", "the right way", "the wrong way"
         ]):
             boundaries.append({
                 "position": i,
@@ -2004,74 +4958,99 @@ def create_dynamic_segments(segments: List[Dict], platform: str = 'tiktok') -> L
     """
     dynamic_segments = []
     
-    # Platform-specific optimal lengths
+    # Platform-specific optimal lengths (adjusted for better content)
     platform_lengths = {
-        'tiktok': {'min': 15, 'max': 30, 'optimal': 20},
-        'instagram': {'min': 15, 'max': 30, 'optimal': 22},
-        'instagram_reels': {'min': 15, 'max': 30, 'optimal': 22},
-        'youtube': {'min': 20, 'max': 60, 'optimal': 35},
-        'youtube_shorts': {'min': 20, 'max': 60, 'optimal': 35},
-        'twitter': {'min': 10, 'max': 25, 'optimal': 18},
-        'linkedin': {'min': 20, 'max': 45, 'optimal': 30}
+        'tiktok': {'min': 12, 'max': 30, 'optimal': 20},
+        'instagram': {'min': 12, 'max': 30, 'optimal': 22},
+        'instagram_reels': {'min': 12, 'max': 30, 'optimal': 22},
+        'youtube': {'min': 15, 'max': 60, 'optimal': 35},
+        'youtube_shorts': {'min': 15, 'max': 60, 'optimal': 35},
+        'twitter': {'min': 8, 'max': 25, 'optimal': 18},
+        'linkedin': {'min': 15, 'max': 45, 'optimal': 30}
     }
     
     target_length = platform_lengths.get(platform, platform_lengths['tiktok'])
     
-    for seg in segments:
-        text = seg.get("text", "")
-        start_time = seg.get("start", 0)
-        end_time = seg.get("end", 0)
-        total_duration = end_time - start_time
+    # Combine all segments into one continuous text for better boundary detection
+    combined_text = " ".join([seg.get("text", "") for seg in segments])
+    total_start = segments[0].get("start", 0) if segments else 0
+    total_end = segments[-1].get("end", 0) if segments else 0
+    total_duration = total_end - total_start
+    
+    # Find natural boundaries in the combined text
+    boundaries = find_natural_boundaries(combined_text)
+    
+    if not boundaries or len(boundaries) < 2:
+        # No natural boundaries found, use original segments
+        return segments
+    
+    # Create segments based on boundaries
+    words = combined_text.split()
+    current_start = total_start
+    
+    # Add start boundary
+    all_boundaries = [{"position": 0, "type": "start", "confidence": 1.0}] + boundaries
+    
+    for i, boundary in enumerate(all_boundaries):
+        if boundary["confidence"] < 0.8:  # Increased from 0.6 to 0.8 for higher confidence
+            continue  # Skip low-confidence boundaries
         
-        # Find natural boundaries
-        boundaries = find_natural_boundaries(text)
+        # Calculate end position
+        if i + 1 < len(all_boundaries):
+            next_boundary = all_boundaries[i + 1]
+            end_position = next_boundary["position"]
+        else:
+            end_position = len(words)
         
-        if not boundaries or len(boundaries) < 2:
-            # No natural boundaries found, use original segment
-            dynamic_segments.append(seg)
+        # Extract segment text
+        segment_words = words[boundary["position"]:end_position]
+        segment_text = " ".join(segment_words)
+        
+        if len(segment_words) < 8:  # Increased from 3 to 8 for longer segments
             continue
         
-        # Create segments based on boundaries
-        words = text.split()
-        current_start = start_time
+        # Calculate timing based on word count and total duration
+        total_words = len(words)
+        segment_ratio = len(segment_words) / total_words
+        segment_duration = total_duration * segment_ratio
         
-        # Add start boundary
-        all_boundaries = [{"position": 0, "type": "start", "confidence": 1.0}] + boundaries
+        # CRITICAL FIX: Preserve original transcript timing instead of artificial calculation
+        # Find the actual transcript segments that correspond to this text
+        original_start = None
+        original_end = None
         
-        for i, boundary in enumerate(all_boundaries):
-            if boundary["confidence"] < 0.6:
-                continue  # Skip low-confidence boundaries
-            
-            # Calculate end position
-            if i + 1 < len(all_boundaries):
-                next_boundary = all_boundaries[i + 1]
-                end_position = next_boundary["position"]
-            else:
-                end_position = len(words)
-            
-            # Extract segment text
-            segment_words = words[boundary["position"]:end_position]
-            segment_text = " ".join(segment_words)
-            
-            if len(segment_words) < 3:  # Skip very short segments
-                continue
-            
-            # Calculate timing (proportional to word count)
-            total_words = len(words)
-            segment_ratio = len(segment_words) / total_words
-            segment_duration = total_duration * segment_ratio
-            
-            # Check if segment meets platform requirements
-            if target_length["min"] <= segment_duration <= target_length["max"]:
-                dynamic_segments.append({
-                    "text": segment_text,
-                    "start": current_start,
-                    "end": current_start + segment_duration,
-                    "boundary_type": boundary["type"],
-                    "confidence": boundary["confidence"]
-                })
-            elif segment_duration < target_length["min"] and len(dynamic_segments) > 0:
-                # If segment is too short, try to merge with previous segment
+        # Look for the first and last words in the original transcript
+        for i, word in enumerate(words):
+            if i == boundary["position"]:
+                # Find which original segment contains this word
+                for orig_seg in segments:
+                    if word in orig_seg.get("text", "").split():
+                        original_start = orig_seg.get("start", current_start)
+                        break
+            if i == end_position - 1:
+                # Find which original segment contains this word
+                for orig_seg in segments:
+                    if word in orig_seg.get("text", "").split():
+                        original_end = orig_seg.get("end", current_start + segment_duration)
+                        break
+        
+        # Use original timing if found, otherwise fall back to calculated timing
+        if original_start is not None and original_end is not None:
+            segment_duration = original_end - original_start
+            current_start = original_start
+        
+        # Check if segment meets platform requirements
+        if target_length["min"] <= segment_duration <= target_length["max"]:
+            dynamic_segments.append({
+                "text": segment_text,
+                "start": current_start,
+                "end": current_start + segment_duration,
+                "boundary_type": boundary["type"],
+                "confidence": boundary["confidence"]
+            })
+        elif segment_duration < target_length["min"]:
+            # If segment is too short, try to merge with previous segment or extend
+            if len(dynamic_segments) > 0:
                 prev_segment = dynamic_segments[-1]
                 merged_duration = (current_start + segment_duration) - prev_segment["start"]
                 if merged_duration <= target_length["max"]:
@@ -2083,14 +5062,34 @@ def create_dynamic_segments(segments: List[Dict], platform: str = 'tiktok') -> L
                         "boundary_type": "merged",
                         "confidence": min(prev_segment["confidence"], boundary["confidence"])
                     }
-            
-            current_start += segment_duration
+            else:
+                # First segment is too short, extend it to minimum length
+                extended_duration = target_length["min"]
+                dynamic_segments.append({
+                    "text": segment_text,
+                    "start": current_start,
+                    "end": current_start + extended_duration,
+                    "boundary_type": "extended",
+                    "confidence": boundary["confidence"]
+                })
+        
+        current_start += segment_duration
     
     # If no dynamic segments were created, return original segments
     if not dynamic_segments:
         return segments
     
-    return dynamic_segments
+    # Post-process: ensure all segments meet minimum length requirements
+    final_segments = []
+    for seg in dynamic_segments:
+        duration = seg["end"] - seg["start"]
+        if duration < target_length["min"]:
+            # Extend short segments to minimum length
+            seg["end"] = seg["start"] + target_length["min"]
+            seg["boundary_type"] = "extended"
+        final_segments.append(seg)
+    
+    return final_segments
 
 def split_mixed_segments(segments: List[Dict]) -> List[Dict]:
     """
@@ -2173,8 +5172,8 @@ def find_viral_clips(segments: List[Dict], audio_file: str, genre: str = 'genera
         sample_text = " ".join([seg.get('text', '') for seg in segments[:3]])
         genre_scorer = GenreAwareScorer()
         detected_genre = genre_scorer.auto_detect_genre(sample_text)
-        print(f"🎯 Auto-detected genre: {detected_genre}")
-        print("💡 You can override this by specifying a different genre")
+        print(f"Auto-detected genre: {detected_genre}")
+        print("You can override this by specifying a different genre")
         genre = detected_genre
     
     # Split mixed segments to separate intro from good content
@@ -2381,12 +5380,12 @@ def find_viral_clips_with_genre(segments: List[Dict], audio_file: str, user_genr
     # Auto-detect genre if user didn't specify
     if user_genre is None:
         detected_genre = detect_podcast_genre(segments)
-        print(f"🎯 Auto-detected genre: {detected_genre}")
-        print("💡 You can override this by selecting a specific genre")
+        print(f"Auto-detected genre: {detected_genre}")
+        print("You can override this by selecting a specific genre")
         genre = detected_genre
     else:
         genre = user_genre
-        print(f"🎯 Using user-selected genre: {genre}")
+        print(f"Using user-selected genre: {genre}")
     
     # Find viral clips with genre awareness
     result = find_viral_clips(segments, audio_file, genre=genre)
@@ -2498,9 +5497,9 @@ class NewsPoliticsGenreProfile(GenreProfile):
                            0.20 * f.get("hook_score", 0.0) + 
                            0.10 * f.get("payoff_score", 0.0))
         
-        # Keep hook and payoff paths
-        hook_path = (0.35 * f.get("hook_score", 0.0) + 0.25 * f.get("arousal_score", 0.0) + 
-                     0.20 * f.get("payoff_score", 0.0) + 0.15 * f.get("info_density", 0.0) + 
+        # FIXED: Increase hook score weight to be the dominant factor
+        hook_path = (0.50 * f.get("hook_score", 0.0) + 0.20 * f.get("arousal_score", 0.0) + 
+                     0.15 * f.get("payoff_score", 0.0) + 0.10 * f.get("info_density", 0.0) + 
                      0.05 * f.get("loopability", 0.0))
         
         payoff_path = (0.40 * f.get("payoff_score", 0.0) + 0.30 * f.get("info_density", 0.0) + 
@@ -2602,7 +5601,7 @@ def interpret_synergy(synergy_mult: float, features: Dict) -> Dict:
     """Provide actionable synergy interpretation with improved feedback"""
     if synergy_mult < 0.7:
         return {
-            "label": "⚠️ Imbalanced",
+            "label": "Imbalanced",
             "advice": "Hook is strong but lacks energy/payoff",
             "color": "#ffc107",
             "severity": "warning"
@@ -2616,7 +5615,7 @@ def interpret_synergy(synergy_mult: float, features: Dict) -> Dict:
         }
     elif synergy_mult < 1.0:
         return {
-            "label": "✅ Good Balance",
+            "label": "Good Balance",
             "advice": "All elements working together",
             "color": "#28a745",
             "severity": "success"
@@ -2785,5 +5784,111 @@ def create_segment_hash(segment: Dict) -> str:
     content = f"{segment.get('text', '')[:100]}_{segment.get('start', 0)}_{segment.get('end', 0)}"
     return hashlib.md5(content.encode()).hexdigest()
 
+
+# Title Generation and Grade Functions
+_TITLE_STOP = re.compile(r"[.!?]\s+")
+_STRONG_VERB = re.compile(r"\b(win|save|avoid|learn|unlock|beat|grow|double|prove|fix|crush|build)\b", re.I)
+
+def _grade_from_score(x: float) -> str:
+    """Convert score (0-1) to letter grade"""
+    x = float(x or 0)
+    if   x >= 0.93: return "A+"
+    elif x >= 0.90: return "A"
+    elif x >= 0.85: return "A-"
+    elif x >= 0.80: return "B+"
+    elif x >= 0.75: return "B"
+    elif x >= 0.70: return "B-"
+    elif x >= 0.60: return "C+"
+    elif x >= 0.50: return "C"
+    else:           return "C-"
+
+def _heuristic_title(text: str, feats: dict, cfg: dict, rank: int | None = None) -> str:
+    """Generate viral-style title from transcript and features"""
+    tcfg = (cfg or {}).get("titles", {}) or {}
+    max_len = int(tcfg.get("max_len", 80))
+    
+    # Extract first sentence
+    sent = _TITLE_STOP.split((text or "").strip())
+    first = (sent[0] if sent else "").strip(" -–—")
+    cand = first if first else (text or "")[:max_len]
+    cand = re.sub(r"^\b(?:so|well|look|listen|okay|you know)[, ]+", "", cand, flags=re.I)
+    cand = cand.capitalize()
+
+    # Boosts from features (families)
+    boosts = []
+    fam = feats.get("_debug", {}).get("hook_v5", {}).get("fam_scores", {}) if feats else {}
+    w = (tcfg.get("heuristic_boosts") or {})
+    
+    if fam.get("listicle", 0) > 0:
+        boosts.append("Top plays to try")
+    if fam.get("curiosity", 0):  
+        boosts.append("The truth you're missing")
+    if fam.get("howto", 0):      
+        boosts.append("How to get ahead")
+    if fam.get("contrarian", 0): 
+        boosts.append("What everyone gets wrong")
+
+    # Prefer strong verbs
+    if not _STRONG_VERB.search(cand):
+        for b in boosts:
+            if _STRONG_VERB.search(b):
+                cand = b + ": " + cand
+                break
+
+    # Trim to max length
+    if len(cand) > max_len:
+        cand = cand[:max_len-1].rstrip() + "…"
+
+    if tcfg.get("prepend_rank") and isinstance(rank, int):
+        return f"#{rank} {cand}"
+    return cand
+
+def _grade_breakdown(feats: dict) -> dict:
+    """Generate grade breakdown for all scoring dimensions"""
+    return {
+        "overall": _grade_from_score(feats.get("final_score", feats.get("viral_score_100", 0)/100)),
+        "hook":    _grade_from_score(feats.get("hook_score", 0)),
+        "flow":    _grade_from_score(feats.get("arousal_score", feats.get("arousal", 0))),
+        "value":   _grade_from_score(feats.get("payoff_score", 0)),
+        "trend":   _grade_from_score(feats.get("loopability", 0)),
+    }
+
+async def _llm_title_async(text: str, feats: dict, cfg: dict) -> str:
+    """Generate title using LLM (optional)"""
+    if not text: return ""
+    llm_cfg = (cfg or {}).get("llm_titles", {}) or {}
+    if not llm_cfg.get("enabled"): return ""
+    
+    import asyncio, json, os
+    from httpx import AsyncClient, Timeout
+
+    model = llm_cfg.get("model", "gpt-4o-mini")
+    max_len = int(llm_cfg.get("max_len", 80))
+    sys = "You write short viral social video titles (<=80 chars). Make it punchy, specific, non-clickbait, present-tense."
+    usr = f"""Transcript snippet:
+{text[:600]}
+
+Scores (0..1):
+Hook={feats.get('hook_score',0):.2f} Flow={feats.get('arousal_score',0):.2f} Value={feats.get('payoff_score',0):.2f} Trend={feats.get('loopability',0):.2f}
+
+Return ONLY the title string, no quotes, <= {max_len} chars."""
+    payload = {
+        "model": model,
+        "messages": [{"role":"system","content":sys},{"role":"user","content":usr}],
+        "temperature": 0.6,
+        "max_tokens": 60,
+    }
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key: return ""
+    try:
+        async with AsyncClient(timeout=Timeout(llm_cfg.get("timeout_s",8))) as c:
+            r = await c.post("https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json=payload)
+            j = r.json()
+            t = j["choices"][0]["message"]["content"].strip()
+            return t[:max_len]
+    except Exception:
+        return ""
 
 

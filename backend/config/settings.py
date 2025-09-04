@@ -21,6 +21,9 @@ WHISPER_LANGUAGE = "en"  # Language for Whisper transcription
 MAX_FILE_SIZE = 500 * 1024 * 1024  # 500MB
 ALLOWED_EXTENSIONS = {".mp3", ".wav", ".m4a", ".flac", ".aac"}
 
+# Progress tracking settings
+PROGRESS_TRACKER_TTL = 300  # 5 minutes in seconds
+
 # Whisper settings
 WHISPER_MODEL = "base"  # Model size: tiny, base, small, medium, large
 

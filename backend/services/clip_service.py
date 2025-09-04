@@ -39,7 +39,7 @@ class ClipService:
             payload = dict(payload)
             payload["ts"] = datetime.now().isoformat() + "Z"
             with open(HISTORY_LOG, "a", encoding="utf-8") as f:
-                f.write(json.dumps(payload) + "\n")
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
         except Exception as e:
             logger.error(f"Failed to log history: {e}")
     

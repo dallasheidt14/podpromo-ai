@@ -17,6 +17,7 @@ soundfile==0.12.1
 numpy==1.24.3
 ffmpeg-python==0.2.0
 openai-whisper==20231117
+faster-whisper>=0.10.0  # Optional: for streaming transcription progress
 pydub==0.25.1
 
 # File handling
@@ -29,7 +30,7 @@ python-dotenv==1.0.0
 # AI/ML dependencies
 sentence-transformers==2.2.2
 librosa>=0.10.0
-spacy>=3.7.0
+spacy==3.7.5
 
 # Monitoring & Testing
 pytest==7.4.3

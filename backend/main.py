@@ -39,18 +39,27 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Add CORS middleware
+# Add CORS middleware with environment-based configuration
+import os
+CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",")
+if os.getenv("ENVIRONMENT") == "production":
+    # In production, only allow specific domains
+    CORS_ORIGINS = [origin.strip() for origin in CORS_ORIGINS if origin.strip() and not origin.startswith("http://localhost")]
+    if not CORS_ORIGINS:
+        CORS_ORIGINS = ["https://highlightly.ai"]  # Default production domain
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],  # Frontend URLs
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["*"],
 )
 
-# Mount static directories
-app.mount("/files", StaticFiles(directory="./uploads"), name="files")
-app.mount("/clips", StaticFiles(directory="./outputs"), name="clips")
+# Mount static directories using config
+from config.settings import UPLOAD_DIR, OUTPUT_DIR, MAX_FILE_SIZE
+app.mount("/files", StaticFiles(directory=UPLOAD_DIR), name="files")
+app.mount("/clips", StaticFiles(directory=OUTPUT_DIR), name="clips")
 
 # Initialize services
 episode_service = EpisodeService()
@@ -68,29 +77,59 @@ from services.auth_service import AuthService
 from services.paddle_service import PaddleService
 from config.settings import UPLOAD_DIR, OUTPUT_DIR
 
-# Initialize services as None, will be created in startup event
-file_manager = None
-queue_manager = None
-monitoring_service = None
+# Initialize production services immediately
+try:
+    file_manager = FileManager()
+    logger.info("FileManager initialized successfully")
+except Exception as e:
+    logger.error(f"Failed to initialize FileManager: {e}")
+    file_manager = None
+
+try:
+    queue_manager = QueueManager()
+    logger.info("QueueManager initialized successfully")
+except Exception as e:
+    logger.error(f"Failed to initialize QueueManager: {e}")
+    queue_manager = None
+
+try:
+    monitoring_service = MonitoringService()
+    logger.info("MonitoringService initialized successfully")
+except Exception as e:
+    logger.error(f"Failed to initialize MonitoringService: {e}")
+    monitoring_service = None
+
+# Initialize auth and paddle services
 auth_service = None
 paddle_service = None
 
 # Startup event
 @app.on_event("startup")
 async def startup_event():
-    """Initialize production services on startup"""
-    global file_manager, queue_manager, monitoring_service, auth_service, paddle_service
-    
+    """Verify services are working on startup"""
     try:
         # Ensure directories exist
-        os.makedirs("./uploads", exist_ok=True)
-        os.makedirs("./outputs", exist_ok=True)
+        os.makedirs(UPLOAD_DIR, exist_ok=True)
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
         os.makedirs("./logs", exist_ok=True)
         
-        # Initialize production services
-        file_manager = FileManager()
-        queue_manager = QueueManager()
-        monitoring_service = MonitoringService()
+        # Verify services are initialized and start background tasks
+        if not file_manager:
+            logger.warning("FileManager not available - file validation will be skipped")
+        else:
+            logger.info("FileManager verified and ready")
+            file_manager.start_background_tasks()
+            
+        if not queue_manager:
+            logger.warning("QueueManager not available - episodes will be processed directly")
+        else:
+            logger.info("QueueManager verified and ready")
+            queue_manager.start_processing()
+            
+        if not monitoring_service:
+            logger.warning("MonitoringService not available - metrics will not be recorded")
+        else:
+            logger.info("MonitoringService verified and ready")
         
         # Register job handlers for queue manager
         async def episode_processing_handler(job):
@@ -127,8 +166,120 @@ async def startup_event():
         # Monitoring service starts automatically in __init__
         
         logger.info("Production services initialized successfully")
+        
+        # Run startup checks
+        await startup_checks()
+        
     except Exception as e:
         logger.error(f"Failed to initialize production services: {e}")
+
+async def startup_checks():
+    """Run critical startup checks"""
+    logger.info("Running startup checks...")
+    
+    # Check required directories
+    assert os.path.exists(UPLOAD_DIR) or os.path.exists(os.path.dirname(UPLOAD_DIR)), f"Upload directory {UPLOAD_DIR} not accessible"
+    assert os.path.exists(OUTPUT_DIR) or os.path.exists(os.path.dirname(OUTPUT_DIR)), f"Output directory {OUTPUT_DIR} not accessible"
+    
+    # Check FFmpeg availability
+    try:
+        import subprocess
+        result = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, timeout=5)
+        if result.returncode != 0:
+            logger.warning("FFmpeg not found - audio processing may fail")
+    except Exception as e:
+        logger.warning(f"FFmpeg check failed: {e}")
+    
+    # Check Whisper model loading
+    try:
+        if episode_service.whisper_model is None:
+            logger.warning("Whisper model not loaded - transcription may fail")
+    except Exception as e:
+        logger.warning(f"Whisper model check failed: {e}")
+    
+    # Check environment variables
+    required_env_vars = ["SUPABASE_URL", "SUPABASE_KEY"]
+    for var in required_env_vars:
+        if not os.getenv(var):
+            logger.warning(f"Environment variable {var} not set - some features may not work")
+    
+    logger.info("Startup checks completed")
+
+# Rate limiting storage
+rate_limit_storage = {}
+RATE_LIMITS = {
+    "upload": {"requests": 5, "window": 300},  # 5 uploads per 5 minutes
+    "transcription": {"requests": 3, "window": 600},  # 3 transcriptions per 10 minutes
+    "rendering": {"requests": 10, "window": 300},  # 10 renders per 5 minutes
+}
+
+# Validation functions
+def validate_time_range(start: float, end: float, max_duration: float = 3600) -> None:
+    """Validate start/end time parameters"""
+    if start < 0:
+        raise HTTPException(status_code=400, detail="Start time must be non-negative")
+    if end <= start:
+        raise HTTPException(status_code=400, detail="End time must be greater than start time")
+    if end - start > max_duration:
+        raise HTTPException(status_code=400, detail=f"Clip duration cannot exceed {max_duration} seconds")
+    if end - start < 1:
+        raise HTTPException(status_code=400, detail="Clip duration must be at least 1 second")
+
+def check_rate_limit(operation: str, client_ip: str = "default") -> None:
+    """Check if client has exceeded rate limit for operation"""
+    import time
+    current_time = time.time()
+    
+    if operation not in RATE_LIMITS:
+        return
+    
+    limit = RATE_LIMITS[operation]
+    key = f"{operation}:{client_ip}"
+    
+    if key not in rate_limit_storage:
+        rate_limit_storage[key] = []
+    
+    # Clean old requests outside the window
+    rate_limit_storage[key] = [
+        req_time for req_time in rate_limit_storage[key] 
+        if current_time - req_time < limit["window"]
+    ]
+    
+    # Check if limit exceeded
+    if len(rate_limit_storage[key]) >= limit["requests"]:
+        raise HTTPException(
+            status_code=429, 
+            detail=f"Rate limit exceeded. Maximum {limit['requests']} {operation} requests per {limit['window']} seconds"
+        )
+    
+    # Add current request
+    rate_limit_storage[key].append(current_time)
+
+# Request validation middleware
+@app.middleware("http")
+async def validate_request_size(request: Request, call_next):
+    """Validate request size and other security checks"""
+    # Check content length for file uploads
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            size = int(content_length)
+            if size > MAX_FILE_SIZE:
+                from fastapi.responses import JSONResponse
+                return JSONResponse(
+                    status_code=413, 
+                    content={"error": f"File too large. Maximum size: {MAX_FILE_SIZE} bytes"}
+                )
+        except ValueError:
+            pass
+    
+    # Check for suspicious patterns
+    if request.url.path.startswith("/api/upload"):
+        # Additional validation for upload endpoints
+        pass
+    
+    response = await call_next(request)
+    return response
 
 # Shutdown event
 @app.on_event("shutdown")
@@ -142,11 +293,16 @@ async def shutdown_event():
 
 # Test transcription endpoint
 @app.post("/api/test-transcription")
-async def test_transcription(file_id: str = Form(...)):
+async def test_transcription(file_id: str = Form(...), request: Request = None):
     """Test transcription with an existing file without uploading"""
     try:
-        # Find the file in uploads directory
-        file_path = f"./uploads/{file_id}"
+        # Rate limiting for transcription
+        client_ip = request.client.host if request else "default"
+        check_rate_limit("transcription", client_ip)
+        # Find the file in uploads directory - sanitize file_id to prevent path traversal
+        import os
+        file_id = os.path.basename(file_id)  # Remove any directory components
+        file_path = f"{UPLOAD_DIR}/{file_id}"
         if not os.path.exists(file_path):
             raise HTTPException(status_code=404, detail=f"File {file_id} not found")
         
@@ -213,8 +369,21 @@ async def health_check():
         queue_manager_ok = queue_manager is not None
         monitoring_ok = monitoring_service is not None
         
-        status = "healthy" if all([ffmpeg_ok, whisper_ok, storage_ok, outputs_ok, 
-                                  file_manager_ok, queue_manager_ok, monitoring_ok]) else "unhealthy"
+        # Check spaCy availability
+        from nlp_loader import spacy_status
+        spacy_info = spacy_status()
+        spacy_ok = spacy_info["available"]
+        
+        # Determine overall status
+        core_services_ok = all([ffmpeg_ok, whisper_ok, storage_ok])
+        optional_services_ok = all([file_manager_ok, queue_manager_ok, monitoring_ok])
+        
+        if core_services_ok and optional_services_ok:
+            status = "healthy"
+        elif core_services_ok:
+            status = "degraded"  # Core services work, optional services missing
+        else:
+            status = "unhealthy"
         
         return HealthCheck(
             status=status,
@@ -224,9 +393,11 @@ async def health_check():
                 "ffmpeg": ffmpeg_ok,
                 "whisper": whisper_ok,
                 "storage": storage_ok,
-                "file_manager": file_manager_ok,
-                "queue_manager": queue_manager_ok,
-                "monitoring": monitoring_ok
+                "spacy": {
+                    "available": spacy_info.get("available", False),
+                    "status": spacy_info.get("status", "not_loaded"),
+                    "features": spacy_info.get("features", {})
+                }
             }
         )
     except Exception as e:
@@ -239,9 +410,11 @@ async def health_check():
                 "ffmpeg": False, 
                 "whisper": False, 
                 "storage": False,
-                "file_manager": False,
-                "queue_manager": False,
-                "monitoring": False
+                "spacy": {
+                    "available": False,
+                    "status": "error",
+                    "features": {}
+                }
             }
         )
 
@@ -380,11 +553,23 @@ async def log_choice(choice_data: Dict):
 
 # Main API endpoints
 @app.post("/api/upload")
-async def upload_episode(file: UploadFile = File(...)):
+async def upload_episode(file: UploadFile = File(...), request: Request = None):
     """Upload and process a podcast episode"""
     try:
+        # Check if services are initialized
+        if not episode_service:
+            logger.error("EpisodeService not initialized")
+            raise HTTPException(status_code=503, detail="Service not ready. Please try again.")
+        
+        # Rate limiting for uploads
+        client_ip = request.client.host if request else "default"
+        check_rate_limit("upload", client_ip)
+        
         if not file.filename:
             raise HTTPException(status_code=400, detail="No file provided")
+        
+        # Log the upload attempt
+        logger.info(f"Upload attempt: {file.filename}, size: {getattr(file, 'size', 'unknown')}")
         
         # Validate file using FileManager (if available)
         if file_manager:
@@ -404,9 +589,14 @@ async def upload_episode(file: UploadFile = File(...)):
                 logger.warning(f"Could not determine file size: {e}")
                 file_size = 0
             
-            validation_result = await file_manager.validate_upload(file.filename, file_size)
-            if not validation_result["valid"]:
-                raise HTTPException(status_code=400, detail=validation_result["error"])
+            try:
+                validation_result = await file_manager.validate_upload(file.filename, file_size)
+                if not validation_result["valid"]:
+                    raise HTTPException(status_code=400, detail=validation_result["error"])
+            except Exception as e:
+                logger.warning(f"File validation failed, continuing anyway: {e}")
+        else:
+            logger.warning("FileManager not available, skipping file validation")
         
         # Create episode and start processing
         episode_id = str(uuid.uuid4())
@@ -415,13 +605,17 @@ async def upload_episode(file: UploadFile = File(...)):
         # Add to processing queue (if available)
         job_id = None
         if queue_manager:
-            from services.queue_manager import JobPriority
-            job_id = await queue_manager.submit_job(
-                job_type="episode_processing",
-                priority=JobPriority.HIGH,
-                metadata={"episode_id": episode.id}
-            )
-            logger.info(f"Episode {episode.id} queued for processing with job ID: {job_id}")
+            try:
+                from services.queue_manager import JobPriority
+                job_id = await queue_manager.submit_job(
+                    job_type="episode_processing",
+                    priority=JobPriority.HIGH,
+                    metadata={"episode_id": episode.id}
+                )
+                logger.info(f"Episode {episode.id} queued for processing with job ID: {job_id}")
+            except Exception as e:
+                logger.warning(f"Failed to queue episode, processing directly: {e}")
+                await episode_service.process_episode(episode.id)
         else:
             # Fallback: process directly if queue manager not available
             logger.warning("Queue manager not available, processing episode directly")
@@ -429,7 +623,10 @@ async def upload_episode(file: UploadFile = File(...)):
         
         # Log success to monitoring (if available)
         if monitoring_service:
-            monitoring_service.record_metric("upload_success", 1)
+            try:
+                monitoring_service.record_metric("upload_success", 1)
+            except Exception as e:
+                logger.warning(f"Failed to record monitoring metric: {e}")
         
         return {
             "ok": True, 
@@ -438,15 +635,44 @@ async def upload_episode(file: UploadFile = File(...)):
             "message": "Upload successful and processing started"
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Upload failed: {e}")
+        logger.error(f"Upload failed: {str(e)}", exc_info=True)
         # Log error to monitoring service (if available)
         if monitoring_service:
-            monitoring_service.record_error("upload_failed", str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+            try:
+                monitoring_service.record_error("upload_failed", str(e))
+            except Exception as monitoring_error:
+                logger.warning(f"Failed to record monitoring error: {monitoring_error}")
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+
+@app.get("/api/episodes")
+async def list_episodes():
+    """Get list of all loaded episodes"""
+    try:
+        episodes = await episode_service.list_episodes()
+        
+        # Convert episodes to summary format
+        episode_summaries = []
+        for episode in episodes:
+            summary = {
+                "episode_id": episode.id,
+                "title": getattr(episode, "title", None),
+                "created_at": episode.created_at.isoformat() if hasattr(episode, "created_at") and episode.created_at else None,
+                "duration_s": getattr(episode, "duration_s", None),
+                "status": episode.status
+            }
+            episode_summaries.append(summary)
+        
+        return {"ok": True, "episodes": episode_summaries}
+    except Exception as e:
+        logger.error(f"Error listing episodes: {e}")
+        return {"ok": False, "error": str(e)}
 
 @app.get("/api/candidates")
 async def get_candidates(
+    episode_id: str | None = Query(None, description="Specific episode ID to get candidates for"),
     genre: str | None = Query(None, description="Genre for optimization (comedy, fantasy_sports, sports, true_crime, business, news_politics, education, health_wellness)"),
     debug: bool = Query(False, description="Enable debug mode for detailed candidate information")
 ):
@@ -455,14 +681,20 @@ async def get_candidates(
         # Set debug environment variable
         os.environ["PODPROMO_DEBUG_ALL"] = "1" if debug else "0"
         
-        # Get the most recent episode
-        episodes = await episode_service.list_episodes()
-        if not episodes:
-            return {"ok": False, "error": "No episodes found. Upload a file first."}
+        # Get the target episode (specific ID or latest)
+        if episode_id:
+            # Get specific episode by ID
+            target_episode = await episode_service.get_episode(episode_id)
+            if not target_episode:
+                return {"ok": False, "error": f"Episode {episode_id} not found."}
+        else:
+            # Get the most recent episode
+            episodes = await episode_service.list_episodes()
+            if not episodes:
+                return {"ok": False, "error": "No episodes found. Upload a file first."}
+            target_episode = episodes[-1]
         
-        latest_episode = episodes[-1]
-        
-        if latest_episode.status != "completed":
+        if target_episode.status != "completed":
             return {"ok": False, "error": "Episode still processing. Please wait."}
         
         # Get candidates using ClipScore with platform/genre optimization
@@ -499,7 +731,7 @@ async def get_candidates(
         
         # Get candidates using the auto-recommended platform
         candidates = await clip_score_service.get_candidates(
-            latest_episode.id, 
+            target_episode.id, 
             platform=frontend_platform, 
             genre=genre
         )
@@ -540,10 +772,17 @@ async def render_one_clip(
     style: str = Form("bold"),
     captions: bool = Form(True),
     punch_ins: bool = Form(True),
-    loop_seam: bool = Form(False)
+    loop_seam: bool = Form(False),
+    request: Request = None
 ):
     """Render a single clip with enhanced options"""
     try:
+        # Rate limiting for rendering
+        client_ip = request.client.host if request else "default"
+        check_rate_limit("rendering", client_ip)
+        
+        # Validate time range
+        validate_time_range(start, end, max_duration=300)  # 5 minutes max for clips
         # For MVP, get the most recent episode
         episodes = await episode_service.list_episodes()
         if not episodes:
@@ -596,6 +835,8 @@ async def create_ab_tests(
 ):
     """Create A/B test versions for hook testing"""
     try:
+        # Validate time range
+        validate_time_range(start, end, max_duration=300)  # 5 minutes max for clips
         # Get the most recent episode
         episodes = await episode_service.list_episodes()
         if not episodes:
@@ -647,6 +888,199 @@ async def get_clip_history(limit: int = 50):
         return {"ok": True, "items": items}
     except Exception as e:
         logger.error(f"History retrieval failed: {e}")
+        return {"ok": False, "error": str(e)}
+
+@app.get("/api/transcript/{episode_id}")
+async def get_transcript(episode_id: str):
+    """Get transcript for an episode (for debugging)"""
+    try:
+        episode = await episode_service.get_episode(episode_id)
+        if not episode:
+            return {"ok": False, "error": "Episode not found"}
+        
+        if not episode.transcript:
+            return {"ok": False, "error": "No transcript available"}
+        
+        # Return transcript segments
+        segments = []
+        for segment in episode.transcript:
+            segments.append({
+                "start": segment.start,
+                "end": segment.end,
+                "text": segment.text,
+                "confidence": segment.confidence
+            })
+        
+        return {
+            "ok": True,
+            "episode_id": episode_id,
+            "status": episode.status,
+            "duration": episode.duration,
+            "segments": segments,
+            "total_segments": len(segments)
+        }
+    except Exception as e:
+        logger.error(f"Failed to get transcript: {e}")
+        return {"ok": False, "error": str(e)}
+
+@app.get("/api/debug-episodes")
+async def debug_episodes():
+    """Debug endpoint to see what episodes are in memory"""
+    try:
+        episodes = list(episode_service.episodes.values())
+        episode_info = []
+        for episode in episodes:
+            episode_info.append({
+                "id": episode.id,
+                "status": episode.status,
+                "has_transcript": bool(episode.transcript),
+                "transcript_segments": len(episode.transcript) if episode.transcript else 0,
+                "duration": episode.duration
+            })
+        
+        return {
+            "ok": True,
+            "total_episodes": len(episodes),
+            "episodes": episode_info
+        }
+    except Exception as e:
+        logger.error(f"Failed to debug episodes: {e}")
+        return {"ok": False, "error": str(e)}
+
+@app.post("/api/reload-episodes")
+async def reload_episodes():
+    """Force reload episodes from storage"""
+    try:
+        # Clear current episodes
+        episode_service.episodes.clear()
+        
+        # Reload from storage
+        episode_service._load_episodes()
+        
+        episodes = list(episode_service.episodes.values())
+        episode_info = []
+        for episode in episodes:
+            episode_info.append({
+                "id": episode.id,
+                "status": episode.status,
+                "has_transcript": bool(episode.transcript),
+                "transcript_segments": len(episode.transcript) if episode.transcript else 0,
+                "duration": episode.duration
+            })
+        
+        return {
+            "ok": True,
+            "message": f"Reloaded {len(episodes)} episodes",
+            "total_episodes": len(episodes),
+            "episodes": episode_info
+        }
+    except Exception as e:
+        logger.error(f"Failed to reload episodes: {e}")
+        return {"ok": False, "error": str(e)}
+
+@app.get("/api/episodes/{episode_id}/clips")
+async def get_episode_clips(episode_id: str, regenerate: bool = False):
+    """Get clips for a specific episode"""
+    try:
+        # Get the episode from the service
+        episode = await episode_service.get_episode(episode_id)
+        if not episode:
+            return {
+                "ok": False,
+                "clips": [],
+                "count": 0,
+                "episode_id": episode_id,
+                "message": "Episode not found"
+            }
+        
+        # Check if processing is complete
+        if episode.status != "completed":
+            return {
+                "ok": False,
+                "clips": [],
+                "count": 0,
+                "episode_id": episode_id,
+                "message": "Episode still processing",
+                "status": episode.status
+            }
+        
+        # Generate clips using the existing clip score service
+        try:
+            clips = await clip_score_service.get_candidates(episode_id)
+            
+            # Format clips for frontend
+            formatted_clips = []
+            for i, clip in enumerate(clips):
+                formatted_clips.append({
+                    "id": clip.get("id", f"clip_{i+1}"),
+                    "title": clip.get("title", f"Clip {i+1}"),
+                    "text": clip.get("text", ""),
+                    "score": clip.get("score", 0),
+                    "start_time": clip.get("start", 0),
+                    "end_time": clip.get("end", 0),
+                    "duration": clip.get("end", 0) - clip.get("start", 0),
+                    "reason": clip.get("reason", ""),
+                    "features": clip.get("features", {}),
+                    "is_advertisement": clip.get("is_advertisement", False)
+                })
+            
+            return {
+                "ok": True,
+                "clips": formatted_clips,
+                "count": len(formatted_clips),
+                "episode_id": episode_id,
+                "_source": "generated"
+            }
+            
+        except Exception as e:
+            logger.error(f"Clip generation failed: {e}")
+            return {
+                "ok": False,
+                "clips": [],
+                "count": 0,
+                "episode_id": episode_id,
+                "message": f"Clip generation failed: {str(e)}"
+            }
+        
+    except Exception as e:
+        logger.error(f"Failed to get clips: {e}")
+        return {
+            "ok": False,
+            "clips": [],
+            "count": 0,
+            "episode_id": episode_id,
+            "error": str(e),
+            "message": f"Clips fetch failed: {str(e)}"
+        }
+
+@app.post("/api/force-candidates")
+async def force_generate_candidates():
+    """Force generate candidates for the most recent episode (for debugging)"""
+    try:
+        # Get all episodes directly from the service
+        episodes = list(episode_service.episodes.values())
+        if not episodes:
+            return {"ok": False, "error": "No episodes found"}
+        
+        # Get the most recent episode
+        latest_episode = episodes[-1]
+        if not latest_episode.transcript:
+            return {"ok": False, "error": "No transcript available for latest episode"}
+        
+        # Generate candidates
+        candidates = await clip_score_service.get_candidates(
+            latest_episode.id, 
+            platform="tiktok_reels"
+        )
+        
+        return {
+            "ok": True,
+            "episode_id": latest_episode.id,
+            "candidates": candidates,
+            "total_candidates": len(candidates)
+        }
+    except Exception as e:
+        logger.error(f"Failed to force generate candidates: {e}")
         return {"ok": False, "error": str(e)}
 
 @app.post("/api/render-variant")
@@ -725,42 +1159,64 @@ async def get_progress():
 
 @app.get("/api/progress/{episode_id}")
 async def get_episode_progress(episode_id: str):
-    """Get processing progress for a specific episode"""
+    """Get processing progress for a specific episode with simple disk fallback"""
     try:
-        episode = await episode_service.get_episode(episode_id)
-        if not episode:
-            return {"ok": False, "error": "Episode not found"}
+        import os
+        from pathlib import Path
         
-        # Get actual progress from episode service
-        progress_data = episode_service.get_progress(episode_id)
-        
-        if episode.status == "completed":
-            return {"ok": True, "progress": 100, "status": "completed", "message": "Processing completed"}
-        elif episode.status == "processing" and progress_data:
-            # Use actual progress from episode service
+        # Simple disk-based progress checking
+        UPLOADS = Path(os.getenv("UPLOADS_DIR", r"C:\Users\Dallas Heidt\Desktop\podpromo\backend\uploads"))
+        audio = UPLOADS / f"{episode_id}.mp3"
+        transcript = UPLOADS / "transcripts" / f"{episode_id}.json"
+
+        if transcript.exists() and transcript.stat().st_size > 10:
             return {
-                "ok": True, 
-                "progress": progress_data.get("percentage", 50), 
-                "status": "processing",
-                "stage": progress_data.get("stage", "processing"),
-                "message": progress_data.get("message", "Processing...")
+                "ok": True,
+                "progress": {
+                    "percentage": 100,
+                    "stage": "completed",
+                    "message": "Completed (inferred from transcript on disk)",
+                    "timestamp": datetime.now().isoformat()
+                },
+                "status": "completed"
             }
-        elif episode.status == "processing":
-            # Fallback: estimate progress based on time
-            if hasattr(episode, 'uploaded_at') and episode.uploaded_at:
-                elapsed = (datetime.now() - episode.uploaded_at).total_seconds()
-                # Conservative estimate: assume 1-2 minutes for processing
-                estimated_time = 120  # 2 minutes
-                progress = min(90, int((elapsed / estimated_time) * 90))
-                return {"ok": True, "progress": progress, "message": "Processing audio..."}
-            else:
-                return {"ok": True, "progress": 25, "message": "Starting processing..."}
-        else:
-            return {"ok": True, "progress": 0, "status": episode.status, "message": "Ready to process"}
-            
+
+        if audio.exists() and audio.stat().st_size > 10:
+            return {
+                "ok": True,
+                "progress": {
+                    "percentage": 10,
+                    "stage": "queued",
+                    "message": "Audio found, but transcript not yet generated",
+                    "timestamp": datetime.now().isoformat()
+                },
+                "status": "queued"
+            }
+
+        return {
+            "ok": False,
+            "progress": {
+                "percentage": 0,
+                "stage": "unknown",
+                "message": "Episode not found on disk",
+                "timestamp": datetime.now().isoformat()
+            },
+            "status": "unknown"
+        }
+        
     except Exception as e:
-        logger.error(f"Episode progress check failed: {e}")
-        return {"ok": False, "error": str(e)}
+        logger.error(f"Progress check failed: {e}")
+        # Always return 200 with error info to prevent frontend retry loops
+        return {
+            "ok": False, 
+            "progress": {
+                "percentage": 0,
+                "stage": "error",
+                "message": f"Progress check failed: {str(e)}",
+                "timestamp": datetime.now().isoformat()
+            },
+            "status": "error"
+        }
 
 @app.get("/api/candidate/debug")
 async def candidate_debug(

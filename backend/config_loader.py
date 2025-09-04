@@ -64,6 +64,24 @@ def load_config():
                 cfg["pitch"] = user["pitch"]
             if "arousal" in user:
                 cfg["arousal"] = user["arousal"]
+            if "arousal_v5" in user:
+                cfg["arousal_v5"] = user["arousal_v5"]
+            if "platform_length_v2" in user:
+                cfg["platform_length_v2"] = user["platform_length_v2"]
+            if "info_density" in user:
+                cfg["info_density"] = user["info_density"]
+            if "question_list_v2" in user:
+                cfg["question_list_v2"] = user["question_list_v2"]
+            if "emotion_v2" in user:
+                cfg["emotion_v2"] = user["emotion_v2"]
+            if "emotion_lexicons" in user:
+                cfg["emotion_lexicons"] = user["emotion_lexicons"]
+            if "synergy" in user:
+                cfg["synergy"] = user["synergy"]
+            if "insight_v2" in user:
+                cfg["insight_v2"] = user["insight_v2"]
+            if "hook_v5" in user:
+                cfg["hook_v5"] = user["hook_v5"]
             if "presets" in user:
                 cfg["presets"] = user["presets"]
             

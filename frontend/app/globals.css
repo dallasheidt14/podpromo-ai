@@ -2,55 +2,107 @@
 @tailwind components;
 @tailwind utilities;
 
+/* --- PodPromo global theme helpers --- */
+:root {
+  --card: #10151f;
+  --card-2: #0d1220;
+  --stroke: #1e2636;
+}
+
 @layer base {
   html {
     scroll-behavior: smooth;
   }
   
   body {
-    @apply bg-gray-50 text-gray-900;
-  }
+  background: radial-gradient(1200px 600px at 20% -10%, #0b0f1a 0%, #05070d 60%, #040507 100%) fixed;
+  color: #ffffff;
+}
   
   * {
-    @apply border-gray-200;
+    @apply border-[#1e2636];
+  }
+  
+  /* Ensure all text elements have proper contrast */
+  h1, h2, h3, h4, h5, h6 {
+    @apply text-white;
+  }
+  
+  p, span, div {
+    @apply text-white/90;
+  }
+  
+  /* Accent colors for headings */
+  .heading-primary {
+    @apply text-white;
+  }
+  
+  .heading-secondary {
+    @apply text-blue-400;
+  }
+  
+  .subtle {
+    @apply text-white/70;
+  }
+  
+  .muted {
+    @apply text-white/60;
+  }
+}
+
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
   }
 }
 
 @layer components {
   .btn-primary {
-    @apply bg-primary-600 hover:bg-primary-700 text-white font-medium py-2 px-4 rounded-lg transition-colors duration-200 focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-offset-2;
+    @apply px-3 py-1.5 rounded bg-white text-black hover:bg-white/90;
   }
   
   .btn-secondary {
-    @apply bg-gray-200 hover:bg-gray-300 text-gray-900 font-medium py-2 px-4 rounded-lg transition-colors duration-200 focus:outline-none focus:ring-2 focus:ring-gray-500 focus:ring-offset-2;
+    @apply bg-white/10 hover:bg-white/20 text-white font-medium py-2 px-4 rounded-lg transition-colors duration-200 focus:outline-none focus:ring-2 focus:ring-white/50 focus:ring-offset-2;
   }
   
   .btn-outline {
-    @apply border border-gray-300 hover:border-gray-400 text-gray-700 hover:text-gray-900 font-medium py-2 px-4 rounded-lg transition-colors duration-200 focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-offset-2;
+    @apply px-3 py-1.5 rounded border border-[#2b3448] text-white hover:bg-white/5;
   }
   
   .card {
-    @apply bg-white rounded-xl shadow-sm border border-gray-200 p-6;
+    background: var(--card);
+    border: 1px solid var(--stroke);
+    border-radius: 14px;
+    @apply p-6;
+  }
+  
+  .card-2 {
+    background: var(--card-2);
+    border: 1px solid var(--stroke);
+    border-radius: 14px;
   }
   
   .input-field {
-    @apply w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent transition-colors duration-200;
+    @apply w-full px-3 py-2 border border-[#2b3448] rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent transition-colors duration-200 bg-white/5 text-white placeholder-white/50;
   }
   
   .upload-zone {
-    @apply border-2 border-dashed border-gray-300 rounded-xl p-8 text-center hover:border-primary-400 transition-colors duration-200 cursor-pointer;
+    @apply border border-[#1e2636] rounded-xl p-6 text-center cursor-pointer bg-white/5;
   }
   
   .upload-zone.active {
-    @apply border-primary-500 bg-primary-50;
+    @apply border-white/40 bg-white/10;
   }
   
   .progress-bar {
-    @apply w-full bg-gray-200 rounded-full h-3 overflow-hidden shadow-inner;
+    @apply w-full h-2 bg-white/10 rounded-full overflow-hidden;
   }
   
   .progress-fill {
-    @apply h-full bg-primary-600 transition-all duration-500 ease-out rounded-full;
+    @apply h-2 rounded-full bg-white/70;
   }
   
   .progress-fill.bg-blue-500 {
@@ -94,15 +146,15 @@
 }
 
 ::-webkit-scrollbar-track {
-  @apply bg-gray-100;
+  @apply bg-white/5;
 }
 
 ::-webkit-scrollbar-thumb {
-  @apply bg-gray-300 rounded-full;
+  @apply bg-white/20 rounded-full;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  @apply bg-gray-400;
+  @apply bg-white/30;
 }
 
 /* Loading animations */

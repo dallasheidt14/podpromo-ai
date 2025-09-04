@@ -61,6 +61,51 @@ class ClipScoreService:
             logger.error(f"Episode analysis failed: {e}")
             raise
 
+    def _is_repetitive_content(self, text: str) -> bool:
+        """Check if content is repetitive or filler (like 'Yeah. Yeah. Yeah...')"""
+        if not text or len(text.strip()) < 5:
+            return True
+        
+        words = text.lower().split()
+        if len(words) < 5:
+            return True
+        
+        # Check for repetitive patterns
+        # Count unique words vs total words
+        unique_words = set(words)
+        repetition_ratio = len(unique_words) / len(words)
+        
+        # If more than 70% of words are repeated, it's likely filler
+        if repetition_ratio < 0.3:
+            return True
+        
+        # Check for specific repetitive patterns
+        repetitive_patterns = [
+            r'^(yeah\.?\s*){3,}',  # "Yeah. Yeah. Yeah..."
+            r'^(uh\.?\s*){3,}',    # "Uh. Uh. Uh..."
+            r'^(um\.?\s*){3,}',    # "Um. Um. Um..."
+            r'^(ok\.?\s*){3,}',    # "Ok. Ok. Ok..."
+            r'^(right\.?\s*){3,}', # "Right. Right. Right..."
+            r'^(so\.?\s*){3,}',    # "So. So. So..."
+            r'^(and\.?\s*){3,}',   # "And. And. And..."
+        ]
+        
+        import re
+        for pattern in repetitive_patterns:
+            if re.match(pattern, text.lower()):
+                return True
+        
+        # Check if the same word appears more than 50% of the time
+        word_counts = {}
+        for word in words:
+            word_counts[word] = word_counts.get(word, 0) + 1
+        
+        max_count = max(word_counts.values()) if word_counts else 0
+        if max_count > len(words) * 0.5:
+            return True
+        
+        return False
+
     def _fails_quality(self, feats: dict) -> str | None:
         """Check if segment fails quality gates (soft reject) - Soft hook penalty, strong ad clamp"""
         # Conditional hook threshold based on payoff and arousal
@@ -163,27 +208,61 @@ class ClipScoreService:
             # Features are already clamped in compute_features for ads
             # This ensures consistency between feature calculation and scoring
             
-            # Soft quality gate with penalties instead of hard fails
+            # Soft quality gate with genre-specific penalties
             reason = self._fails_quality(feats)
             seg["discard_reason"] = reason
             
             if reason:
+                # Get genre-specific quality gate config
+                from config_loader import get_config
+                config = get_config()
+                quality_config = config.get("quality_gate", {})
+                global_config = quality_config.get("global", {})
+                genre_config = quality_config.get(genre, {})
+                
+                # Apply genre-specific penalties
                 if reason == "weak_hook_very_soft":
-                    # Apply soft penalty for very weak hooks
-                    penalty_mult = 0.55  # ×0.55 penalty (more aggressive)
+                    penalty_mult = global_config.get("weak_hook_very_soft", 0.65)
                     raw_score *= penalty_mult
                     seg["soft_penalty"] = f"very_weak_hook_{penalty_mult}"
                     logger.info(f"Clip got soft penalty: {reason}, applying {penalty_mult}x, final score: {raw_score:.3f}")
                 elif reason == "weak_hook_mild_soft":
-                    # Apply mild penalty for hooks below threshold
-                    penalty_mult = 0.80  # ×0.80 penalty (more aggressive)
+                    penalty_mult = global_config.get("weak_hook_mild_soft", 0.90)
                     raw_score *= penalty_mult
                     seg["soft_penalty"] = f"mild_weak_hook_{penalty_mult}"
                     logger.info(f"Clip got mild penalty: {reason}, applying {penalty_mult}x, final score: {raw_score:.3f}")
-                else:
-                    # Hard fail for other reasons (ad_like combinations, no_payoff, low_energy)
+                elif reason == "no_payoff":
+                    # Check for insight/question fallback
+                    has_insight = feats.get("insight_score", 0.0) >= 0.70
+                    has_question = feats.get("question_score", 0.0) >= 0.50
+                    
+                    if has_insight or has_question:
+                        # Use genre-specific soften for insights/questions
+                        penalty_mult = genre_config.get("no_payoff_soften", global_config.get("no_payoff_soften", 0.85))
+                        raw_score *= penalty_mult
+                        seg["soft_penalty"] = f"no_payoff_with_insight_{penalty_mult}"
+                        logger.info(f"Clip softened for insight/question: {reason}, applying {penalty_mult}x, final score: {raw_score:.3f}")
+                    else:
+                        # Standard no_payoff penalty
+                        penalty_mult = genre_config.get("no_payoff_soften", global_config.get("no_payoff_soften", 0.70))
+                        raw_score *= penalty_mult
+                        seg["soft_penalty"] = f"no_payoff_{penalty_mult}"
+                        logger.info(f"Clip got no_payoff penalty: {reason}, applying {penalty_mult}x, final score: {raw_score:.3f}")
+                elif reason == "low_energy":
+                    penalty_mult = global_config.get("low_energy_soften", 0.75)
+                    raw_score *= penalty_mult
+                    seg["soft_penalty"] = f"low_energy_{penalty_mult}"
+                    logger.info(f"Clip got low_energy penalty: {reason}, applying {penalty_mult}x, final score: {raw_score:.3f}")
+                elif "ad_like" in reason:
+                    # Hard floor only for ads
                     logger.info(f"Clip failed quality gate: {reason}, setting score to 0.05")
                     raw_score = 0.05
+                else:
+                    # Fallback for other reasons
+                    penalty_mult = 0.70
+                    raw_score *= penalty_mult
+                    seg["soft_penalty"] = f"other_{penalty_mult}"
+                    logger.info(f"Clip got other penalty: {reason}, applying {penalty_mult}x, final score: {raw_score:.3f}")
                 seg["raw_score"] = raw_score
             else:
                 seg["raw_score"] = raw_score
@@ -200,6 +279,7 @@ class ClipScoreService:
             # Calibrate score for better user experience with wider range
             calibrated_score = self._calibrate_score_for_ui(raw_score)
             seg["display_score"] = calibrated_score["score"]
+            seg["clip_score_100"] = calibrated_score["score"]  # Set clip_score_100 for frontend
             seg["confidence"] = calibrated_score["confidence"]
             seg["confidence_color"] = calibrated_score["color"]
             
@@ -228,9 +308,9 @@ class ClipScoreService:
         if raw_score < min_score:
             return {"score": 40, "confidence": "⚠️ Fair", "color": "text-red-600"}
         else:
-            # Map 0.1 → 45%, 0.8 → 95%
+            # Map 0.1 → 45%, 0.8 → 95%, cap at 100%
             normalized = (raw_score - min_score) / (max_score - min_score)
-            calibrated = int(normalized * 50 + 45)
+            calibrated = min(int(normalized * 50 + 45), 100)  # Cap at 100%
             
             # Confidence bands
             if calibrated >= 90:
@@ -434,8 +514,73 @@ class ClipScoreService:
         
         return True
 
+    def _is_repetitive_content(self, text: str) -> bool:
+        """Check if content is repetitive/filler (like 'Yeah. Yeah. Yeah...')"""
+        words = text.lower().split()
+        if len(words) < 5:
+            return False
+        
+        # Check for repetitive patterns
+        word_counts = {}
+        for word in words:
+            word_counts[word] = word_counts.get(word, 0) + 1
+        
+        # If any word appears more than 50% of the time, it's repetitive
+        max_count = max(word_counts.values())
+        if max_count > len(words) * 0.5:
+            return True
+        
+        # Check for specific repetitive patterns
+        repetitive_patterns = [
+            "yeah yeah yeah",
+            "uh uh uh",
+            "um um um",
+            "so so so",
+            "and and and",
+            "the the the"
+        ]
+        
+        text_lower = text.lower()
+        for pattern in repetitive_patterns:
+            if pattern in text_lower:
+                return True
+        
+        return False
+
+    def _is_intro_content(self, text: str) -> bool:
+        """Check if content is intro/greeting material"""
+        text_lower = text.lower().strip()
+        
+        intro_patterns = [
+            r"^(yo|hey|hi|hello|what's up|how's it going|good morning|good afternoon|good evening)",
+            r"^(it's|this is) (monday|tuesday|wednesday|thursday|friday|saturday|sunday)",
+            r"^(i'm|my name is) \w+",
+            r"^(welcome to|thanks for|thank you for)",
+            r"^(hope you|hope everyone)",
+            r"^(let's get|let's start|let's begin)",
+            r"^(today we're|today i'm|today let's)"
+        ]
+        
+        import re
+        for pattern in intro_patterns:
+            if re.match(pattern, text_lower):
+                return True
+        
+        return False
+
+    def _is_natural_ending(self, text: str) -> bool:
+        """Check if text ends naturally"""
+        text = text.strip()
+        # Good endings
+        if text.endswith(('.', '!', '?')):
+            # Check it's not mid-sentence
+            last_words = text.split()[-3:]
+            if not any(w in ['the', 'a', 'an', 'to', 'of', 'and', 'but'] for w in last_words):
+                return True
+        return False
+
     def _transcript_to_segments(self, transcript: List[TranscriptSegment], genre: str = 'general', platform: str = 'tiktok') -> List[Dict]:
-        """Use dynamic segmentation with moment detection for segmentation"""
+        """Combine fragmented transcript segments into coherent clips"""
         try:
             # Convert TranscriptSegment objects to dicts
             transcript_dicts = []
@@ -449,24 +594,59 @@ class ClipScoreService:
                 else:
                     transcript_dicts.append(seg)
             
-            # Apply dynamic segmentation first
-            from services.secret_sauce import create_dynamic_segments, split_mixed_segments
+            logger.info(f"Starting with {len(transcript_dicts)} raw transcript segments")
             
-            # Split mixed segments to separate intro from good content
-            split_segments = split_mixed_segments(transcript_dicts)
+            # COMBINE segments to reach minimum viable length
+            combined_segments = []
+            current_segment = None
+            target_duration = 20  # Aim for 20-second clips
+            max_duration = 45
+            min_duration = 15
             
-            # Create dynamic segments based on natural boundaries and platform optimization
-            dynamic_segments = create_dynamic_segments(split_segments, platform)
+            for seg in transcript_dicts:
+                # Skip intro/filler
+                if self._is_intro_content(seg['text']) or self._is_repetitive_content(seg['text']):
+                    continue
+                    
+                if current_segment is None:
+                    current_segment = seg.copy()
+                else:
+                    # Check if adding this segment would exceed max
+                    potential_duration = seg['end'] - current_segment['start']
+                    
+                    if potential_duration <= max_duration:
+                        # Extend current segment
+                        current_segment['end'] = seg['end']
+                        current_segment['text'] += ' ' + seg['text']
+                        
+                        # Check if we've reached target duration
+                        if potential_duration >= target_duration:
+                            # Look for natural break point
+                            if self._is_natural_ending(seg['text']):
+                                combined_segments.append(current_segment)
+                                current_segment = None
+                    else:
+                        # Would be too long, save current and start new
+                        if current_segment['end'] - current_segment['start'] >= min_duration:
+                            combined_segments.append(current_segment)
+                        current_segment = seg.copy()
             
-            logger.info(f"Created {len(dynamic_segments)} dynamic segments for {platform}")
+            # Don't forget last segment
+            if current_segment and (current_segment['end'] - current_segment['start'] >= min_duration):
+                combined_segments.append(current_segment)
             
-            # Use dynamic segments directly (moment detection disabled for better results)
-            logger.info(f"Using {len(dynamic_segments)} dynamic segments with natural boundaries")
-            return dynamic_segments
+            logger.info(f"Combined into {len(combined_segments)} coherent segments")
+            
+            # Log segment details for debugging
+            for i, seg in enumerate(combined_segments[:3]):
+                duration = seg['end'] - seg['start']
+                logger.info(f"Combined Segment {i+1}: {duration:.1f}s - {seg['text'][:60]}...")
+            
+            return combined_segments
             
         except Exception as e:
-            logger.error(f"Dynamic segmentation failed: {e}, falling back to window-based")
-            return self._window_based_segments(transcript_dicts, window=25, step=15)
+            logger.error(f"Segment combination failed: {e}, falling back to window-based")
+            return self._window_based_segments(transcript_dicts, window=30, step=20)
     
     def _window_based_segments(self, transcript: List[Dict], window: float = 25, step: float = 15) -> List[Dict]:
         """Fallback window-based segmentation with larger steps"""
@@ -481,7 +661,7 @@ class ClipScoreService:
         for start_time in range(0, int(total_duration), int(step)):
             end_time = min(start_time + window, total_duration)
             
-            if end_time - start_time < 12:  # Minimum duration
+            if end_time - start_time < 15:  # Minimum duration (increased from 12 to 15)
                 continue
             
             segment_text = self._get_transcript_segment_text(transcript, start_time, end_time)
@@ -660,18 +840,38 @@ class ClipScoreService:
             # Use rank_candidates for proper scoring pipeline
             ranked_segments = self.rank_candidates(segments, episode.audio_path, top_k=10, platform=backend_platform, genre=final_genre)
             
-            # Convert to candidate format
+            # Convert to candidate format with title generation and grades
             candidates = []
-            for seg in ranked_segments:
+            config = get_config()
+            
+            for i, seg in enumerate(ranked_segments):
                 # Get features for field mapping
                 features = seg.get("features", {})
                 
+                # Generate title and grades
+                from services.secret_sauce import _heuristic_title, _grade_breakdown
+                
+                # Create enhanced features dict for title generation
+                enhanced_features = {
+                    **features,
+                    "final_score": seg.get("raw_score", 0.0)
+                }
+                
+                # Generate viral title
+                title = _heuristic_title(seg["text"], enhanced_features, config, rank=i+1)
+                
+                # Generate grade breakdown
+                grades = _grade_breakdown(enhanced_features)
+                
                 candidate = {
+                    "id": f"clip_{episode_id}_{i}",
                     "start": seg["start"],
                     "end": seg["end"],
                     "text": seg["text"],
+                    "title": title,
                     "features": features,
-                    "score": seg.get("display_score", 0),  # Frontend expects "score"
+                    "grades": grades,
+                    "score": seg.get("raw_score", 0.0),  # Use raw score (0-1) for frontend
                     "raw_score": seg.get("raw_score", 0),
                     "display_score": seg.get("display_score", 0),
                     "clip_score_100": seg.get("clip_score_100", 0),
@@ -684,6 +884,7 @@ class ClipScoreService:
                     "platform": backend_platform,
                     "moment_type": seg.get("type", "general"),
                     "moment_confidence": seg.get("confidence", 0.5),
+                    "status": "completed",
                     
                     # Frontend field mappings
                     "hook_score": features.get("hook_score", 0.0),
@@ -711,8 +912,8 @@ class ClipScoreService:
             # Filter overlapping candidates
             filtered_candidates = self._filter_overlapping_candidates(candidates)
             
-            # Apply quality filtering
-            quality_filtered = self._filter_low_quality(filtered_candidates, min_score=40)
+            # Apply quality filtering (temporarily lowered for debugging)
+            quality_filtered = self._filter_low_quality(filtered_candidates, min_score=20)
             
             return quality_filtered[:10]  # Return top 10
             
