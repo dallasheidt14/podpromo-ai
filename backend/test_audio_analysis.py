@@ -8,7 +8,7 @@ import os
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 try:
-    from services.secret_sauce import _audio_prosody_score, compute_audio_energy
+    from services.secret_sauce_pkg import _audio_prosody_score, compute_audio_energy
     import numpy as np
     
     print("🎵 Testing Audio Analysis Functions")

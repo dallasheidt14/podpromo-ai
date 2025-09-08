@@ -9,7 +9,7 @@ import os
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from services.viral_moment_detector import ViralMomentDetector
-from services.secret_sauce import _detect_insight_content_v2, _detect_insight_content
+from services.secret_sauce_pkg import _detect_insight_content_v2, _detect_insight_content
 from config_loader import load_config
 
 def test_insight_v2_config():
@@ -245,7 +245,7 @@ def test_insight_confidence_multiplier():
     """Test confidence multiplier functionality"""
     print("=== Testing Insight Confidence Multiplier ===")
     
-    from services.secret_sauce import _apply_insight_confidence_multiplier
+    from services.secret_sauce_pkg import _apply_insight_confidence_multiplier
     
     # Test with different confidence levels
     base_score = 0.5

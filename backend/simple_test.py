@@ -6,7 +6,7 @@ Simple test to check if imports are working
 print("Starting simple test...")
 
 try:
-    from services.secret_sauce import GenreAwareScorer
+    from services.secret_sauce_pkg import GenreAwareScorer
     print("✅ GenreAwareScorer imported successfully")
     
     scorer = GenreAwareScorer()

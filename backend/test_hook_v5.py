@@ -7,7 +7,7 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from services.secret_sauce import _hook_score_v4, _hook_score_v5, _calibrate_hook_v5, _sigmoid01, attach_hook_scores
+from services.secret_sauce_pkg import _hook_score_v4, _hook_score_v5, _calibrate_hook_v5, _sigmoid01, attach_hook_scores
 from utils.hooks import cluster_hook_cues, build_hook_families_from_config, print_cluster_report
 from config_loader import get_config
 

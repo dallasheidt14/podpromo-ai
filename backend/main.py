@@ -454,7 +454,7 @@ async def test_detectors(body: dict):
     """Test individual detectors with sample text"""
     try:
         txt = body.get("text", "")
-        from services.secret_sauce import _hook_score, _payoff_presence, _info_density, _ad_penalty
+        from services.secret_sauce_pkg import _hook_score, _payoff_presence, _info_density, _ad_penalty
         # Test original hook detection
         hook_val = _hook_score(txt)
         # Test original ad detection
@@ -694,7 +694,7 @@ async def get_candidates(
         
         # Get candidates using ClipScore with platform/genre optimization
         # Auto-recommend the best platform based on content analysis
-        from services.secret_sauce import find_viral_clips, PLATFORM_GENRE_MULTIPLIERS
+        from services.secret_sauce_pkg import find_viral_clips, PLATFORM_GENRE_MULTIPLIERS
         
         # Analyze content to recommend best platform
         recommended_platform = "tiktok"  # Default fallback
@@ -735,7 +735,7 @@ async def get_candidates(
             return {"ok": False, "error": "No candidates found for this episode."}
         
         # Add platform mapping info to response
-        from services.secret_sauce import resolve_platform
+        from services.secret_sauce_pkg import resolve_platform
         backend_platform = resolve_platform(frontend_platform)
         
         # Record successful candidate generation (if monitoring available)
@@ -1314,7 +1314,7 @@ async def candidate_debug(
     Recompute features/score for a single [start,end] to inspect details.
     """
     try:
-        from services.secret_sauce import compute_features, score_segment, explain_segment
+        from services.secret_sauce_pkg import compute_features, score_segment, explain_segment
         from config_loader import get_config
         
         # Get episode
@@ -1372,7 +1372,7 @@ class WeightSandbox(BaseModel):
 async def sandbox_score(body: WeightSandbox):
     """Test different weight configurations on a specific clip segment"""
     try:
-        from services.secret_sauce import compute_features, score_segment
+        from services.secret_sauce_pkg import compute_features, score_segment
         
         # Get episode
         episode = await episode_service.get_episode(body.file_id)
@@ -1494,7 +1494,7 @@ debug_router = APIRouter(prefix="/api/debug")
 async def inspect_clip(payload: dict):
     """Inspect why a clip would pass/fail quality gates"""
     try:
-        from services.secret_sauce import _hook_score, _ad_penalty, _payoff_presence
+        from services.secret_sauce_pkg import _hook_score, _ad_penalty, _payoff_presence
         
         # Extract payload data
         text = payload.get("text", "")

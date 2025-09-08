@@ -18,7 +18,7 @@ from config.settings import (
     DURATION_TARGET_MIN, DURATION_TARGET_MAX
 )
 
-from services.secret_sauce import compute_features_v4, score_segment_v4, explain_segment_v4, viral_potential_v4, get_clip_weights
+from services.secret_sauce_pkg import compute_features_v4, score_segment_v4, explain_segment_v4, viral_potential_v4, get_clip_weights
 from services.viral_moment_detector import ViralMomentDetector
 from services.progress_writer import write_progress
 from config_loader import get_config
@@ -90,6 +90,28 @@ class ClipScoreService:
         """Check if text contains numbers (lists, statistics, etc.)"""
         return 1.0 if re.search(r'\d', text) else 0.0
 
+    def _ad_proxy(self, text: str) -> bool:
+        """Cheap text-based advertisement detection"""
+        if not text:
+            return False
+
+        t = text.lower()
+        ad_phrases = [
+            "sponsored by",
+            "brought to you by",
+            "use code",
+            "promo code",
+            "check out",
+            "visit our",
+            "subscribe",
+            "my course",
+            "my book",
+            "link in bio",
+            "special offer",
+            "limited time",
+        ]
+        return any(p in t for p in ad_phrases)
+
     def pre_rank_candidates(self, segments: List[Dict], episode_id: str) -> List[Dict]:
         """Pre-rank candidates using cheap features only"""
         if not PRERANK_ENABLED:
@@ -97,7 +119,12 @@ class ClipScoreService:
             
         logger.info(f"Starting pre-rank scoring for {len(segments)} segments")
         write_progress(episode_id, "scoring:prerank", 10, "Pre-ranking candidates...")
-        
+
+        # Cheap ad flagging so early stages can skip obvious promotions
+        for seg in segments:
+            if not seg.get('is_advertisement', False):
+                seg['is_advertisement'] = self._ad_proxy(seg.get('text', ''))
+
         # Filter out ads first
         candidates = [seg for seg in segments if not seg.get('is_advertisement', False)]
         
@@ -1087,7 +1114,7 @@ class ClipScoreService:
     async def get_candidates(self, episode_id: str, platform: str = "tiktok_reels", genre: str = None) -> List[Dict]:
         """Get AI-scored clip candidates for an episode with platform/genre optimization"""
         try:
-            from services.secret_sauce import (
+            from services.secret_sauce_pkg import (
                 compute_features_v4, score_segment_v4,
                 resolve_platform, detect_podcast_genre
             )
@@ -1127,7 +1154,7 @@ class ClipScoreService:
                 features = seg.get("features", {})
                 
                 # Generate title and grades
-                from services.secret_sauce import _heuristic_title, _grade_breakdown
+                from services.secret_sauce_pkg import _heuristic_title, _grade_breakdown
                 
                 # Create enhanced features dict for title generation
                 enhanced_features = {

@@ -164,7 +164,7 @@ def score_hook_v5_enhanced(
 
     if audio_data is not None and sr is not None:
         try:
-            from services.secret_sauce import compute_audio_hook_modifier
+            from services.secret_sauce_pkg import compute_audio_hook_modifier
             audio_mod = float(compute_audio_hook_modifier(audio_data, sr, start_time))
         except Exception:
             audio_mod = 0.0

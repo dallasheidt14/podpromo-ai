@@ -2972,7 +2972,14 @@ def compute_features_v4(segment: Dict, audio_file: str, y_sr=None, genre: str = 
     niche_penalty, niche_reason = _calculate_niche_penalty(text, genre)
     
     # ENHANCED AUDIO ANALYSIS: Compute actual audio arousal with intelligent fallback
-    audio_arousal = _audio_prosody_score(audio_file, segment["start"], segment["end"], text=text, genre=genre)
+    audio_arousal = _audio_prosody_score(
+        audio_file,
+        segment["start"],
+        segment["end"],
+        y_sr=y_sr,
+        text=text,
+        genre=genre,
+    )
     
     # ENHANCED TEXT AROUSAL: Genre-aware text arousal scoring
     text_arousal = _arousal_score_text(text, genre)
@@ -4727,7 +4734,14 @@ def compute_features(segment: Dict, audio_file: str, y_sr=None, version: str = "
         
         feats = {
             "hook_score": _hook_score(text),
-            "arousal_score": _audio_prosody_score(audio_file, segment["start"], segment["end"], y_sr=y_sr),
+            "arousal_score": _audio_prosody_score(
+                audio_file,
+                segment["start"],
+                segment["end"],
+                y_sr=y_sr,
+                text=text,
+                genre=genre,
+            ),
             "emotion_score": _emotion_score(text),
             "question_score": _question_or_list(text),
             "payoff_score": _payoff_presence(text),
