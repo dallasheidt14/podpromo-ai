@@ -51,6 +51,12 @@ from .features import (
     debug_segment_scoring,
 )
 
+# Import remaining functions from monolithic file temporarily
+from .__init__monolithic import (
+    _grade_breakdown,
+    _heuristic_title,
+)
+
 # Export all public functions and classes
 __all__ = [
     # Genre system
@@ -101,4 +107,8 @@ __all__ = [
     # Utility functions
     "create_segment_hash",
     "debug_segment_scoring",
+    
+    # Additional functions from monolithic file
+    "_grade_breakdown",
+    "_heuristic_title",
 ]

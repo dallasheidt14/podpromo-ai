@@ -248,6 +248,43 @@ def _loopability_heuristic(text: str) -> float:
     """Enhanced loopability scoring with perfect-loop detection, quotability patterns, and curiosity enders"""
     if not text: 
         return 0.0
+    
+    t = text.lower()
+    score = 0.0
+    
+    # Perfect loop detection - ends where it begins
+    words = t.split()
+    if len(words) >= 3:
+        first_phrase = " ".join(words[:3])
+        last_phrase = " ".join(words[-3:])
+        if first_phrase == last_phrase:
+            score += 0.4
+    
+    # Quotability patterns
+    quotable_patterns = [
+        r"here's the thing",
+        r"the truth is",
+        r"what i learned",
+        r"the key is",
+        r"here's why",
+        r"the secret",
+        r"the trick"
+    ]
+    
+    for pattern in quotable_patterns:
+        if re.search(pattern, t):
+            score += 0.2
+            break
+    
+    # Curiosity enders - questions or incomplete thoughts
+    if t.endswith('?') or t.endswith('...') or t.endswith('but'):
+        score += 0.15
+    
+    # Short, punchy statements
+    if len(words) <= 8 and any(word in t for word in ['insane', 'crazy', 'wild', 'epic', 'amazing']):
+        score += 0.1
+    
+    return float(np.clip(score, 0.0, 1.0))
 
 def _ad_penalty(text: str) -> dict:
     """Enhanced ad detection with comprehensive patterns"""
@@ -414,6 +451,26 @@ def _audio_prosody_score(audio_path: str, start: float, end: float, y_sr=None, t
         if len(y) == 0:
             # Fallback to text-based estimation
             return _text_based_audio_estimation(text, genre)
+        
+        # Compute audio features
+        rms = librosa.feature.rms(y=y)[0]
+        spectral_centroids = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
+        zero_crossing_rate = librosa.feature.zero_crossing_rate(y)[0]
+        
+        # Calculate arousal score based on audio features
+        rms_mean = np.mean(rms)
+        spectral_mean = np.mean(spectral_centroids)
+        zcr_mean = np.mean(zero_crossing_rate)
+        
+        # Normalize and combine features
+        arousal_score = (rms_mean * 0.4 + spectral_mean * 0.3 + zcr_mean * 0.3)
+        arousal_score = float(np.clip(arousal_score, 0.0, 1.0))
+        
+        return arousal_score
+        
+    except Exception as e:
+        logger.warning(f"Audio analysis failed: {e}, falling back to text-based estimation")
+        return _text_based_audio_estimation(text, genre)
 
 def _arousal_score_text(text: str, genre: str = 'general') -> float:
     """Enhanced text arousal scoring with genre awareness and intensity levels"""
@@ -487,6 +544,56 @@ def _detect_payoff(text: str, genre: str = 'general') -> tuple[float, str]:
     t = text.lower()
     score = 0.0
     reasons = []
+    
+    # Resolution patterns
+    resolution_patterns = [
+        r"(so|therefore|thus|as a result|consequently)",
+        r"(the answer is|the solution is|here's how)",
+        r"(that's why|which explains|this means)",
+        r"(in conclusion|to sum up|the bottom line)"
+    ]
+    
+    for pattern in resolution_patterns:
+        if re.search(pattern, t):
+            score += 0.2
+            reasons.append("resolution")
+            break
+    
+    # Value delivery patterns
+    value_patterns = [
+        r"(here's what|the key|the secret|the trick)",
+        r"(you should|you need to|you must|you have to)",
+        r"(this will|this can|this helps|this makes)",
+        r"(the benefit|the advantage|the upside)"
+    ]
+    
+    for pattern in value_patterns:
+        if re.search(pattern, t):
+            score += 0.15
+            reasons.append("value_delivery")
+            break
+    
+    # Genre-specific payoff patterns
+    if genre == 'fantasy_sports':
+        sports_patterns = [
+            r"(start|bench|target|avoid|sleeper|bust)",
+            r"(this week|next week|playoffs|season)",
+            r"(league winner|championship|title)"
+        ]
+        for pattern in sports_patterns:
+            if re.search(pattern, t):
+                score += 0.1
+                reasons.append("sports_payoff")
+                break
+    
+    # Penalty for questions without answers
+    if "?" in t and not any(word in t for word in ["answer", "solution", "here's", "the key"]):
+        score -= 0.1
+        reasons.append("question_without_answer")
+    
+    final_score = float(np.clip(score, 0.0, 1.0))
+    reason_str = ";".join(reasons) if reasons else "no_payoff"
+    return final_score, reason_str
 
 def _detect_insight_content(text: str, genre: str = 'general') -> tuple[float, str]:
     """Detect if content contains actual insights vs. intro/filler material"""
@@ -615,6 +722,7 @@ from services.secret_sauce_pkg.__init__monolithic import (
     info_density_score_v2,
     question_list_score_v2,
     emotion_score_v2,
+    _platform_length_score_v2,
 )
 
 # Export all functions
