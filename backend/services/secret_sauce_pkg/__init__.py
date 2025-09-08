@@ -8,7 +8,6 @@ from .genres import GenreProfile, GenreAwareScorer
 from .genre_profiles import FantasySportsGenreProfile, ComedyGenreProfile
 from .scoring import (
     get_clip_weights,
-    CLIP_WEIGHTS,
     score_segment_v4,
     explain_segment_v4,
     viral_potential_v4,
@@ -62,7 +61,6 @@ __all__ = [
     
     # Scoring functions
     "get_clip_weights",
-    "CLIP_WEIGHTS",
     "score_segment_v4",
     "explain_segment_v4", 
     "viral_potential_v4",

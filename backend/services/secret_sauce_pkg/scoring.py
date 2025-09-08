@@ -18,13 +18,8 @@ def get_clip_weights():
         logger.warning("Weights normalized from %.2f to 1.00", ws)
     return weights
 
-CLIP_WEIGHTS = get_clip_weights()
-
-def score_segment_v4(features: Dict, weights: Dict = None, apply_penalties: bool = True, genre: str = 'general', platform: str = None) -> Dict:
+def score_segment_v4(features: Dict, apply_penalties: bool = True, genre: str = 'general', platform: str = None) -> Dict:
     """V4 Multi-path scoring system with genre awareness and platform multipliers"""
-    if weights is None:
-        weights = get_clip_weights()
-    
     f = features
     
     # Get genre-specific scoring paths
@@ -118,9 +113,10 @@ def score_segment_v4(features: Dict, weights: Dict = None, apply_penalties: bool
         "bonus_reasons": bonus_reasons
     }
 
-def explain_segment_v4(features: Dict, weights: Dict = None, genre: str = 'general') -> Dict:
+def explain_segment_v4(features: Dict, genre: str = 'general', scoring_result: Dict = None) -> Dict:
     """Explain V4 scoring results"""
-    scoring_result = score_segment_v4(features, weights, genre=genre)
+    if scoring_result is None:
+        scoring_result = score_segment_v4(features, genre=genre)
     f = features
     
     strengths = []
