@@ -1,242 +1,426 @@
-'use client';
+// components/ClipGallery.tsx
+"use client";
+import React, { useMemo, useState, useEffect } from "react";
+import Modal from "./Modal";
+import { Clip } from "./ClipDetail";
 
-import { useState } from 'react';
-import { motion } from 'framer-motion';
-import { Video, Download, Play, Clock, Star, CheckCircle, AlertCircle, Eye } from 'lucide-react';
-import { Clip } from '@shared/types';
-import { toPct, toPctLabel, toHMMSS, toSec } from '@shared/format';
-import { playPreview, stopPreview, isPlaying, getCurrentSrc } from '@shared/previewAudio';
-import ClipDetail from './ClipDetail';
-
-interface ClipGalleryProps {
+type Props = {
   clips: Clip[];
-}
+  emptyMessage?: string;
+  onClipUpdate?: (clipId: string, updates: Partial<Clip>) => void;
+};
 
-export default function ClipGallery({ clips }: ClipGalleryProps) {
-  const [selectedClip, setSelectedClip] = useState<Clip | null>(null);
+export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onClipUpdate }: Props) {
+  const [open, setOpen] = useState(false);
+  const [selected, setSelected] = useState<Clip | null>(null);
+  const [playingClipId, setPlayingClipId] = useState<string | null>(null);
+  const [generating, setGenerating] = useState(false);
+  const [titleVariants, setTitleVariants] = useState<string[]>([]);
+  const [currentTitle, setCurrentTitle] = useState<string>("");
 
-  const getScoreColor = (score: number): string => {
-    if (score >= 0.8) return 'text-green-400 bg-green-900/30';
-    if (score >= 0.6) return 'text-blue-400 bg-blue-900/30';
-    if (score >= 0.4) return 'text-yellow-400 bg-yellow-900/30';
-    return 'text-gray-400 bg-gray-900/30';
-  };
+  // Debug: Log clips when they change
+  useEffect(() => {
+    console.log('ClipGallery received clips:', clips);
+    if (clips && clips.length > 0) {
+      console.log('First clip previewUrl:', clips[0].previewUrl);
+      console.log('First clip features:', clips[0].features);
+      
+      // Auto-generate titles for clips that need them
+      clips.forEach((clip, index) => {
+        const transcript = clip.transcript || clip.text;
+        const isTranscriptSnippet = clip.title && clip.title.length > 50 && transcript && clip.title === transcript.substring(0, clip.title.length);
+        console.log(`Checking clip ${index} for title generation:`, {
+          id: clip.id,
+          title: clip.title,
+          text: transcript?.substring(0, 100) + '...',
+          isTranscriptSnippet,
+          needsTitle: (!clip.title || isTranscriptSnippet) && transcript
+        });
+        
+        // Force title generation for the first clip to test
+        if (index === 0) {
+          console.log('FORCE GENERATING TITLE FOR FIRST CLIP:', clip.id);
+          generateNewTitle(clip.id);
+        } else if ((!clip.title || isTranscriptSnippet) && transcript) {
+          console.log('Auto-generating title for clip:', clip.id);
+          generateNewTitle(clip.id);
+        }
+      });
+    }
+  }, [clips]);
 
-  const getStatusIcon = (status: string) => {
-    switch (status) {
-      case 'completed':
-        return <CheckCircle className="w-4 h-4 text-green-400" />;
-      case 'generating':
-        return <Clock className="w-4 h-4 text-blue-400 animate-spin" />;
-      case 'error':
-        return <AlertCircle className="w-4 h-4 text-red-400" />;
-      default:
-        return <Clock className="w-4 h-4 text-gray-400" />;
+  // Initialize current title when selected clip changes
+  useEffect(() => {
+    if (selected) {
+      setCurrentTitle(selected.title || "");
+      setTitleVariants([]);
+      
+      // Auto-backfill title if missing or if it's just a transcript snippet
+      const transcript = selected.transcript || selected.text;
+      const isTranscriptSnippet = selected.title && selected.title.length > 50 && transcript && selected.title === transcript.substring(0, selected.title.length);
+      console.log('Checking selected clip for title generation:', {
+        id: selected.id,
+        title: selected.title,
+        transcript: transcript?.substring(0, 100) + '...',
+        isTranscriptSnippet,
+        needsTitle: (!selected.title || isTranscriptSnippet) && transcript
+      });
+      
+      if ((!selected.title || isTranscriptSnippet) && transcript) {
+        console.log('Auto-generating title for selected clip:', selected.id);
+        generateNewTitle(selected.id);
+      }
+    }
+  }, [selected]);
+
+  const sorted = useMemo(
+    () =>
+      [...(clips || [])].sort((a, b) => (b.score ?? 0) - (a.score ?? 0)),
+    [clips]
+  );
+
+  const handlePlayPause = (clip: Clip) => {
+    console.log('Play button clicked for clip:', clip.id);
+    console.log('Clip previewUrl:', clip.previewUrl);
+    console.log('Clip features:', clip.features);
+    
+    if (playingClipId === clip.id) {
+      // Stop current audio
+      const audio = document.querySelector(`audio[data-clip-id="${clip.id}"]`) as HTMLAudioElement;
+      if (audio) {
+        audio.pause();
+        audio.currentTime = 0;
+      }
+      setPlayingClipId(null);
+    } else {
+      // Stop any currently playing audio
+      const allAudio = document.querySelectorAll('audio');
+      allAudio.forEach(audio => {
+        (audio as HTMLAudioElement).pause();
+        (audio as HTMLAudioElement).currentTime = 0;
+      });
+      // Start new audio
+      setPlayingClipId(clip.id);
+      // Trigger play after state update
+      setTimeout(() => {
+        const newAudio = document.querySelector(`audio[data-clip-id="${clip.id}"]`) as HTMLAudioElement;
+        if (newAudio) {
+          console.log('Attempting to play audio:', newAudio.src);
+          newAudio.play().catch(e => console.log('Audio play failed:', e));
+        } else {
+          console.log('Audio element not found');
+        }
+      }, 100);
     }
   };
 
+  const generateNewTitle = async (clipId: string) => {
+    console.log('Generating title for clip:', clipId);
+    setGenerating(true);
+    try {
+      const response = await fetch(`http://localhost:8000/api/clips/${clipId}/titles`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          platform: 'shorts',
+          n: 6,
+          allow_emoji: true
+        }),
+        cache: 'no-store',
+      });
+      
+      console.log('Title generation response status:', response.status);
+      
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error('Title generation failed:', response.status, errorText);
+        throw new Error(`HTTP ${response.status}: ${errorText}`);
+      }
+      
+      const data = await response.json();
+      console.log('Title generation response data:', data);
+      console.log('Generated title chosen:', data.chosen);
+      console.log('Generated title variants:', data.variants);
+      
+      setCurrentTitle(data.chosen);
+      setTitleVariants(data.variants);
+      
+      // Update the selected clip's title in the parent state
+      if (selected) {
+        console.log('Updating selected clip title from', selected.title, 'to', data.chosen);
+        selected.title = data.chosen;
+      }
+      
+      // Notify parent component to update the clip
+      if (onClipUpdate) {
+        console.log('Notifying parent of title update for clip:', clipId, 'new title:', data.chosen);
+        onClipUpdate(clipId, { title: data.chosen });
+      }
+    } catch (error) {
+      console.error('[titles] generate error', error);
+      // Graceful fallback: keep the old title
+    } finally {
+      setGenerating(false);
+    }
+  };
 
+  const copyTitle = (title: string) => {
+    navigator.clipboard.writeText(title);
+  };
+
+  const updateTitle = async (clipId: string, newTitle: string) => {
+    try {
+      const response = await fetch(`http://localhost:8000/api/clips/${clipId}/title`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ platform: 'shorts', title: newTitle })
+      });
+      
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      
+      setCurrentTitle(newTitle);
+      
+      // Update the selected clip's title in the parent state
+      if (selected) {
+        selected.title = newTitle;
+      }
+    } catch (error) {
+      console.error('[titles] update error', error);
+    }
+  };
+
+  if (!clips?.length) {
+    return (
+      <div className="rounded-2xl border border-dashed border-neutral-300 p-8 text-center text-neutral-500">
+        {emptyMessage}
+      </div>
+    );
+  }
 
   return (
     <>
-      <div className="rounded-2xl border border-[#1e2636] bg-white/[0.04] shadow-[0_10px_30px_rgba(0,0,0,0.35)] p-6 text-white">
-        <div className="flex items-center justify-between mb-6">
-          <div className="flex items-center space-x-3">
-            <div className="w-8 h-8 bg-white/10 rounded-lg flex items-center justify-center">
-              <Video className="w-4 h-4 text-white" />
-            </div>
-            <h3 className="text-lg font-semibold text-white">Clips</h3>
-          </div>
-          <span className="text-sm text-white/70">{clips.length} clips</span>
-        </div>
-
-      <div className="space-y-4">
-        {clips.map((clip, index) => (
-          <motion.div
-            key={clip.id}
-            initial={{ opacity: 0, y: 20 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.3, delay: index * 0.1 }}
-            className="relative rounded-xl overflow-hidden border border-[#1e2636] bg-white/[0.04] hover:border-white/35 transition cursor-pointer"
-            onClick={() => { 
-              console.log('[open]', clip.id); 
-              setSelectedClip(clip); 
-            }}
-          >
-            <div className="p-3">
-              <div className="flex items-center gap-2 mb-2">
-                <span className={`text-[10px] font-semibold text-white px-1.5 py-0.5 rounded ${getScoreColor(clip.score)}`}>
-                  {toPctLabel(Number(clip.score ?? 0))}
-                </span>
-                <span className="text-[10px] px-1.5 py-0.5 rounded bg-white/10 text-white/80 capitalize">
-                  {clip.status || "completed"}
-                </span>
-              </div>
-
-              <div className="mt-2 text-sm font-semibold line-clamp-2 text-white">
-                {clip.title || clip.text?.slice(0, 80) || "Untitled clip"}
-              </div>
-
-              {clip.text && (
-                <div className="mt-1 text-xs text-white/60 line-clamp-2">
-                  {clip.text}
-                </div>
-              )}
-
-              <div className="mt-3 flex items-center justify-between text-xs text-white/50">
-                <span>{toHMMSS(Number(clip.startTime ?? 0))} - {toHMMSS(Number(clip.endTime ?? 0))}</span>
-                <span>{toSec(Number(clip.duration ?? 0))}s</span>
-              </div>
-
-              {clip.status === 'error' && clip.error && (
-                <div className="mt-3 p-3 bg-red-900/30 border border-red-500/30 rounded-lg">
-                  <p className="text-sm text-red-400">
-                    <AlertCircle className="w-4 h-4 inline mr-2" />
-                    {clip.error}
-                  </p>
-                </div>
-              )}
-
-              {clip.status === 'completed' && (
-                <div className="mt-3 flex space-x-2">
-                  <button
-                    onClick={(e) => { 
-                      e.stopPropagation(); 
-                      console.log('[open-btn]', clip.id); 
-                      setSelectedClip(clip); 
-                    }}
-                    className="px-3 py-1.5 text-xs rounded border border-[#2b3448] text-white hover:bg-white/5"
-                    title="View detailed clip information"
-                    aria-label="View detailed clip information"
+      <div className="grid gap-4 sm:gap-6 grid-cols-1 sm:grid-cols-2 lg:grid-cols-3">
+        {sorted.map((clip) => {
+          const isVideo = clip.previewUrl?.match(/\.(mp4|mov|webm|avi)$/i);
+          const isAudio = clip.previewUrl?.match(/\.(mp3|m4a|aac|ogg|wav)$/i);
+          return (
+            <div
+              key={clip.id}
+              className="group rounded-2xl border-2 border-blue-100 bg-gradient-to-br from-white to-blue-50 shadow-card hover:shadow-card-hover transition-all duration-300 hover:border-blue-300 relative overflow-hidden"
+            >
+              {/* Decorative accent */}
+              <div className="absolute top-0 right-0 w-16 h-16 bg-yellow-200 rounded-full -translate-y-8 translate-x-8 opacity-30 group-hover:opacity-50 transition-opacity"></div>
+              <div className="aspect-video w-full overflow-hidden rounded-t-2xl bg-neutral-100">
+                {isVideo ? (
+                  <video
+                    src={clip.previewUrl}
+                    className="h-full w-full object-cover"
+                    muted
+                    playsInline
+                    preload="metadata"
+                  />
+                ) : isAudio ? (
+                  <div 
+                    className="flex h-full w-full items-center justify-center bg-gradient-to-br from-blue-50 to-purple-50 relative cursor-pointer hover:from-blue-100 hover:to-purple-100 transition-colors"
+                    onClick={() => handlePlayPause(clip)}
                   >
-                    <Eye className="w-3 h-3" />
-                    <span>View Details</span>
-                  </button>
-                  {clip.previewUrl && (
-                    <button
-                      onClick={(e) => { 
-                        e.stopPropagation(); 
-                        playPreview(clip.previewUrl!); 
-                      }}
-                      className="px-3 py-1.5 text-xs rounded border border-[#2b3448] text-white hover:bg-white/5 flex items-center space-x-1"
-                      title={`Preview clip starting at ${Math.round(clip.start_time || 0)}s`}
-                      aria-label={`Preview clip starting at ${Math.round(clip.start_time || 0)}s`}
-                    >
-                      <Play className="w-3 h-3" />
-                      <span>Preview</span>
-                    </button>
+                    {/* Waveform Visualization */}
+                    <div className="absolute inset-0 flex items-center justify-center px-4">
+                      <div className="flex items-end space-x-1 h-16">
+                        {Array.from({ length: 20 }, (_, i) => {
+                          const height = Math.random() * 0.8 + 0.2; // Random height between 20% and 100%
+                          const isActive = playingClipId === clip.id;
+                          return (
+                            <div
+                              key={i}
+                              className={`w-1 rounded-full transition-all duration-150 ${
+                                isActive 
+                                  ? 'bg-blue-500 animate-pulse' 
+                                  : 'bg-blue-300'
+                              }`}
+                              style={{ height: `${height * 100}%` }}
+                            />
+                          );
+                        })}
+                      </div>
+                    </div>
+                    
+                    {/* Play/Pause Button Overlay */}
+                    <div className="relative z-10">
+                      <div className="w-16 h-16 bg-white rounded-full flex items-center justify-center shadow-lg hover:shadow-xl transition-shadow">
+                        {playingClipId === clip.id ? (
+                          <svg width="24" height="24" viewBox="0 0 24 24" className="text-blue-600">
+                            <rect x="6" y="4" width="4" height="16" fill="currentColor"/>
+                            <rect x="14" y="4" width="4" height="16" fill="currentColor"/>
+                          </svg>
+                        ) : (
+                          <svg width="24" height="24" viewBox="0 0 24 24" className="text-blue-600">
+                            <path d="M8 5v14l11-7z" fill="currentColor"/>
+                          </svg>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="flex h-full w-full items-center justify-center text-neutral-400">
+                    No preview
+                  </div>
+                )}
+              </div>
+
+              <div className="p-4 space-y-3">
+                <div className="flex items-start justify-between gap-2">
+                  <h3 className="line-clamp-2 font-medium text-neutral-900">
+                    {clip.title || clip.text?.slice(0, 60) + "..." || "Untitled clip"}
+                  </h3>
+                  {typeof clip.score === "number" && (
+                    <span className="shrink-0 rounded-full bg-gradient-to-r from-blue-500 to-blue-600 px-3 py-1.5 text-xs font-bold text-white shadow-lg">
+                      ⭐ {Math.round(clip.score * 100)}/100
+                    </span>
                   )}
+                </div>
+
+                {/* Timing Information */}
+                {clip.start != null && clip.end != null && (
+                  <div className="text-xs text-blue-800 bg-gradient-to-r from-blue-100 to-yellow-100 px-3 py-2 rounded-lg border border-blue-200 relative z-10">
+                    <span className="font-semibold">⏱️ Duration: {Math.max(0, Math.round(clip.end - clip.start))}s ({Math.round(clip.start)}s-{Math.round(clip.end)}s)</span>
+                  </div>
+                )}
+
+                <div className="flex flex-wrap gap-2 relative z-10">
+                  <button
+                    className="btn btn-primary bg-gradient-to-r from-blue-500 to-blue-600 hover:from-blue-600 hover:to-blue-700 text-white border-0 shadow-lg hover:shadow-xl transition-all duration-300"
+                    onClick={() => {
+                      setSelected(clip);
+                      setOpen(true);
+                    }}
+                  >
+                    View details
+                  </button>
+
+                  <button
+                    className="btn bg-gradient-to-r from-yellow-400 to-yellow-500 hover:from-yellow-500 hover:to-yellow-600 text-white border-0 shadow-lg hover:shadow-xl transition-all duration-300"
+                    onClick={() => handlePlayPause(clip)}
+                  >
+                    {playingClipId === clip.id ? '⏸️ Pause Audio' : '🎵 Preview Audio'}
+                  </button>
+
+                  {clip.previewUrl && !isAudio && (
+                    <a className="btn" href={clip.previewUrl} target="_blank" rel="noreferrer">
+                      Preview
+                    </a>
+                  )}
+
                   {clip.downloadUrl && (
-                    <a
-                      href={clip.downloadUrl}
-                      download
-                      onClick={(e) => e.stopPropagation()}
-                      className="px-3 py-1.5 text-xs rounded border border-[#2b3448] text-white hover:bg-white/5 flex items-center space-x-1"
-                      title="Download clip file"
-                      aria-label="Download clip file"
-                    >
-                      <Download className="w-3 h-3" />
-                      <span>Download</span>
+                    <a className="btn" href={clip.downloadUrl} download>
+                      Download
                     </a>
                   )}
                 </div>
-              )}
+              </div>
             </div>
-
-            {/* Clip Score Breakdown */}
-            <div className="mt-4 pt-4 border-t border-[#1e2636]">
-              <h5 className="text-sm font-medium text-white/80 mb-2">ClipScore Breakdown</h5>
-              {clip.features ? (
-                <div className="mt-3 grid grid-cols-2 gap-1 text-xs">
-                  {[
-                    ['Hook', clip.features.hook_score ?? clip.features.hook],
-                    ['Emotion', clip.features.emotion_score ?? clip.features.emotion],
-                    ['Prosody', clip.features.arousal_score ?? clip.features.prosody ?? clip.features.arousal],
-                    ['Payoff', clip.features.payoff_score ?? clip.features.payoff],
-                    ['Loop', clip.features.loopability ?? clip.features.loop],
-                  ].map(([label, val]) =>
-                    val == null ? null : (
-                      <div key={label} className="flex items-center justify-between">
-                        <span className="text-white/70">{label}</span>
-                        <span className="font-medium text-white">{toPctLabel(Number(val ?? 0))}</span>
-                      </div>
-                    )
-                  )}
-                </div>
-              ) : (
-                <div className="grid grid-cols-2 md:grid-cols-5 gap-2 text-xs">
-                  <div className="text-center">
-                    <div className="w-full bg-white/10 rounded-full h-2 mb-1">
-                      <div 
-                        className="bg-white/80 h-2 rounded-full" 
-                        style={{ width: `${(clip.score * 0.25) * 100}%` }}
-                      ></div>
-                    </div>
-                    <span className="text-white/70">Hook</span>
-                  </div>
-                  <div className="text-center">
-                    <div className="w-full bg-white/10 rounded-full h-2 mb-1">
-                      <div 
-                        className="bg-white/80 h-2 rounded-full" 
-                        style={{ width: `${(clip.score * 0.20) * 100}%` }}
-                      ></div>
-                    </div>
-                    <span className="text-white/70">Emotion</span>
-                  </div>
-                  <div className="text-center">
-                    <div className="w-full bg-white/10 rounded-full h-2 mb-1">
-                      <div 
-                        className="bg-white/80 h-2 rounded-full" 
-                        style={{ width: `${(clip.score * 0.20) * 100}%` }}
-                      ></div>
-                    </div>
-                    <span className="text-white/70">Prosody</span>
-                  </div>
-                  <div className="text-center">
-                    <div className="w-full bg-white/10 rounded-full h-2 mb-1">
-                      <div 
-                        className="bg-white/80 h-2 rounded-full" 
-                        style={{ width: `${(clip.score * 0.20) * 100}%` }}
-                      ></div>
-                    </div>
-                    <span className="text-white/70">Payoff</span>
-                  </div>
-                  <div className="text-center">
-                    <div className="w-full bg-white/10 rounded-full h-2 mb-1">
-                      <div 
-                        className="bg-white/80 h-2 rounded-full" 
-                        style={{ width: `${(clip.score * 0.15) * 100}%` }}
-                      ></div>
-                    </div>
-                    <span className="text-white/70">Loop</span>
-                  </div>
-                </div>
-              )}
-            </div>
-          </motion.div>
-        ))}
+          );
+        })}
       </div>
 
-      {/* Download All Button */}
-      {clips.some(clip => clip.status === 'completed' && clip.downloadUrl) && (
-        <div className="mt-6 pt-6 border-t border-[#1e2636]">
-          <div className="text-center">
-            <p className="text-sm text-white/60 mb-2">
-              {clips.filter(clip => clip.status === 'completed' && clip.downloadUrl).length} clips ready for download
-            </p>
-            <p className="text-xs text-white/50">
-              Click individual download buttons above to get specific clips
-            </p>
-          </div>
-        </div>
+      {/* Hidden audio element for playback */}
+      {playingClipId && (
+        <audio
+          key={playingClipId}
+          data-clip-id={playingClipId}
+          src={clips.find(c => c.id === playingClipId)?.previewUrl}
+          autoPlay
+          onEnded={() => setPlayingClipId(null)}
+          onError={() => setPlayingClipId(null)}
+        />
       )}
-      </div>
 
-      {/* Clip Detail Modal */}
-      <ClipDetail 
-        clip={selectedClip} 
-        onClose={() => setSelectedClip(null)} 
-      />
+      <Modal open={open} onClose={() => setOpen(false)}>
+        <div>
+          <h4 className="text-xl font-semibold mb-4">{currentTitle || selected?.title || "Clip Details"}</h4>
+          {selected?.score && (
+            <div className="mb-6">
+              <div className="text-4xl font-bold text-gray-900">
+                {Math.round((selected.score * 100))}
+                <span className="text-2xl text-gray-500">/100</span>
+              </div>
+            </div>
+          )}
+
+          {/* Timing Information */}
+          {selected?.start != null && selected?.end != null && (
+            <div className="mb-6 p-4 bg-blue-50 rounded-lg border border-blue-200">
+              <div className="flex items-center gap-2">
+                <svg width="20" height="20" viewBox="0 0 24 24" className="text-blue-600">
+                  <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z" fill="currentColor"/>
+                </svg>
+                <span className="text-lg font-semibold text-blue-900">
+                  Duration: {Math.max(0, Math.round(selected.end - selected.start))}s ({Math.round(selected.start)}s-{Math.round(selected.end)}s)
+                </span>
+              </div>
+            </div>
+          )}
+
+          {/* Score Breakdown Section */}
+          {selected && (
+            <div className="mb-6 p-4 bg-gray-50 rounded-lg">
+              <h5 className="text-sm font-medium text-gray-700 mb-3">Score Breakdown</h5>
+              <div className="grid grid-cols-4 gap-2">
+                {[
+                  { key: 'hook_score', name: 'Hook', weight: 0.35, description: 'Attention-grabbing opening that hooks viewers in the first 3 seconds' },
+                  { key: 'arousal_score', name: 'Arousal', weight: 0.20, description: 'Energy and excitement level that keeps viewers engaged' },
+                  { key: 'emotion_score', name: 'Emotion', weight: 0.15, description: 'Emotional engagement that creates connection and relatability' },
+                  { key: 'question_score', name: 'Q/List', weight: 0.10, description: 'Questions or list format that encourages interaction and completion' },
+                  { key: 'payoff_score', name: 'Payoff', weight: 0.10, description: 'Clear value or insight delivered that makes viewers feel they learned something' },
+                  { key: 'info_density', name: 'Info', weight: 0.05, description: 'Information density - how much valuable content is packed in' },
+                  { key: 'loopability', name: 'Loop', weight: 0.05, description: 'Replayability factor - how likely viewers are to watch again' },
+                  { key: 'platform_len_match', name: 'Length', weight: 0.05, description: 'Optimal length for the target platform (Shorts/Reels/TikTok)' }
+                ].map(({ key, name, weight, description }) => {
+                  // Get score from features object (normalized in normalize.ts)
+                  const score = selected.features?.[key] || 0;
+                  const percentage = Math.round(score * 100);
+                  const contribution = Math.round(score * weight * 100);
+                  
+                  return (
+                    <div
+                      key={key}
+                      className="relative group cursor-help"
+                      title={description}
+                    >
+                      <div className="bg-white rounded-lg p-2 border border-gray-200 hover:border-gray-300 transition-colors">
+                        <div className="text-xs font-medium text-gray-600 mb-1">{name}</div>
+                        <div className="text-lg font-bold text-gray-900">{percentage}%</div>
+                        <div className="text-xs text-gray-500">+{contribution} pts</div>
+                      </div>
+                      
+                      {/* Tooltip */}
+                      <div className="absolute bottom-full left-1/2 transform -translate-x-1/2 mb-2 px-3 py-2 bg-black text-white text-xs rounded-lg opacity-0 group-hover:opacity-100 transition-opacity duration-200 pointer-events-none z-10 max-w-xs text-center">
+                        {description}
+                        <div className="absolute top-full left-1/2 transform -translate-x-1/2 border-4 border-transparent border-t-black"></div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+          
+          {selected?.text && (
+            <div className="mb-4">
+              <h5 className="font-medium mb-2">Transcript:</h5>
+              <p className="text-sm text-gray-600">{selected.text}</p>
+            </div>
+          )}
+          {selected?.previewUrl && (
+            <div className="mb-4">
+              <h5 className="font-medium mb-2">Preview:</h5>
+              <audio src={selected.previewUrl} controls className="w-full" />
+            </div>
+          )}
+        </div>
+      </Modal>
     </>
   );
 }

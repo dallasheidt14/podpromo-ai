@@ -7,8 +7,9 @@ import hashlib
 import os
 
 # Get directories from environment or default
-UPLOADS_DIR = Path(os.getenv("UPLOADS_DIR", r"C:\Users\Dallas Heidt\Desktop\podpromo\backend\uploads"))
-OUTPUTS_DIR = Path(os.getenv("OUTPUTS_DIR", r"C:\Users\Dallas Heidt\Desktop\podpromo\backend\outputs"))
+from config.settings import UPLOAD_DIR, OUTPUT_DIR
+UPLOADS_DIR = Path(os.getenv("UPLOADS_DIR", UPLOAD_DIR))
+OUTPUTS_DIR = Path(os.getenv("OUTPUTS_DIR", OUTPUT_DIR))
 PREVIEWS_DIR = OUTPUTS_DIR / "previews"
 
 # Ensure previews directory exists

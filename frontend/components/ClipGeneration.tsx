@@ -3,8 +3,8 @@
 import { useState } from 'react';
 import { motion } from 'framer-motion';
 import { Video, Settings, Play, Sparkles, Clock, Target } from 'lucide-react';
-import { Episode } from '@shared/types';
-import { postGenerateClips, ensureOk } from '@shared/api';
+import { Episode } from '../src/shared/types';
+import { postGenerateClips, ensureOk } from '../src/shared/api';
 import { AnimatePresence } from 'framer-motion';
 
 interface ClipGenerationProps {

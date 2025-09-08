@@ -3,9 +3,9 @@
 import { useEffect, useRef, useState } from 'react';
 import EpisodeUpload from '../components/EpisodeUpload';
 import ClipGallery from '../components/ClipGallery';
-import { normalizeClip } from '@shared/normalize';
-import { Clip } from '@shared/types';
-import { getClips, getProgress, handleApiResult } from '@shared/api';
+import { normalizeClip } from '../src/shared/normalize';
+import { Clip } from '../src/shared/types';
+import { getClips, getProgress, handleApiResult } from '../src/shared/api';
 
 export default function Page() {
   const [episodeId, setEpisodeId] = useState<string | null>(null);
@@ -20,223 +20,79 @@ export default function Page() {
     setEpisodeId(null);
     setUploadStatus('idle');
     setClips([]);
-    setClipsLoading(false);
-    // Clear ?episodeId
-    try {
-      const url = new URL(window.location.href);
-      url.searchParams.delete('episodeId');
-      window.history.replaceState({}, '', url.toString());
-    } catch {}
     setShowResumePrompt(false);
   }
 
-  function resumeLast() {
-    try {
-      const saved = localStorage.getItem('lastEpisodeId');
-      if (saved) {
-        setEpisodeId(saved);
-        setUploadStatus('processing'); // EpisodeUpload will resume polling
-        const url = new URL(window.location.href);
-        url.searchParams.set('episodeId', saved);
-        window.history.replaceState({}, '', url.toString());
-      }
-    } catch {}
+  function resumePreviousUpload() {
     setShowResumePrompt(false);
+    // The EpisodeUpload component will handle the rest
   }
-
-  async function fetchClips(id: string) {
-    try {
-      setClipsLoading(true);
-      const result = await getClips(id);
-      
-      handleApiResult(
-        result,
-        (data) => {
-          const raw = Array.isArray(data.clips) ? data.clips : [];
-          const normalized = raw.map(normalizeClip);
-          const isAd = (c: any) => Boolean(c?.is_advertisement || c?._ad_flag || c?.features?.is_advertisement);
-          const ranked = normalized.filter(c => !isAd(c)).sort((a, b) => (b.score ?? 0) - (a.score ?? 0)).slice(0, 12);
-          setClips(ranked);
-          setUploadStatus('completed');
-          localStorage.setItem('lastEpisodeId', id);
-          console.log(`[resume] clips loaded: ${ranked.length} (raw ${normalized.length})`);
-        },
-        (error) => {
-          console.warn("[resume] fetchClips failed:", error);
-        }
-      );
-    } catch (e) {
-      console.warn("[resume] unexpected error:", e);
-    } finally {
-      setClipsLoading(false);
-    }
-  }
-
-  // 🔁 Resume flow on direct URL / refresh
-  useEffect(() => {
-    if (didResumeRef.current) return;
-    const urlId = new URLSearchParams(window.location.search).get("episodeId");
-    const saved = localStorage.getItem("lastEpisodeId");
-    
-    if (urlId) {
-      didResumeRef.current = true;
-      setEpisodeId(urlId);
-
-      (async () => {
-        try {
-          console.log("[resume] checking progress for", urlId);
-          const result = await getProgress(urlId);
-          
-          handleApiResult(
-            result,
-            (data) => {
-              const stage = String(data.progress?.stage || data.status || "").toLowerCase();
-              console.log("[resume] stage:", stage);
-              if (stage === "completed") {
-                fetchClips(urlId);
-              } else {
-                setUploadStatus('processing'); // tell EpisodeUpload to resume polling
-              }
-            },
-            (error) => {
-              console.warn("[resume] progress check failed:", error);
-              setUploadStatus('processing'); // safe default: start polling
-            }
-          );
-        } catch (e) {
-          console.warn("[resume] failed, defaulting to processing", e);
-          setUploadStatus('processing');
-        }
-      })();
-    } else if (saved) {
-      // Don't auto-resume; let the user choose.
-      setShowResumePrompt(true);
-    }
-  }, []);
-
-  // 🚀 Reset state when no episodeId (fresh page load)
-  useEffect(() => {
-    const urlId = new URLSearchParams(window.location.search).get("episodeId");
-    const saved = localStorage.getItem("lastEpisodeId");
-    const id = urlId || saved;
-    
-    if (!id) {
-      // Fresh page load - reset everything
-      setEpisodeId(null);
-      setUploadStatus('idle');
-      setClips([]);
-      setClipsLoading(false);
-    }
-  }, []);
 
   function handleEpisodeUploaded(id: string) {
     setEpisodeId(id);
-    setUploadStatus('processing'); // EpisodeUpload will poll; we'll load clips on completion
+    setUploadStatus('processing');
+  }
+
+  function handleClipUpdate(clipId: string, updates: Partial<Clip>) {
+    setClips(prevClips => 
+      prevClips.map(clip => 
+        clip.id === clipId ? { ...clip, ...updates } : clip
+      )
+    );
   }
 
   return (
-    <main className="min-h-screen p-6 max-w-5xl mx-auto">
-      {showResumePrompt && (
-        <div className="rounded-xl border border-[#1e2636] bg-white/[0.04] p-4 mb-6 flex items-center justify-between gap-3">
-          <div className="text-sm text-white/80">
-            Found a previous session. Resume it, or start a new upload?
-          </div>
-          <div className="flex gap-2">
-            <button 
-              className="px-4 py-2 text-sm bg-white/10 hover:bg-white/20 text-white rounded-lg transition-colors"
-              onClick={startNewUpload}
-            >
-              Start new upload
-            </button>
-            <button 
-              className="px-4 py-2 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-colors"
-              onClick={resumeLast}
-            >
-              Resume
-            </button>
-          </div>
-        </div>
-      )}
-
-      <div className="mb-6">
-        <h1 className="text-3xl font-extrabold tracking-tight text-white">
-          PodPromo <span className="text-emerald-400">AI</span>
-        </h1>
-        <p className="mt-1 text-white/70">
-          Upload your podcast episode to generate <span className="text-white">viral clips</span>
-        </p>
+    <div>
+                {/* Header */}
+                <div className="text-center mb-8">
+                  <div className="flex items-center justify-center mb-4">
+                    <img 
+                      src="/logo.png" 
+                      alt="Highlightly AI" 
+                      className="h-96 w-auto"
+                    />
+                  </div>
+                  <div className="bg-gradient-to-r from-blue-50 to-yellow-50 rounded-2xl p-6 border-2 border-blue-100 shadow-lg">
+                    <h2 className="text-2xl font-bold text-gray-800 mb-3">
+                      Find the clips that actually go viral
+                    </h2>
+                    <p className="text-lg text-gray-600 leading-relaxed">
+                      We detect, score, and rank your best moments—then hand you social-ready cuts.
+                    </p>
+                  </div>
+                </div>
+      
+      {/* Upload Section */}
+      <div className="rounded-2xl border-2 border-blue-200 bg-gradient-to-br from-blue-50 to-white shadow-card p-6 relative overflow-hidden">
+        {/* Decorative accent */}
+        <div className="absolute top-0 right-0 w-32 h-32 bg-yellow-200 rounded-full -translate-y-16 translate-x-16 opacity-20"></div>
+        <EpisodeUpload
+          onEpisodeUploaded={handleEpisodeUploaded}
+          initialEpisodeId={episodeId ?? undefined}
+          initialUploadStatus={uploadStatus}
+          onClipsFetched={setClips}
+          onCompleted={() => setUploadStatus('completed')}
+        />
       </div>
 
-      <EpisodeUpload
-        onEpisodeUploaded={handleEpisodeUploaded}
-        initialEpisodeId={episodeId ?? undefined}
-        initialUploadStatus={uploadStatus}
-        onCompleted={() => episodeId && fetchClips(episodeId)}
-      />
-
-      {/* Session Controls */}
-      {episodeId && (
-        <div className="rounded-xl border border-[#1e2636] bg-white/[0.04] p-4 mb-6">
-          <div className="flex items-center justify-between mb-2">
-            <h2 className="text-lg font-semibold text-white">Current Session</h2>
-            <div className="flex gap-2">
-              <button 
-                className="px-4 py-2 text-sm bg-white/10 hover:bg-white/20 text-white rounded-lg transition-colors"
-                onClick={startNewUpload}
-              >
-                Start another upload
-              </button>
-              <button 
-                className="px-4 py-2 text-sm bg-red-600/20 hover:bg-red-600/30 text-red-400 rounded-lg transition-colors"
-                onClick={() => {
-                  try { localStorage.removeItem('lastEpisodeId'); } catch {}
-                  setEpisodeId(null);
-                  setUploadStatus('idle');
-                  setClips([]);
-                  setClipsLoading(false);
-                  try {
-                    const url = new URL(window.location.href);
-                    url.searchParams.delete('episodeId');
-                    window.history.replaceState({}, '', url.toString());
-                  } catch {}
-                }}
-              >
-                Clear session
-              </button>
-            </div>
-          </div>
-          <div className="flex items-center gap-2 text-sm text-white/60">
-            <span>Episode ID: {episodeId.slice(0, 8)}...</span>
-            <button
-              onClick={() => {
-                navigator.clipboard.writeText(episodeId);
-                // You could add a toast notification here
-              }}
-              className="px-2 py-1 text-xs bg-white/10 hover:bg-white/20 rounded transition-colors"
-              title="Copy full episode ID"
-            >
-              Copy
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* Top Clips */}
-      <section id="clips" className="mt-8">
-        <h2 className="text-2xl font-semibold text-white mb-3">Top Clips</h2>
+      {/* Clips Section */}
+      <div className="mt-6 rounded-2xl border-2 border-yellow-200 bg-gradient-to-br from-yellow-50 to-white shadow-card p-6 relative overflow-hidden">
+        {/* Decorative accent */}
+        <div className="absolute top-0 left-0 w-24 h-24 bg-blue-200 rounded-full -translate-y-12 -translate-x-12 opacity-20"></div>
+        <h2 className="text-2xl font-bold mb-4 text-gray-800 relative z-10">Your AI-Generated Clips</h2>
         {clipsLoading && (
-          <div className="rounded-xl border border-[#1e2636] bg-white/[0.04] p-4 text-center text-white/70">
-            Loading clips…
+          <div className="text-center py-8">
+            <div className="w-8 h-8 border-4 border-blue-500/20 border-t-blue-500 rounded-full animate-spin mx-auto mb-4"></div>
+            <p className="text-gray-600">Analyzing your content...</p>
           </div>
         )}
-        {!clipsLoading && clips.length > 0 && <ClipGallery clips={clips} />}
-
+        {!clipsLoading && clips.length > 0 && <ClipGallery clips={clips} onClipUpdate={handleClipUpdate} />}
         {!clipsLoading && clips.length === 0 && episodeId && (
-          <div className="rounded-xl border border-[#1e2636] bg-white/[0.04] p-4 text-center text-white/70">
-            No clips found for this episode yet. If processing just finished, give it a second or refresh.
+          <div className="text-center py-8 text-gray-500">
+            <p>No clips found yet. If processing just finished, give it a moment or refresh the page.</p>
           </div>
         )}
-      </section>
-    </main>
+      </div>
+    </div>
   );
 }

@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect } from 'react';
-import { Episode } from '@shared/types';
+import { Episode } from '../src/shared/types';
 
 interface EpisodeSelectorProps {
   onEpisodeSelected: (episodeId: string) => void;
@@ -96,7 +96,7 @@ export default function EpisodeSelector({ onEpisodeSelected }: EpisodeSelectorPr
                 <span className={`px-2 py-1 rounded-full text-xs font-medium ${
                   episode.status === 'completed' ? 'bg-green-100 text-green-700' :
                   episode.status === 'processing' ? 'bg-blue-100 text-blue-700' :
-                  episode.status === 'error' ? 'bg-red-100 text-red-700' :
+                  episode.status === 'failed' ? 'bg-red-100 text-red-700' :
                   'bg-gray-100 text-gray-700'
                 }`}>
                   {episode.status}

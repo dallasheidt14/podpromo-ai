@@ -1279,13 +1279,22 @@ def _hook_score_v4(text: str, arousal: float = 0.0, words_per_sec: float = 0.0, 
             reasons.append(f"audio_prosody_{audio_modifier:.2f}")
     
     # OPTIMIZED: Laughter and exclamation detection (text-only for performance)
-    laughter_boost = detect_laughter_exclamations(text, audio_data, sr, start_time, enable_audio_analysis=False)
+    # SPEED: Skip expensive laughter detection in fast mode
+    speed_preset = os.getenv("SPEED_PRESET", "balanced").lower()
+    if speed_preset == "fast":
+        laughter_boost = 0.0  # Skip expensive laughter detection
+    else:
+        laughter_boost = detect_laughter_exclamations(text, audio_data, sr, start_time, enable_audio_analysis=False)
     if laughter_boost > 0:
         score += laughter_boost
         reasons.append(f"laughter_exclamation_{laughter_boost:.2f}")
     
     # ENHANCED: Time-weighted analysis (with gradual decay instead of uniform)
-    time_weighted_score = calculate_time_weighted_hook_score(text)
+    # SPEED: Skip expensive time-weighted analysis in fast mode
+    if os.getenv("FAST_SCORING", "0") == "1":
+        time_weighted_score = 0.0  # Skip expensive time-weighted analysis
+    else:
+        time_weighted_score = calculate_time_weighted_hook_score(text)
     if time_weighted_score > 0:
         # More gradual time weighting: 0.9 for early content, 0.7 for later content
         # This creates better differentiation between content at different positions

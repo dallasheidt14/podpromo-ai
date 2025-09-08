@@ -9,7 +9,8 @@ from typing import Any, Dict, List
 import os
 import json
 
-UPLOADS = Path(os.getenv("UPLOADS_DIR", r"C:\Users\Dallas Heidt\Desktop\podpromo\backend\uploads"))
+from config.settings import UPLOAD_DIR
+UPLOADS = Path(os.getenv("UPLOADS_DIR", UPLOAD_DIR))
 
 def _read_json(p: Path) -> Any:
     with p.open("r", encoding="utf-8") as f:

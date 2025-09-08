@@ -17,9 +17,10 @@ logger = logging.getLogger(__name__)
 class FileManager:
     """Manages file storage, cleanup, and validation"""
     
-    def __init__(self, upload_dir: str = "./uploads", output_dir: str = "./outputs"):
-        self.upload_dir = Path(upload_dir)
-        self.output_dir = Path(output_dir)
+    def __init__(self, upload_dir: str = None, output_dir: str = None):
+        from config.settings import UPLOAD_DIR, OUTPUT_DIR
+        self.upload_dir = Path(upload_dir or UPLOAD_DIR)
+        self.output_dir = Path(output_dir or OUTPUT_DIR)
         self.max_file_size = 500 * 1024 * 1024  # 500MB
         self.max_storage_gb = 10  # 10GB total storage limit
         self.cleanup_interval_hours = 24

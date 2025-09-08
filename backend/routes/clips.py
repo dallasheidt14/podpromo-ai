@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import time
 from typing import List, Optional, Literal, Dict, Any
+from pathlib import Path
 
 from fastapi import APIRouter, Header, HTTPException, Depends, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field, conint, confloat, field_validator, model_validator
 
 router = APIRouter(prefix="/api/episodes", tags=["clips"])
@@ -225,3 +226,82 @@ async def post_generate_clips(
             },
         },
     )
+
+def _is_ready(ep_id: str) -> bool:
+    """Check if clips are ready for this episode"""
+    try:
+        from services.progress_service import progress_service
+        from config.settings import UPLOAD_DIR
+        
+        # Check progress first
+        progress = progress_service.get_progress(ep_id)
+        if progress and progress.get("stage") == "completed":
+            return True
+        if progress and int(progress.get("percent", 0)) >= 100:
+            return True
+            
+        # Check for persisted output files
+        ep_path = Path(UPLOAD_DIR) / ep_id
+        clips_file = ep_path / "clips.json"
+        clips_dir = ep_path / "clips"
+        
+        return clips_file.exists() or clips_dir.exists()
+    except Exception:
+        return False
+
+def _load_clips(ep_id: str) -> List[Dict[str, Any]]:
+    """Load clips for an episode"""
+    try:
+        from services.episode_service import EpisodeService
+        episode_service = EpisodeService()
+        episode = episode_service.get_episode(ep_id)
+        
+        if not episode or not hasattr(episode, 'clips'):
+            return []
+            
+        clips = episode.clips or []
+        
+        # Convert to frontend format
+        formatted_clips = []
+        for clip in clips:
+            formatted_clip = {
+                "id": getattr(clip, 'id', ''),
+                "startTime": getattr(clip, 'start_time', 0),
+                "endTime": getattr(clip, 'end_time', 0),
+                "text": getattr(clip, 'text', ''),
+                "score": getattr(clip, 'score', 0),
+                "features": {
+                    "hook_score": getattr(clip, 'hook_score', 0),
+                    "arousal_score": getattr(clip, 'arousal_score', 0),
+                    "emotion_score": getattr(clip, 'emotion_score', 0),
+                    "payoff_score": getattr(clip, 'payoff_score', 0),
+                } if hasattr(clip, 'hook_score') else None,
+                "previewUrl": f"/api/preview/{ep_id}/{getattr(clip, 'id', '')}.mp3",
+                "vttUrl": f"/api/captions/{ep_id}/{getattr(clip, 'id', '')}.vtt",
+            }
+            formatted_clips.append(formatted_clip)
+            
+        return formatted_clips
+    except Exception as e:
+        print(f"[CLIPS] Error loading clips for {ep_id}: {e}")
+        return []
+
+@router.head("/{ep_id}/clips")
+def head_clips(ep_id: str):
+    """HEAD request to check if clips are ready"""
+    if _is_ready(ep_id):
+        return Response(status_code=204, headers={"Cache-Control": "no-store"})
+    return Response(status_code=202, headers={"Retry-After": "15", "Cache-Control": "no-store"})
+
+@router.get("/{ep_id}/clips")
+def get_clips(ep_id: str):
+    """Get clips for an episode - returns 202 if not ready, 200 with data if ready"""
+    if not _is_ready(ep_id):
+        return JSONResponse(
+            {"ok": False, "ready": False, "message": "Scoring in progress"},
+            status_code=202,
+            headers={"Retry-After": "15", "Cache-Control": "no-store"}
+        )
+    
+    clips = _load_clips(ep_id)
+    return {"ok": True, "ready": True, "clips": clips}

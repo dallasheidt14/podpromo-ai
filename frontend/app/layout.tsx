@@ -5,24 +5,18 @@ import './globals.css';
 const inter = Inter({ subsets: ['latin'] });
 
 export const metadata: Metadata = {
-  title: 'PodPromo AI - Generate Engaging Podcast Clips',
+  title: 'Highlightly AI - Generate Engaging Podcast Clips',
   description: 'AI-powered podcast clip generation service. Upload your episode and get 3-5 engaging social media clips in under 5 minutes.',
   keywords: 'podcast, clips, AI, social media, video generation, content creation',
-  authors: [{ name: 'PodPromo AI Team' }],
+  authors: [{ name: 'Highlightly AI Team' }],
   viewport: 'width=device-width, initial-scale=1',
 };
 
-export default function RootLayout({
-  children,
-}: {
-  children: React.ReactNode;
-}) {
+export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en">
-      <body className={`${inter.className} min-h-screen bg-[radial-gradient(1200px_600px_at_20%_-10%,#0b0f1a_0%,#05070d_60%,#040507_100%)] text-white antialiased`}>
-        <div className="min-h-screen">
-          {children}
-        </div>
+      <body className="min-h-screen bg-gradient-to-b from-slate-50 to-white text-neutral-900 antialiased">
+        <main className="mx-auto max-w-6xl px-4 py-8">{children}</main>
       </body>
     </html>
   );

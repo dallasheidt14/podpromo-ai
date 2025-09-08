@@ -6,12 +6,21 @@ This service orchestrates the clip scoring pipeline using the proprietary algori
 import numpy as np
 import logging
 import re
-from typing import List, Dict
+import random
+import math
+import os
+from typing import List, Dict, Tuple
 from models import AudioFeatures, TranscriptSegment, MomentScore
-from config.settings import UPLOAD_DIR, OUTPUT_DIR, MAX_FILE_SIZE, ALLOWED_EXTENSIONS
+from config.settings import (
+    UPLOAD_DIR, OUTPUT_DIR, MAX_FILE_SIZE, ALLOWED_EXTENSIONS,
+    PRERANK_ENABLED, TOP_K_RATIO, TOP_K_MIN, TOP_K_MAX, STRATIFY_ENABLED, 
+    SAFETY_KEEP_ENABLED, COMPARE_SCORING_MODES, PRERANK_WEIGHTS,
+    DURATION_TARGET_MIN, DURATION_TARGET_MAX
+)
 
 from services.secret_sauce import compute_features_v4, score_segment_v4, explain_segment_v4, viral_potential_v4, get_clip_weights
 from services.viral_moment_detector import ViralMomentDetector
+from services.progress_writer import write_progress
 from config_loader import get_config
 
 # ensure v2 is ON everywhere
@@ -25,7 +34,231 @@ class ClipScoreService:
     def __init__(self, episode_service):
         self.episode_service = episode_service
 
-    def analyze_episode(self, audio_path: str, transcript: List[TranscriptSegment]) -> List[MomentScore]:
+    def _duration_fit(self, duration: float) -> float:
+        """Calculate duration fit score (0-1) for pre-rank scoring"""
+        if duration < DURATION_TARGET_MIN:
+            return duration / DURATION_TARGET_MIN
+        elif duration > DURATION_TARGET_MAX:
+            return max(0.0, 1 - (duration - DURATION_TARGET_MAX) / DURATION_TARGET_MAX)
+        else:
+            return 1.0
+
+    def _hook_proxy(self, text: str) -> float:
+        """Cheap hook detection for pre-rank scoring"""
+        if not text:
+            return 0.0
+        
+        text_lower = text.lower().strip()
+        hook_patterns = [
+            r'^(how|why|what|top\s?\d+|the secret|3 ways|you won.t believe)',
+            r'^(here.s|let me|i.m going to|the thing is)',
+            r'^(did you know|here.s the thing|the secret to)',
+            r'^(listen|look|wait|hold on)',
+        ]
+        
+        for pattern in hook_patterns:
+            if re.match(pattern, text_lower):
+                return 1.0
+        return 0.0
+
+    def _arousal_proxy(self, text: str) -> float:
+        """Cheap arousal detection for pre-rank scoring"""
+        if not text:
+            return 0.0
+        
+        arousal_score = 0.0
+        arousal_score += min(1.0, text.count('!') * 0.2)
+        arousal_score += min(1.0, text.count('?') * 0.15)
+        arousal_score += min(1.0, text.count('wow') * 0.3)
+        arousal_score += min(1.0, text.count('crazy') * 0.3)
+        arousal_score += min(1.0, text.count('amazing') * 0.3)
+        
+        # Bonus for short, punchy content with questions
+        if '?' in text and len(text) < 160:
+            arousal_score += 0.2
+            
+        return min(1.0, arousal_score)
+
+    def _info_density_proxy(self, words_per_sec: float) -> float:
+        """Calculate info density score (sweet spot 2.5-4.5 wps)"""
+        if words_per_sec <= 0:
+            return 0.0
+        # Sweet spot around 3.5 wps
+        return max(0.0, 1 - abs(words_per_sec - 3.5) / 3.5)
+
+    def _has_numbers(self, text: str) -> float:
+        """Check if text contains numbers (lists, statistics, etc.)"""
+        return 1.0 if re.search(r'\d', text) else 0.0
+
+    def pre_rank_candidates(self, segments: List[Dict], episode_id: str) -> List[Dict]:
+        """Pre-rank candidates using cheap features only"""
+        if not PRERANK_ENABLED:
+            return segments
+            
+        logger.info(f"Starting pre-rank scoring for {len(segments)} segments")
+        write_progress(episode_id, "scoring:prerank", 10, "Pre-ranking candidates...")
+        
+        # Filter out ads first
+        candidates = [seg for seg in segments if not seg.get('is_advertisement', False)]
+        
+        # Calculate pre-rank scores
+        for seg in candidates:
+            duration = seg.get('duration', 0)
+            text = seg.get('text', '')
+            words_per_sec = seg.get('words_per_sec', 0)
+            
+            # Calculate cheap features
+            hook_score = self._hook_proxy(text)
+            arousal_score = self._arousal_proxy(text)
+            info_density = self._info_density_proxy(words_per_sec)
+            duration_fit = self._duration_fit(duration)
+            has_numbers = self._has_numbers(text)
+            is_ad_penalty = 1.0 if seg.get('is_advertisement', False) else 0.0
+            
+            # Calculate pre-rank score
+            prerank_score = (
+                PRERANK_WEIGHTS['hook'] * hook_score +
+                PRERANK_WEIGHTS['arousal'] * arousal_score +
+                PRERANK_WEIGHTS['info_density'] * info_density +
+                PRERANK_WEIGHTS['duration_fit'] * duration_fit +
+                PRERANK_WEIGHTS['has_numbers'] * has_numbers +
+                PRERANK_WEIGHTS['is_ad_penalty'] * is_ad_penalty
+            )
+            
+            seg['prerank_score'] = prerank_score
+            seg['prerank_features'] = {
+                'hook': hook_score,
+                'arousal': arousal_score,
+                'info_density': info_density,
+                'duration_fit': duration_fit,
+                'has_numbers': has_numbers,
+                'is_ad_penalty': is_ad_penalty
+            }
+        
+        # Sort by pre-rank score
+        candidates.sort(key=lambda x: x['prerank_score'], reverse=True)
+        
+        # Calculate K
+        N = len(candidates)
+        K = min(TOP_K_MAX or N, max(TOP_K_MIN, math.ceil(TOP_K_RATIO * N)))
+        
+        logger.info(f"Pre-rank complete: {N} candidates -> keeping top {K}")
+        write_progress(episode_id, "scoring:prerank", 20, f"Pre-ranked {N} candidates, keeping top {K}")
+        
+        return candidates[:K]
+
+    def get_safety_candidates(self, segments: List[Dict]) -> List[Dict]:
+        """Get obvious banger candidates that should always be kept"""
+        if not SAFETY_KEEP_ENABLED:
+            return []
+            
+        safety_candidates = []
+        
+        for seg in segments:
+            if seg.get('is_advertisement', False):
+                continue
+                
+            text = seg.get('text', '')
+            duration = seg.get('duration', 0)
+            words_per_sec = seg.get('words_per_sec', 0)
+            
+            # Safety rules for obvious bangers
+            is_safety = False
+            
+            # Rule 1: Strong hook + arousal
+            if (self._hook_proxy(text) >= 0.8 and 
+                self._arousal_proxy(text) >= 0.6):
+                is_safety = True
+                
+            # Rule 2: Questions + numbers (lists perform well)
+            if ('?' in text and self._has_numbers(text) and 
+                self._info_density_proxy(words_per_sec) >= 0.6):
+                is_safety = True
+                
+            # Rule 3: Perfect duration + high info density
+            if (self._duration_fit(duration) >= 0.9 and 
+                self._info_density_proxy(words_per_sec) >= 0.7):
+                is_safety = True
+                
+            # Rule 4: Early question (first 30% of text)
+            if ('?' in text and len(text) > 0 and 
+                text.find('?') < len(text) * 0.3):
+                is_safety = True
+                
+            if is_safety:
+                safety_candidates.append(seg)
+                # Log the first few words of each safety banger
+                text_preview = seg.get('text', '')[:50] + "..." if len(seg.get('text', '')) > 50 else seg.get('text', '')
+                logger.info(f"Safety banger: '{text_preview}' (hook={self._hook_proxy(seg.get('text', '')):.2f}, arousal={self._arousal_proxy(seg.get('text', '')):.2f})")
+                
+        logger.info(f"Safety net: found {len(safety_candidates)} obvious bangers")
+        return safety_candidates
+
+    def pick_stratified(self, candidates: List[Dict], target_count: int) -> List[Dict]:
+        """Pick candidates with stratification across time and duration"""
+        if not STRATIFY_ENABLED or len(candidates) <= target_count:
+            return candidates[:target_count]
+            
+        # Create time buckets (early/mid/late)
+        total_duration = max(seg.get('end', 0) for seg in candidates) if candidates else 1
+        time_buckets = {'early': [], 'mid': [], 'late': []}
+        
+        for seg in candidates:
+            start_time = seg.get('start', 0)
+            if start_time < total_duration * 0.33:
+                time_buckets['early'].append(seg)
+            elif start_time < total_duration * 0.66:
+                time_buckets['mid'].append(seg)
+            else:
+                time_buckets['late'].append(seg)
+        
+        # Create duration buckets (short/med/long)
+        duration_buckets = {'short': [], 'med': [], 'long': []}
+        for seg in candidates:
+            duration = seg.get('duration', 0)
+            if duration < 30:
+                duration_buckets['short'].append(seg)
+            elif duration < 60:
+                duration_buckets['med'].append(seg)
+            else:
+                duration_buckets['long'].append(seg)
+        
+        # Pick minimum from each bucket
+        selected = []
+        min_per_bucket = 2
+        
+        for bucket_name, bucket_segs in time_buckets.items():
+            if bucket_segs:
+                bucket_segs.sort(key=lambda x: x['prerank_score'], reverse=True)
+                selected.extend(bucket_segs[:min_per_bucket])
+        
+        for bucket_name, bucket_segs in duration_buckets.items():
+            if bucket_segs:
+                bucket_segs.sort(key=lambda x: x['prerank_score'], reverse=True)
+                # Add if not already selected
+                for seg in bucket_segs[:min_per_bucket]:
+                    if seg not in selected:
+                        selected.append(seg)
+        
+        # Fill remaining slots by score
+        remaining = [seg for seg in candidates if seg not in selected]
+        remaining.sort(key=lambda x: x['prerank_score'], reverse=True)
+        
+        needed = target_count - len(selected)
+        selected.extend(remaining[:needed])
+        
+        # Add exploration picks (random from remainder)
+        if len(selected) < target_count:
+            exploration_count = min(5, target_count - len(selected))
+            exploration_candidates = [seg for seg in remaining if seg not in selected]
+            if exploration_candidates:
+                selected.extend(random.sample(exploration_candidates, 
+                                           min(exploration_count, len(exploration_candidates))))
+        
+        logger.info(f"Stratified selection: {len(selected)} candidates from {len(candidates)}")
+        return selected[:target_count]
+
+    def analyze_episode(self, audio_path: str, transcript: List[TranscriptSegment], episode_id: str = None) -> List[MomentScore]:
         """Analyze episode and return scored moments"""
         try:
             logger.info(f"Starting episode analysis for {audio_path}")
@@ -34,7 +267,9 @@ class ClipScoreService:
             segments = self._transcript_to_segments(transcript, genre='general', platform='tiktok')
             
             # Rank candidates using secret sauce V4 with genre awareness
-            ranked_segments = self.rank_candidates(segments, audio_path, top_k=10, platform='tiktok', genre='general')
+            # SPEED: Reduce top_k for faster processing (still processes all segments, just ranks fewer)
+            top_k = int(os.getenv("TOP_K_CANDIDATES", "15"))  # Default 15, was 10
+            ranked_segments = self.rank_candidates(segments, audio_path, top_k=top_k, platform='tiktok', genre='general', episode_id=episode_id)
             
             # Convert back to MomentScore objects
             moment_scores = []
@@ -150,9 +385,41 @@ class ClipScoreService:
         
         return None
 
-    def rank_candidates(self, segments: List[Dict], audio_file: str, top_k=5, platform: str = 'tiktok', genre: str = 'general') -> List[Dict]:
-        """Rank candidates using secret sauce V4 scoring with multi-path approach"""
+    def rank_candidates(self, segments: List[Dict], audio_file: str, top_k=5, platform: str = 'tiktok', genre: str = 'general', episode_id: str = None) -> List[Dict]:
+        """Rank candidates using two-stage scoring: pre-rank + full V4 scoring"""
         scored = []
+        
+        # Two-stage scoring: pre-rank first, then full scoring on top candidates
+        if PRERANK_ENABLED and len(segments) > 10:  # Only use pre-rank for larger sets
+            logger.info(f"Using two-stage scoring: {len(segments)} segments")
+            
+            # Stage 1: Pre-rank with cheap features
+            prerank_candidates = self.pre_rank_candidates(segments, episode_id or "unknown")
+            
+            # Get safety candidates (obvious bangers)
+            safety_candidates = self.get_safety_candidates(segments)
+            
+            # Combine and deduplicate
+            safety_added = [s for s in safety_candidates if s not in prerank_candidates]
+            all_candidates = prerank_candidates + safety_added
+            
+            logger.info(f"Pre-rank: {len(prerank_candidates)} candidates")
+            logger.info(f"Safety net: {len(safety_candidates)} bangers found, {len(safety_added)} new ones added")
+            logger.info(f"Combined: {len(all_candidates)} total candidates")
+            
+            # Apply stratified selection if enabled
+            if STRATIFY_ENABLED:
+                target_count = min(len(all_candidates), max(TOP_K_MIN, math.ceil(TOP_K_RATIO * len(segments))))
+                final_candidates = self.pick_stratified(all_candidates, target_count)
+            else:
+                final_candidates = all_candidates
+                
+            logger.info(f"Two-stage: {len(segments)} -> {len(final_candidates)} candidates for full scoring")
+            segments_to_score = final_candidates
+        else:
+            logger.info(f"Using full scoring: {len(segments)} segments")
+            segments_to_score = segments
+        
         # preload audio once for arousal (big speed-up)
         try:
             import librosa
@@ -160,7 +427,15 @@ class ClipScoreService:
         except Exception:
             y_sr = None
 
-        for seg in segments:
+        # Stage 2: Full V4 scoring on selected candidates
+        write_progress(episode_id or "unknown", "scoring:full", 20, f"Full scoring {len(segments_to_score)} candidates...")
+        
+        for i, seg in enumerate(segments_to_score):
+            # Progress update every 10 items
+            if i % 10 == 0:
+                progress_pct = 20 + int((i / len(segments_to_score)) * 70)  # 20-90%
+                write_progress(episode_id or "unknown", "scoring:full", progress_pct, f"Scoring candidate {i+1}/{len(segments_to_score)}...")
+            
             # Use V4 feature computation with enhanced detectors and genre awareness
             feats = compute_features_v4(seg, audio_file, y_sr=y_sr, platform=platform, genre=genre)
             seg["features"] = feats
@@ -293,6 +568,9 @@ class ClipScoreService:
             seg["viral"] = viral_potential_v4(feats, length_s, "general")
             
             scored.append(seg)
+        
+        # Completion progress update
+        write_progress(episode_id or "unknown", "scoring:completed", 100, f"Scoring complete: {len(scored)} candidates processed")
         
         # Sort by raw_score descending but prefer non-discarded
         scored_sorted = sorted(scored, key=lambda s: (s.get("discard_reason") is not None, -s["raw_score"]))
@@ -838,7 +1116,7 @@ class ClipScoreService:
             segments = self._transcript_to_segments(episode.transcript, genre=final_genre, platform=platform)
 
             # Use rank_candidates for proper scoring pipeline
-            ranked_segments = self.rank_candidates(segments, episode.audio_path, top_k=10, platform=backend_platform, genre=final_genre)
+            ranked_segments = self.rank_candidates(segments, episode.audio_path, top_k=10, platform=backend_platform, genre=final_genre, episode_id=episode_id)
             
             # Convert to candidate format with title generation and grades
             candidates = []

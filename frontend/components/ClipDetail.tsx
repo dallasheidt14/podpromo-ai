@@ -1,122 +1,114 @@
+// components/ClipDetail.tsx
 "use client";
+import React from "react";
+import Modal from "./Modal";
 
-import { Dialog } from "@headlessui/react";
-import { useEffect, useState } from "react";
-import type { Clip } from "@shared/types";
-import { toPct, toPctLabel, toHMMSS } from "@shared/format";
+export type Clip = {
+  id: string;
+  title?: string;
+  score?: number; // 0..1
+  start?: number; // seconds
+  end?: number;   // seconds
+  previewUrl?: string; // audio or video
+  downloadUrl?: string;
+  transcript?: string;
+  captionsVttUrl?: string;
+  [key: string]: any;
+};
 
-export default function ClipDetail({ clip, onClose }: { clip: Clip | null; onClose: () => void }) {
-  const [open, setOpen] = useState(!!clip);
-  
-  useEffect(() => {
-    console.log('[Detail] clip changed:', clip?.id);
-    setOpen(!!clip);
-  }, [clip]);
-  
+type Props = {
+  clip: Clip | null;
+  open: boolean;
+  onClose: () => void;
+};
+
+export default function ClipDetail({ clip, open, onClose }: Props) {
   if (!clip) return null;
 
-  const bars: Array<[string, number | undefined, string | undefined]> = [
-    ["Hook", clip.features?.hook_score, clip.grades?.hook],
-    ["Flow", clip.features?.arousal_score, clip.grades?.flow],
-    ["Value", clip.features?.payoff_score, clip.grades?.value],
-    ["Trend", clip.features?.loopability,  clip.grades?.trend],
-  ];
+  const duration =
+    clip.start != null && clip.end != null
+      ? Math.max(0, (clip.end - clip.start) | 0)
+      : undefined;
+
+  const isVideo = clip.previewUrl?.match(/\.(mp4|mov|webm|avi)$/i);
+  const isAudio = clip.previewUrl?.match(/\.(mp3|m4a|aac|ogg|wav)$/i);
 
   return (
-    <Dialog open={open} onClose={onClose} className="fixed inset-0 z-50">
-      <div className="fixed inset-0 bg-black/70" aria-hidden="true" />
-      <div className="fixed inset-0 flex items-center justify-center p-4">
-        <Dialog.Panel className="card max-w-4xl w-full overflow-hidden">
-          {/* Header */}
-          <div className="p-5 border-b border-[#1e2636] flex items-center justify-between">
-            <h2 className="text-xl font-bold text-white">{clip.title}</h2>
-            <div className="text-sm text-white/90">
-              <span className="font-semibold">{toPctLabel(Number(clip.score ?? 0))}</span>
-              <span className="ml-2 text-white/60">{clip.grades?.overall || ""}</span>
-            </div>
-          </div>
+    <Modal open={open} onClose={onClose} maxWidthClass="max-w-4xl">
+      <div className="space-y-5">
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+          <h2 className="text-xl sm:text-2xl font-semibold text-neutral-900">
+            {clip.title || "Clip Details"}
+          </h2>
 
-          {/* Body */}
-          <div className="grid md:grid-cols-2 gap-0">
-            {/* Media */}
-            <div className="bg-black">
-              {clip.previewUrl ? (
-                (() => {
-                  const src = clip.previewUrl;
-                  const isAudio = !!src && /\.(mp3|m4a|aac|ogg|wav)$/i.test(src);
-                  
-                  return isAudio ? (
-                    <audio src={src} controls className="w-full" />
-                  ) : (
-                    <video src={src} controls className="w-full max-h-[460px] object-cover" />
-                  );
-                })()
-              ) : (
-                <div className="h-full w-full grid place-items-center text-white/70 p-8">
-                  No preview available
-                </div>
-              )}
-            </div>
-
-            {/* Transcript + Scores */}
-            <div className="p-5 space-y-4">
-              <div className="text-xs text-white/50">
-                [{toHMMSS(Number(clip.startTime ?? 0))} – {toHMMSS(Number(clip.endTime ?? 0))}]
-              </div>
-              <div className="rounded card-2 p-3 text-sm leading-6 whitespace-pre-line text-white/90">
-                {clip.text || "(no transcript snippet)"}
-              </div>
-
-              <div>
-                <div className="text-sm font-semibold text-white/80 mb-2">Score breakdown</div>
-                <div className="space-y-2">
-                  {[
-                    ["Hook", clip.features?.hook_score, clip.grades?.hook],
-                    ["Flow", clip.features?.arousal_score, clip.grades?.flow],
-                    ["Value", clip.features?.payoff_score, clip.grades?.value],
-                    ["Trend", clip.features?.loopability,  clip.grades?.trend],
-                  ].map(([label, v, g]) => (
-                    <div key={label as string} className="flex items-center gap-2">
-                      <div className="w-16 text-xs text-white/60">{label as string}</div>
-                      <div className="flex-1 h-2 rounded bg-white/10">
-                        <div className="h-2 rounded bg-white/80" style={{ width: `${Math.max(0, Math.min(1, Number(v ?? 0))) * 100}%` }} />
-                      </div>
-                      <div className="w-16 text-right text-xs text-white/80">
-                        {v != null ? toPct(Number(v)) : "–"} {g ? `(${g})` : ""}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* Footer */}
-          <div className="p-4 border-t border-[#1e2636] flex items-center justify-end gap-2">
-            <button
-              onClick={() => navigator.clipboard.writeText(clip.title)}
-              className="px-3 py-1.5 text-sm rounded border border-[#2b3448] text-white hover:bg-white/5"
-            >
-              Copy title
-            </button>
-            {clip.downloadUrl && (
-              <a
-                href={clip.downloadUrl}
-                download
-                className="px-3 py-1.5 text-sm rounded border border-[#2b3448] text-white hover:bg-white/5"
-              >
-                Download
-              </a>
+          <div className="flex items-center gap-2">
+            {typeof clip.score === "number" && (
+              <span className="inline-flex items-center gap-1 rounded-full bg-primary-50 px-3 py-1 text-sm font-medium text-primary-700">
+                <svg width="16" height="16" viewBox="0 0 24 24">
+                  <path d="M12 2l3.09 6.26L22 9.27l-5 4.85 1.19 6.88L12 17.77l-6.19 3.23L7 14.12 2 9.27l6.91-1.01L12 2z" fill="currentColor"/>
+                </svg>
+                {(clip.score * 100).toFixed(0)}%
+              </span>
             )}
-            <button
-              onClick={onClose}
-              className="px-3 py-1.5 text-sm rounded bg-white text-black hover:bg-white/90"
-            >
-              Close
-            </button>
+            {duration != null && (
+              <span className="inline-flex items-center gap-1 rounded-full bg-neutral-100 px-3 py-1 text-sm text-neutral-700">
+                ⏱ Duration: {duration}s ({Math.round(clip.start!)}s-{Math.round(clip.end!)}s)
+              </span>
+            )}
           </div>
-        </Dialog.Panel>
+        </div>
+
+        <div className="aspect-video w-full overflow-hidden rounded-xl border border-neutral-200">
+          {isVideo ? (
+            <video src={clip.previewUrl} controls className="h-full w-full" />
+          ) : isAudio ? (
+            <div className="flex h-full w-full items-center justify-center bg-neutral-50">
+              <audio src={clip.previewUrl} controls className="w-full max-w-2xl p-4" />
+            </div>
+          ) : (
+            <div className="flex h-full w-full items-center justify-center bg-neutral-50 text-neutral-500">
+              No preview available
+            </div>
+          )}
+        </div>
+
+        <div className="grid gap-4 sm:grid-cols-2">
+          <div className="rounded-xl border border-neutral-200 p-4">
+            <h3 className="mb-2 text-sm font-medium text-neutral-600">Transcript</h3>
+            <div className="max-h-44 overflow-auto whitespace-pre-wrap text-sm leading-relaxed text-neutral-800">
+              {clip.transcript || "No transcript available."}
+            </div>
+          </div>
+
+          <div className="rounded-xl border border-neutral-200 p-4 space-y-3">
+            <h3 className="text-sm font-medium text-neutral-600">Actions</h3>
+            <div className="flex flex-wrap gap-2">
+              {clip.downloadUrl && (
+                <a
+                  href={clip.downloadUrl}
+                  className="btn btn-primary"
+                  download
+                >
+                  Download
+                </a>
+              )}
+              {clip.captionsVttUrl && (
+                <a href={clip.captionsVttUrl} className="btn">
+                  Download Captions
+                </a>
+              )}
+              <button
+                className="btn"
+                onClick={() => {
+                  navigator.clipboard.writeText(clip.title || "Great clip!");
+                }}
+              >
+                Copy Title
+              </button>
+            </div>
+          </div>
+        </div>
       </div>
-    </Dialog>
+    </Modal>
   );
 }

@@ -9,11 +9,12 @@ import logging
 import mimetypes
 from datetime import datetime
 from typing import List, Dict, Optional
+from concurrent.futures import ProcessPoolExecutor
 
 # Ensure correct MIME type for .m4a files
 mimetypes.add_type("audio/mp4", ".m4a")
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Form, Query, Request
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Form, Query, Request, Depends
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -57,24 +58,72 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],  # Include OPTIONS for preflight
+    allow_methods=["GET","POST","HEAD","OPTIONS"],  # Minimal for least privilege
     allow_headers=["*"],
 )
+
+# Add timing middleware for progress endpoints
+@app.middleware("http")
+async def timing_middleware(request: Request, call_next):
+    if request.url.path.startswith("/api/progress/"):
+        import time
+        t0 = time.perf_counter()
+        response = await call_next(request)
+        dt = (time.perf_counter() - t0) * 1000
+        logging.info(f"Progress served in {dt:.1f}ms")
+        
+        # Add no-cache headers for progress endpoints
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        
+        return response
+    return await call_next(request)
 
 # Cache headers middleware for preview files
 @app.middleware("http")
 async def preview_cache_headers(request, call_next):
     resp = await call_next(request)
     p = request.url.path
+    
+    # Handle preview files
     if p.startswith("/clips/previews/") and resp.status_code == 200:
         resp.headers.setdefault("Cache-Control", "public, max-age=31536000, immutable")
         resp.headers.setdefault("Accept-Ranges", "bytes")
+        
+        # Set correct MIME type for .m4a files
+        if p.endswith(".m4a"):
+            resp.headers.setdefault("Content-Type", "audio/mp4")
+    
+    # Handle caption files
+    elif p.startswith("/clips/captions/") and resp.status_code == 200:
+        resp.headers.setdefault("Cache-Control", "public, max-age=31536000, immutable")
+        if p.endswith(".vtt"):
+            resp.headers.setdefault("Content-Type", "text/vtt; charset=utf-8")
+        elif p.endswith(".srt"):
+            resp.headers.setdefault("Content-Type", "text/plain; charset=utf-8")
+    
     return resp
 
 # Mount static directories using config
 from config.settings import UPLOAD_DIR, OUTPUT_DIR, MAX_FILE_SIZE
 app.mount("/files", StaticFiles(directory=UPLOAD_DIR), name="files")
 app.mount("/clips", StaticFiles(directory=OUTPUT_DIR), name="clips")
+
+# Process pool for CPU-intensive scoring (feature flag)
+USE_POOL = bool(int(os.getenv("SCORING_PROCESS_POOL", "0")))
+POOL = ProcessPoolExecutor(max_workers=min(4, os.cpu_count() or 2)) if USE_POOL else None
+
+def run_scoring(ep, segments):
+    """Run scoring either in process pool or inline based on feature flag"""
+    if POOL:
+        # Import here to avoid circular imports
+        from services.clip_score import score_episode
+        return POOL.submit(score_episode, ep, segments)  # returns Future
+    else:
+        # Import here to avoid circular imports
+        from services.clip_score import score_episode
+        return score_episode(ep, segments)               # runs inline in bg task
 
 # Initialize services
 episode_service = EpisodeService()
@@ -362,76 +411,12 @@ async def test_transcription(file_id: str = Form(...), request: Request = None):
             content={"success": False, "error": str(e)}
         )
 
-# Health check endpoint
-@app.get("/health", response_model=HealthCheck)
-async def health_check():
-    """Check system health and service status"""
-    try:
-        # Check FFmpeg
-        ffmpeg_ok = clip_service.check_ffmpeg()
-        
-        # Check Whisper (if model is loaded)
-        whisper_ok = clip_service.check_whisper()
-        
-        # Check storage
-        storage_ok = episode_service.check_storage()
-        
-        # Check outputs directory
-        outputs_ok = os.path.exists("./outputs") or os.makedirs("./outputs", exist_ok=True)
-        
-        # Check production services (simplified for now)
-        file_manager_ok = file_manager is not None
-        queue_manager_ok = queue_manager is not None
-        monitoring_ok = monitoring_service is not None
-        
-        # Check spaCy availability
-        from nlp_loader import spacy_status
-        spacy_info = spacy_status()
-        spacy_ok = spacy_info["available"]
-        
-        # Determine overall status
-        core_services_ok = all([ffmpeg_ok, whisper_ok, storage_ok])
-        optional_services_ok = all([file_manager_ok, queue_manager_ok, monitoring_ok])
-        
-        if core_services_ok and optional_services_ok:
-            status = "healthy"
-        elif core_services_ok:
-            status = "degraded"  # Core services work, optional services missing
-        else:
-            status = "unhealthy"
-        
-        return HealthCheck(
-            status=status,
-            timestamp=datetime.now(),
-            version="1.0.0",
-            services={
-                "ffmpeg": ffmpeg_ok,
-                "whisper": whisper_ok,
-                "storage": storage_ok,
-                "spacy": {
-                    "available": spacy_info.get("available", False),
-                    "status": spacy_info.get("status", "not_loaded"),
-                    "features": spacy_info.get("features", {})
-                }
-            }
-        )
-    except Exception as e:
-        logger.error(f"Health check failed: {e}")
-        return HealthCheck(
-            status="unhealthy",
-            timestamp=datetime.now(),
-            version="1.0.0",
-            services={
-                "ffmpeg": False, 
-                "whisper": False, 
-                "storage": False,
-                "spacy": {
-                    "available": False,
-                    "status": "error",
-                    "features": {}
-                }
-            }
-        )
+# Include health and ready routers
+from routes.health import router as health_router
+from routes.ready import router as ready_router
+
+app.include_router(health_router)
+app.include_router(ready_router)
 
 # Configuration endpoints
 @app.get("/config/get")
@@ -568,9 +553,12 @@ async def log_choice(choice_data: Dict):
 
 # Main API endpoints
 @app.post("/api/upload")
-async def upload_episode(file: UploadFile = File(...), request: Request = None):
+async def upload_episode(file: UploadFile = File(...), background_tasks: BackgroundTasks = None, request: Request = None):
     """Upload and process a podcast episode"""
     try:
+        # Import progress writer
+        from services.progress_writer import write_progress
+        
         # Check if services are initialized
         if not episode_service:
             logger.error("EpisodeService not initialized")
@@ -617,23 +605,16 @@ async def upload_episode(file: UploadFile = File(...), request: Request = None):
         episode_id = str(uuid.uuid4())
         episode = await episode_service.create_episode(episode_id, file, file.filename)
         
-        # Add to processing queue (if available)
-        job_id = None
-        if queue_manager:
-            try:
-                from services.queue_manager import JobPriority
-                job_id = await queue_manager.submit_job(
-                    job_type="episode_processing",
-                    priority=JobPriority.HIGH,
-                    metadata={"episode_id": episode.id}
-                )
-                logger.info(f"Episode {episode.id} queued for processing with job ID: {job_id}")
-            except Exception as e:
-                logger.warning(f"Failed to queue episode, processing directly: {e}")
-                await episode_service.process_episode(episode.id)
+        # Write initial progress
+        write_progress(episode_id, "uploading", 1, "File received")
+        
+        # Start processing in background (don't await)
+        if background_tasks:
+            background_tasks.add_task(episode_service.process_episode, episode.id)
+            logger.info(f"Episode {episode.id} queued for background processing")
         else:
-            # Fallback: process directly if queue manager not available
-            logger.warning("Queue manager not available, processing episode directly")
+            # Fallback: process directly if no background tasks
+            logger.warning("No background tasks available, processing episode directly")
             await episode_service.process_episode(episode.id)
         
         # Log success to monitoring (if available)
@@ -646,7 +627,6 @@ async def upload_episode(file: UploadFile = File(...), request: Request = None):
         return {
             "ok": True, 
             "episodeId": episode.id, 
-            "jobId": job_id,
             "message": "Upload successful and processing started"
         }
         
@@ -993,10 +973,84 @@ async def reload_episodes():
         logger.error(f"Failed to reload episodes: {e}")
         return {"ok": False, "error": str(e)}
 
-@app.get("/api/episodes/{episode_id}/clips")
-async def get_episode_clips(episode_id: str, regenerate: bool = False, background_tasks: BackgroundTasks = None):
-    """Get clips for a specific episode"""
+@app.head("/api/episodes/{episode_id}/clips")
+async def head_episode_clips(episode_id: str):
+    """HEAD request to check if clips are ready"""
     try:
+        # Check readiness first using progress service
+        try:
+            from services.progress_service import progress_service
+            progress = progress_service.get_progress(episode_id)
+            
+            # Check if clips are ready
+            is_ready = False
+            if progress and isinstance(progress, dict):
+                # Extract progress data from the service response
+                progress_data = progress.get("progress", {})
+                if progress_data.get("stage") == "completed":
+                    is_ready = True
+                elif int(progress_data.get("percent", 0)) >= 100:
+                    is_ready = True
+            
+            if not is_ready:
+                # Check for persisted output files
+                from pathlib import Path
+                from config.settings import UPLOAD_DIR
+                ep_path = Path(UPLOAD_DIR) / episode_id
+                clips_file = ep_path / "clips.json"
+                clips_dir = ep_path / "clips"
+                is_ready = clips_file.exists() or clips_dir.exists()
+        except Exception:
+            is_ready = False
+        
+        if is_ready:
+            from fastapi.responses import Response
+            return Response(status_code=204, headers={"Cache-Control": "no-store"})
+        else:
+            from fastapi.responses import Response
+            return Response(status_code=202, headers={"Retry-After": "15", "Cache-Control": "no-store"})
+    except Exception:
+        from fastapi.responses import Response
+        return Response(status_code=202, headers={"Retry-After": "15", "Cache-Control": "no-store"})
+
+@app.get("/api/episodes/{episode_id}/clips")
+async def get_episode_clips(episode_id: str, regenerate: bool = False, background_tasks: BackgroundTasks = None, request: Request = None):
+    """Get clips for a specific episode - returns 202 if not ready, 200 with data if ready"""
+    try:
+        # Check readiness first using progress service
+        try:
+            from services.progress_service import progress_service
+            progress = progress_service.get_progress(episode_id)
+            
+            # Check if clips are ready
+            is_ready = False
+            if progress and isinstance(progress, dict):
+                # Extract progress data from the service response
+                progress_data = progress.get("progress", {})
+                if progress_data.get("stage") == "completed":
+                    is_ready = True
+                elif int(progress_data.get("percent", 0)) >= 100:
+                    is_ready = True
+            
+            if not is_ready:
+                # Check for persisted output files
+                from pathlib import Path
+                from config.settings import UPLOAD_DIR
+                ep_path = Path(UPLOAD_DIR) / episode_id
+                clips_file = ep_path / "clips.json"
+                clips_dir = ep_path / "clips"
+                is_ready = clips_file.exists() or clips_dir.exists()
+            
+            if not is_ready:
+                from fastapi.responses import JSONResponse
+                return JSONResponse(
+                    {"ok": False, "ready": False, "message": "Scoring in progress"},
+                    status_code=202,
+                    headers={"Retry-After": "15", "Cache-Control": "no-store"}
+                )
+        except Exception as e:
+            logger.warning(f"Progress check failed: {e}, proceeding with episode check")
+        
         # Get the episode from the service
         episode = await episode_service.get_episode(episode_id)
         if not episode:
@@ -1008,20 +1062,16 @@ async def get_episode_clips(episode_id: str, regenerate: bool = False, backgroun
                 "message": "Episode not found"
             }
         
-        # Check if processing is complete
-        if episode.status != "completed":
-            return {
-                "ok": False,
-                "clips": [],
-                "count": 0,
-                "episode_id": episode_id,
-                "message": "Episode still processing",
-                "status": episode.status
-            }
-        
-        # Generate clips using the existing clip score service
+        # Get clips from episode (already generated during processing)
         try:
-            clips = await clip_score_service.get_candidates(episode_id)
+            if hasattr(episode, 'clips') and episode.clips:
+                # Use already generated clips from episode processing
+                clips = episode.clips
+                logger.info(f"Using cached clips for episode {episode_id}: {len(clips)} clips")
+            else:
+                # Fallback: generate clips if not available (shouldn't happen)
+                logger.warning(f"No cached clips found for episode {episode_id}, generating now...")
+                clips = await clip_score_service.get_candidates(episode_id)
             
             # Import preview service
             from services.preview_service import ensure_preview, get_episode_media_path
@@ -1036,11 +1086,11 @@ async def get_episode_clips(episode_id: str, regenerate: bool = False, backgroun
                 start_sec = float(clip.get("start", 0))
                 end_sec = float(clip.get("end", 0))
                 
-                # Check if preview already exists
+                # Check if preview already exists or generate it
                 preview_url = None
                 if source_media and source_media.exists():
                     # Try to get existing preview first
-                    from services.preview_service import build_preview_filename
+                    from services.preview_service import build_preview_filename, ensure_preview
                     from pathlib import Path
                     from config.settings import OUTPUT_DIR
                     
@@ -1049,18 +1099,26 @@ async def get_episode_clips(episode_id: str, regenerate: bool = False, backgroun
                     
                     if preview_path.exists() and preview_path.stat().st_size > 0:
                         preview_url = f"/clips/previews/{preview_filename}"
-                    elif background_tasks:
-                        # Schedule background generation for missing previews
-                        background_tasks.add_task(
-                            ensure_preview,
-                            source_media=source_media,
-                            episode_id=episode_id,
-                            clip_id=clip_id,
-                            start_sec=start_sec,
-                            end_sec=end_sec,
-                            max_preview_sec=min(30.0, end_sec - start_sec or 20.0),
-                            pad_start_sec=0.0,
-                        )
+                    else:
+                        # Generate preview synchronously for immediate availability
+                        try:
+                            generated_url = ensure_preview(
+                                source_media=source_media,
+                                episode_id=episode_id,
+                                clip_id=clip_id,
+                                start_sec=start_sec,
+                                end_sec=end_sec,
+                                max_preview_sec=min(30.0, end_sec - start_sec or 20.0),
+                                pad_start_sec=0.0,
+                            )
+                            if generated_url:
+                                preview_url = generated_url
+                                logger.info(f"Generated preview for clip {clip_id}: {preview_url}")
+                            else:
+                                logger.warning(f"Failed to generate preview for clip {clip_id}")
+                        except Exception as e:
+                            logger.error(f"Preview generation failed for clip {clip_id}: {e}")
+                            # Continue without preview
                 
                 formatted_clips.append({
                     "id": clip_id,
@@ -1076,13 +1134,28 @@ async def get_episode_clips(episode_id: str, regenerate: bool = False, backgroun
                     "previewUrl": preview_url  # Add preview URL
                 })
             
-            return {
-                "ok": True,
-                "clips": formatted_clips,
-                "count": len(formatted_clips),
-                "episode_id": episode_id,
-                "_source": "generated"
-            }
+            # Add ETag and caching for immutable clips
+            import json
+            import hashlib
+            from fastapi.responses import JSONResponse
+            
+            payload = {"ok": True, "ready": True, "clips": formatted_clips}
+            body = json.dumps(formatted_clips, sort_keys=True, separators=(",",":")).encode()
+            etag = hashlib.md5(body).hexdigest()
+            
+            # Check If-None-Match header for 304 responses
+            if_none_match = request.headers.get("if-none-match") if request else None
+            if if_none_match == etag:
+                from fastapi.responses import Response
+                return Response(status_code=304, headers={"ETag": etag})
+            
+            return JSONResponse(
+                payload,
+                headers={
+                    "ETag": etag,
+                    "Cache-Control": "public, max-age=3600, stale-while-revalidate=120"
+                }
+            )
             
         except Exception as e:
             logger.error(f"Clip generation failed: {e}")
@@ -1211,65 +1284,24 @@ async def get_progress():
 
 @app.get("/api/progress/{episode_id}")
 async def get_episode_progress(episode_id: str):
-    """Get processing progress for a specific episode with simple disk fallback"""
+    """Get processing progress for a specific episode - fail-safe implementation"""
     try:
-        import os
-        from pathlib import Path
+        from services.progress_service import progress_service
+        result = progress_service.get_progress(episode_id)
         
-        # Simple disk-based progress checking
-        from config.settings import UPLOAD_DIR
-        UPLOADS = Path(os.getenv("UPLOADS_DIR", str(UPLOAD_DIR)))
-        audio = UPLOADS / f"{episode_id}.mp3"
-        transcript = UPLOADS / "transcripts" / f"{episode_id}.json"
-
-        if transcript.exists() and transcript.stat().st_size > 10:
-            return {
-                "ok": True,
-                "progress": {
-                    "percentage": 100,
-                    "stage": "completed",
-                    "message": "Completed (inferred from transcript on disk)",
-                    "timestamp": datetime.now().isoformat()
-                },
-                "status": "completed"
-            }
-
-        if audio.exists() and audio.stat().st_size > 10:
-            return {
-                "ok": True,
-                "progress": {
-                    "percentage": 10,
-                    "stage": "queued",
-                    "message": "Audio found, but transcript not yet generated",
-                    "timestamp": datetime.now().isoformat()
-                },
-                "status": "queued"
-            }
-
-        return {
-            "ok": False,
-            "progress": {
-                "percentage": 0,
-                "stage": "unknown",
-                "message": "Episode not found on disk",
-                "timestamp": datetime.now().isoformat()
-            },
-            "status": "unknown"
-        }
+        # The progress service now returns a dict directly
+        # Extract the progress data from the service response
+        progress_data = result.get("progress", {}) if result else {}
         
+        # Normalize: always ensure percent exists and remove percentage
+        perc = progress_data.pop("percentage", None)
+        if "percent" not in progress_data:
+            progress_data["percent"] = int(perc) if perc is not None else int(progress_data.get("percent", 0) or 0)
+        
+        return {"ok": True, "progress": progress_data}
     except Exception as e:
-        logger.error(f"Progress check failed: {e}")
-        # Always return 200 with error info to prevent frontend retry loops
-        return {
-            "ok": False, 
-            "progress": {
-                "percentage": 0,
-                "stage": "error",
-                "message": f"Progress check failed: {str(e)}",
-                "timestamp": datetime.now().isoformat()
-            },
-            "status": "error"
-        }
+        logger.error(f"Progress endpoint error: {e}")
+        return {"ok": False, "error": str(e), "progress": {"stage": "error", "percent": 0}}
 
 @app.get("/api/candidate/debug")
 async def candidate_debug(
@@ -1534,6 +1566,10 @@ app.include_router(debug_router)
 # Include clips router
 from routes.clips import router as clips_router
 app.include_router(clips_router)
+
+# Include titles router
+from routes_titles import router as titles_router
+app.include_router(titles_router)
 
 # Authentication Endpoints
 @app.post("/api/auth/signup")

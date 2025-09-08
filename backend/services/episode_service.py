@@ -9,7 +9,14 @@ import json
 import time
 from typing import List, Optional, Dict
 from datetime import datetime
-import whisper
+try:
+    import faster_whisper
+    WHISPER_AVAILABLE = True
+    WHISPER_TYPE = "faster-whisper"
+except ImportError:
+    import whisper
+    WHISPER_AVAILABLE = True
+    WHISPER_TYPE = "whisper"
 import aiofiles
 import ffmpeg
 from pydub import AudioSegment
@@ -165,30 +172,129 @@ class EpisodeService:
     def _init_whisper(self):
         """Initialize Whisper model"""
         try:
-            logger.info("Loading Whisper model...")
-            # Use base model for stability
-            self.whisper_model = whisper.load_model("base")
-            logger.info("Whisper model 'base' loaded successfully")
+            logger.info(f"Loading {WHISPER_TYPE} model...")
+            if WHISPER_TYPE == "faster-whisper":
+                # Use faster-whisper with CPU for now to avoid CUDA library issues
+                device = "cpu"  # Force CPU to avoid cublas64_12.dll issues
+                compute_type = "int8"  # Use int8 for CPU
+                self.whisper_model = faster_whisper.WhisperModel("base", device=device, compute_type=compute_type)
+                logger.info(f"Faster-Whisper model 'base' loaded successfully on {device} with {compute_type}")
+            else:
+                # Fallback to regular whisper
+                self.whisper_model = whisper.load_model("base")
+                logger.info("Whisper model 'base' loaded successfully")
         except Exception as e:
             logger.error(f"Failed to load Whisper model: {e}")
             logger.warning("Will attempt to load model on first use")
             self.whisper_model = None
     
+    def _should_use_fp16(self) -> bool:
+        """Device-aware FP16 detection - use FP16 only if GPU supports it"""
+        try:
+            import torch
+            if torch.cuda.is_available():
+                # Check if GPU supports FP16 (compute capability >= 7.0)
+                capability = torch.cuda.get_device_capability()
+                if capability >= (7, 0):
+                    return True
+            return False
+        except Exception:
+            return False
+
+    def _get_speed_preset(self) -> str:
+        """Get speed preset: fast|balanced|quality"""
+        return os.getenv("SPEED_PRESET", "balanced").lower()
+
+    def _get_whisper_beam_size(self) -> int:
+        """Get beam size based on speed preset"""
+        preset = self._get_speed_preset()
+        if preset == "fast":
+            return 1
+        elif preset == "quality":
+            return 4
+        else:  # balanced
+            return 2
+
+    def _get_whisper_best_of(self) -> int:
+        """Get best_of based on speed preset"""
+        preset = self._get_speed_preset()
+        if preset == "fast":
+            return 1
+        elif preset == "quality":
+            return 5
+        else:  # balanced
+            return 2
+
+    def _get_whisper_temperature(self):
+        """Get temperature based on speed preset"""
+        preset = self._get_speed_preset()
+        if preset == "fast":
+            return 0.0
+        elif preset == "quality":
+            return [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+        else:  # balanced
+            return 0.0
+
+    def _get_whisper_condition_previous(self) -> bool:
+        """Get condition_previous based on speed preset"""
+        preset = self._get_speed_preset()
+        if preset == "fast":
+            return False
+        else:  # balanced and quality
+            return True
+
     def _update_progress(self, episode_id: str, stage: str, percentage: float, message: str = ""):
-        """Update progress for an episode"""
-        if episode_id not in self.progress:
-            self.progress[episode_id] = {}
-        
-        self.progress[episode_id].update({
-            "stage": stage,
-            "percentage": percentage,
-            "message": message,
-            "timestamp": datetime.now().isoformat()
-        })
-        
-        # Log progress with visual indicator like the backend logs
-        progress_bar = "█" * int(percentage / 10) + "▌" * (10 - int(percentage / 10))
-        logger.info(f"Episode {episode_id}: {stage} - {percentage:.1f}%|{progress_bar}| {message}")
+        """Update progress for an episode using atomic file persistence"""
+        try:
+            # Update in-memory cache for backward compatibility
+            if episode_id not in self.progress:
+                self.progress[episode_id] = {}
+            
+            self.progress[episode_id].update({
+                "stage": stage,
+                "percentage": percentage,
+                "message": message,
+                "timestamp": datetime.now().isoformat()
+            })
+            
+            # Update persistent progress service
+            from services.progress_service import progress_service
+            progress_service.update_progress(
+                episode_id=episode_id,
+                stage=stage,
+                percentage=int(percentage),
+                message=message
+            )
+            
+            # Log progress with visual indicator like the backend logs
+            progress_bar = "█" * int(percentage / 10) + "▌" * (10 - int(percentage / 10))
+            logger.info(f"Episode {episode_id}: {stage} - {percentage:.1f}%|{progress_bar}| {message}")
+            
+        except Exception as e:
+            logger.error(f"Failed to update progress for {episode_id}: {e}")
+            # Still log the progress even if persistence fails
+            progress_bar = "█" * int(percentage / 10) + "▌" * (10 - int(percentage / 10))
+            logger.info(f"Episode {episode_id}: {stage} - {percentage:.1f}%|{progress_bar}| {message}")
+    
+    def _mark_completed(self, episode_id: str, message: str = "Episode processing completed successfully!"):
+        """Mark episode as completed using progress service"""
+        try:
+            from services.progress_service import progress_service
+            progress_service.mark_completed(episode_id, message)
+            self._update_progress(episode_id, "completed", 100.0, message)
+        except Exception as e:
+            logger.error(f"Failed to mark episode {episode_id} as completed: {e}")
+            self._update_progress(episode_id, "completed", 100.0, message)
+    
+    def _mark_error(self, episode_id: str, error_message: str):
+        """Mark episode as errored using progress service"""
+        try:
+            from services.progress_service import progress_service
+            progress_service.mark_error(episode_id, error_message)
+            self._update_progress(episode_id, "error", 0.0, f"Error: {error_message}")
+        except Exception as e:
+            logger.error(f"Failed to mark episode {episode_id} as errored: {e}")
+            self._update_progress(episode_id, "error", 0.0, f"Error: {error_message}")
     
     def _episode_paths(self, episode_id: str):
         """Get the expected file paths for an episode"""
@@ -323,7 +429,7 @@ class EpisodeService:
             
         except Exception as e:
             logger.error(f"Failed to create episode {episode_id}: {e}")
-            self._update_progress(episode_id, "error", 0.0, f"Upload failed: {str(e)}")
+            self._mark_error(episode_id, f"Upload failed: {str(e)}")
             raise
     
     async def get_episode(self, episode_id: str) -> Optional[Episode]:
@@ -341,6 +447,9 @@ class EpisodeService:
     async def process_episode(self, episode_id: str):
         """Process episode: transcribe and analyze"""
         try:
+            # Import progress writer
+            from services.progress_writer import write_progress
+            
             # Add to processing guard
             self._processing_episodes.add(episode_id)
             
@@ -358,7 +467,7 @@ class EpisodeService:
             episode.status = "processing"
             episode.uploaded_at = datetime.now()
             tracker.update_stage("initializing", 100, "Starting audio processing...")
-            self._update_progress(episode_id, "processing", 30.0, "Starting audio processing...")
+            write_progress(episode_id, "converting", 1, "Preparing media...")
             
             logger.info(f"Processing episode {episode_id}")
             
@@ -367,66 +476,122 @@ class EpisodeService:
             
             # Convert to audio if needed
             tracker.update_stage("audio_processing", 0, "Converting to audio format...")
-            self._update_progress(episode_id, "converting", 35.0, "Converting to audio format...")
+            write_progress(episode_id, "converting", 1, "Converting to audio format...")
             audio_path = await self._ensure_audio_format(file_path)
             
             # Store the audio path in the episode
             episode.audio_path = audio_path
             tracker.update_stage("audio_processing", 50, "Audio conversion completed")
-            self._update_progress(episode_id, "converted", 45.0, "Audio conversion completed")
+            write_progress(episode_id, "converting", 1, "Audio conversion completed")
             
             # Get duration
             tracker.update_stage("audio_processing", 75, "Analyzing audio duration...")
-            self._update_progress(episode_id, "analyzing", 50.0, "Analyzing audio duration...")
+            write_progress(episode_id, "transcribing", 1, "Transcribing...")
             duration = await self._get_audio_duration(audio_path)
             episode.duration = duration
             tracker.update_stage("audio_processing", 100, f"Audio ready - Duration: {duration:.1f}s")
-            self._update_progress(episode_id, "analyzed", 55.0, f"Audio duration: {duration:.1f}s")
             
             # Transcribe audio with enhanced progress
             if self._has_faster_whisper():
                 tracker.update_stage("transcription", 0, "Starting transcription with Faster-Whisper...")
-                self._update_progress(episode_id, "transcribing", 60.0, "Starting transcription with Faster-Whisper...")
                 transcript = await self._transcribe_with_faster_whisper(audio_path, episode_id, tracker, duration)
             else:
                 tracker.update_stage("transcription", 0, "Starting transcription with Whisper...")
-                self._update_progress(episode_id, "transcribing", 60.0, "Starting transcription with Whisper...")
                 transcript = await self._transcribe_audio_with_progress(audio_path, episode_id, tracker)
             
             # Store transcript in episode
             episode.transcript = transcript
             tracker.update_stage("transcription", 100, f"Transcription completed: {len(transcript)} segments")
-            self._update_progress(episode_id, "transcribed", 85.0, f"Transcription completed: {len(transcript)} segments")
+            write_progress(episode_id, "transcribing", 95, f"Transcription completed: {len(transcript)} segments")
             
             # Save episode with transcript
             self._save_episode(episode)
             
             # Generate clips after transcription is complete
             tracker.update_stage("scoring", 0, "Finding viral clips...")
-            self._update_progress(episode_id, "scoring", 90.0, "Finding viral clips...")
+            write_progress(episode_id, "scoring", 85, "Finding viral moments...")
             
             try:
-                # Import clip scoring service
-                from services.clip_score import ClipScoreService
-                clip_score_service = ClipScoreService(self)
+                # Check if clips already exist to avoid re-scoring
+                if hasattr(episode, 'clips') and episode.clips:
+                    logger.info(f"Using existing clips for episode {episode_id}: {len(episode.clips)} clips")
+                    clips = episode.clips
+                    
+                    # Ensure clips are also saved to file if they exist in memory but not on disk
+                    try:
+                        from pathlib import Path
+                        episode_dir = Path(UPLOAD_DIR) / episode_id
+                        clips_file = episode_dir / "clips.json"
+                        
+                        if not clips_file.exists():
+                            episode_dir.mkdir(exist_ok=True)
+                            
+                            # Convert clips to serializable format
+                            serializable_clips = []
+                            for clip in clips:
+                                serializable_clip = {}
+                                for key, value in clip.items():
+                                    if isinstance(value, (str, int, float, bool, list, dict, type(None))):
+                                        serializable_clip[key] = value
+                                    else:
+                                        serializable_clip[key] = str(value)
+                                serializable_clips.append(serializable_clip)
+                            
+                            with open(clips_file, 'w', encoding='utf-8') as f:
+                                json.dump(serializable_clips, f, indent=2, ensure_ascii=False)
+                            
+                            logger.info(f"Saved existing {len(clips)} clips to {clips_file}")
+                    except Exception as e:
+                        logger.error(f"Failed to save existing clips to file: {e}")
+                else:
+                    # Import clip scoring service
+                    from services.clip_score import ClipScoreService
+                    clip_score_service = ClipScoreService(self)
+                    
+                    # Generate clips using the scoring service
+                    clips = await clip_score_service.get_candidates(episode_id)
+                    episode.clips = clips  # Store clips in episode
+                    logger.info(f"Generated {len(clips)} clips for episode {episode_id}")
                 
-                # Generate clips using the scoring service
-                clips = await clip_score_service.get_candidates(episode_id)
-                episode.clips = clips  # Store clips in episode
                 tracker.update_stage("scoring", 100, f"Found {len(clips)} viral clips")
-                self._update_progress(episode_id, "scored", 95.0, f"Found {len(clips)} clips")
-                logger.info(f"Generated {len(clips)} clips for episode {episode_id}")
+                write_progress(episode_id, "scoring", 100, f"Found {len(clips)} clips")
+                
+                # Save clips to clips.json file for title generation API
+                try:
+                    from pathlib import Path
+                    episode_dir = Path(UPLOAD_DIR) / episode_id
+                    episode_dir.mkdir(exist_ok=True)
+                    clips_file = episode_dir / "clips.json"
+                    
+                    # Convert clips to serializable format
+                    serializable_clips = []
+                    for clip in clips:
+                        serializable_clip = {}
+                        for key, value in clip.items():
+                            if isinstance(value, (str, int, float, bool, list, dict, type(None))):
+                                serializable_clip[key] = value
+                            else:
+                                serializable_clip[key] = str(value)
+                        serializable_clips.append(serializable_clip)
+                    
+                    with open(clips_file, 'w', encoding='utf-8') as f:
+                        json.dump(serializable_clips, f, indent=2, ensure_ascii=False)
+                    
+                    logger.info(f"Saved {len(clips)} clips to {clips_file}")
+                except Exception as e:
+                    logger.error(f"Failed to save clips to file: {e}")
             except Exception as e:
                 logger.error(f"Clip generation failed: {e}")
                 episode.clips = []
                 tracker.update_stage("scoring", 100, "Clip generation failed, continuing...")
-                self._update_progress(episode_id, "scored", 95.0, "Clip generation failed, continuing...")
+                write_progress(episode_id, "scoring", 100, "Clip generation failed, continuing...")
             
             # Update episode status
             episode.status = "completed"
             episode.processed_at = datetime.now()
             tracker.update_stage("finalizing", 100, "Episode processing completed successfully!")
-            self._update_progress(episode_id, "completed", 100.0, "Episode processing completed successfully!")
+            write_progress(episode_id, "processing", 96, "Finalizing clips...")
+            write_progress(episode_id, "completed", 100, "Done")
             
             # Extend TTL for completed episodes so they remain accessible
             new_expires_at = time.time() + PROGRESS_TRACKER_TTL
@@ -439,6 +604,9 @@ class EpisodeService:
             
         except Exception as e:
             logger.error(f"Episode processing failed for {episode_id}: {e}")
+            from services.progress_writer import write_progress
+            write_progress(episode_id, "error", 0, f"{type(e).__name__}: {e}")
+            
             episode = self.episodes.get(episode_id)
             if episode:
                 episode.status = "failed"
@@ -450,7 +618,7 @@ class EpisodeService:
                     # Extend TTL for failed episodes so they remain accessible
                     new_expires_at = time.time() + PROGRESS_TRACKER_TTL
                     self.enhanced_trackers[episode_id] = (tracker, new_expires_at)
-                self._update_progress(episode_id, "error", 0.0, f"Processing failed: {str(e)}")
+                self._mark_error(episode_id, f"Processing failed: {str(e)}")
         finally:
             # Remove from processing guard
             self._processing_episodes.discard(episode_id)
@@ -530,21 +698,38 @@ class EpisodeService:
                     raise Exception("Failed to load Whisper model")
             
             # Run transcription in thread pool to avoid blocking
-            result = await loop.run_in_executor(
-                None, 
-                lambda: self.whisper_model.transcribe(
-                    audio_path,
-                    language=WHISPER_LANGUAGE,
-                    word_timestamps=True,  # Enable word timestamps for better accuracy
-                    fp16=False,  # Force FP32 to avoid warnings
-                    verbose=False,  # Disable verbose logging for performance
-                    beam_size=5,  # Better quality decoding
-                    best_of=5,    # Better quality decoding
-                    temperature=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],  # Multiple temperatures for better results
-                    condition_on_previous_text=True,  # Better context
-                    initial_prompt="This is a podcast episode with clear speech and natural conversation."  # Help Whisper understand context
+            if WHISPER_TYPE == "faster-whisper":
+                # Use faster-whisper API
+                result = await loop.run_in_executor(
+                    None, 
+                    lambda: self.whisper_model.transcribe(
+                        audio_path,
+                        language=WHISPER_LANGUAGE,
+                        word_timestamps=True,
+                        beam_size=self._get_whisper_beam_size(),
+                        best_of=self._get_whisper_best_of(),
+                        temperature=self._get_whisper_temperature(),
+                        condition_on_previous_text=self._get_whisper_condition_previous(),
+                        initial_prompt="This is a podcast episode with clear speech and natural conversation."
+                    )
                 )
-            )
+            else:
+                # Use regular whisper API
+                result = await loop.run_in_executor(
+                    None, 
+                    lambda: self.whisper_model.transcribe(
+                        audio_path,
+                        language=WHISPER_LANGUAGE,
+                        word_timestamps=True,
+                        fp16=self._should_use_fp16(),
+                        verbose=False,
+                        beam_size=self._get_whisper_beam_size(),
+                        best_of=self._get_whisper_best_of(),
+                        temperature=self._get_whisper_temperature(),
+                        condition_on_previous_text=self._get_whisper_condition_previous(),
+                        initial_prompt="This is a podcast episode with clear speech and natural conversation."
+                    )
+                )
             
             # Update progress during processing
             self._update_progress(episode_id, "processing", 75.0, "Processing transcription results...")
@@ -621,9 +806,12 @@ class EpisodeService:
     async def _transcribe_audio_with_progress(self, audio_path: str, episode_id: str, tracker: EnhancedProgressTracker) -> List[TranscriptSegment]:
         """Enhanced transcription with better progress tracking"""
         try:
+            from services.progress_writer import write_progress
+            
             # Lazy load Whisper model if not available
             if not self.whisper_model:
                 tracker.update_stage("transcription", 5, "Loading Whisper model...")
+                write_progress(episode_id, "transcribing", 5, "Loading model...")
                 try:
                     self.whisper_model = whisper.load_model("base")
                     logger.info("Whisper model loaded successfully")
@@ -633,6 +821,7 @@ class EpisodeService:
             
             logger.info(f"Starting enhanced transcription for {audio_path}")
             tracker.update_stage("transcription", 10, "Starting Whisper transcription...")
+            write_progress(episode_id, "transcribing", 10, "Starting transcription...")
             
             # Get audio duration for progress calculation
             duration = await self._get_audio_duration(audio_path)
@@ -643,6 +832,7 @@ class EpisodeService:
             
             # Update progress to show transcription is running
             tracker.update_stage("transcription", 20, "Whisper model processing audio...")
+            write_progress(episode_id, "transcribing", 20, "Processing audio...")
             
             # Run transcription in thread pool to avoid blocking
             result = await loop.run_in_executor(
@@ -663,6 +853,7 @@ class EpisodeService:
             
             # Update progress during processing
             tracker.update_stage("transcription", 60, "Processing transcription results...")
+            write_progress(episode_id, "transcribing", 60, "Processing results...")
             
             # Convert to our format with progress updates
             transcript = []
@@ -673,6 +864,8 @@ class EpisodeService:
                 segment_progress = 60 + (i / max(1, total_segments)) * 35  # 60-95%
                 tracker.update_stage("transcription", segment_progress, 
                                    f"Processing segments... {i+1}/{total_segments}")
+                write_progress(episode_id, "transcribing", int(segment_progress), 
+                             f"Processing segments... {i+1}/{total_segments}")
                 
                 transcript_segment = TranscriptSegment(
                     start=segment.get("start", 0.0),
@@ -682,6 +875,9 @@ class EpisodeService:
                 transcript.append(transcript_segment)
             
             logger.info(f"Enhanced transcription completed: {len(transcript)} segments")
+            # Use the final calculated progress (95%) instead of hardcoding 80%
+            final_progress = 60 + (total_segments / max(1, total_segments)) * 35  # This should be 95%
+            write_progress(episode_id, "transcribing", int(final_progress), f"Transcription complete: {len(transcript)} segments")
             return transcript
             
         except Exception as e:
@@ -694,22 +890,31 @@ class EpisodeService:
         """Transcribe using faster-whisper with streaming progress"""
         try:
             from faster_whisper import WhisperModel
+            from services.progress_writer import write_progress
             
             # Load model once
             if not hasattr(self, 'fw_model'):
                 tracker.update_stage("transcription", 5, "Loading Faster-Whisper model...")
-                self.fw_model = WhisperModel("base", compute_type="int8")
-                logger.info("Faster-Whisper model loaded successfully")
+                write_progress(episode_id, "transcribing", 5, "Loading model...")
+                # Use CPU to avoid CUDA library issues
+                compute_type = "int8"  # Use int8 for CPU
+                self.fw_model = WhisperModel("base", device="cpu", compute_type=compute_type)
+                logger.info(f"Faster-Whisper model loaded successfully with {compute_type}")
             
             segments_list = []
             tracker.update_stage("transcription", 10, "Starting Faster-Whisper transcription...")
+            write_progress(episode_id, "transcribing", 10, "Starting transcription...")
             
-            # Stream segments
+            # Stream segments with balanced preset settings
             segments, info = self.fw_model.transcribe(
                 audio_path, 
                 language="en",
                 vad_filter=True,
-                beam_size=5
+                beam_size=self._get_whisper_beam_size(),
+                best_of=self._get_whisper_best_of(),
+                temperature=self._get_whisper_temperature(),
+                condition_on_previous_text=self._get_whisper_condition_previous(),
+                word_timestamps=True
             )
             
             last_pct = 10
@@ -726,10 +931,12 @@ class EpisodeService:
                 if pct - last_pct >= 2.0:  # Update every 2%
                     detail = f"{int(seg.end)}s / {int(total_duration)}s"
                     tracker.update_stage("transcription", pct, "Transcribing audio...", detail)
+                    write_progress(episode_id, "transcribing", int(pct), f"Transcribing... {detail}")
                     last_pct = pct
                     await asyncio.sleep(0)  # Yield control
                     
             tracker.update_stage("transcription", 100, "Faster-Whisper transcription complete")
+            write_progress(episode_id, "transcribing", 95, "Transcription complete")
             logger.info(f"Faster-Whisper transcription completed: {len(segments_list)} segments")
             return segments_list
             

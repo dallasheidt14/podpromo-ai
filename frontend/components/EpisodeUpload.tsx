@@ -4,13 +4,15 @@ import { useState, useCallback, useEffect, useRef } from 'react';
 import { useDropzone } from 'react-dropzone';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Upload, FileAudio, FileVideo, X, CheckCircle, AlertCircle, Clock, Loader2 } from 'lucide-react';
-import { Episode, Clip, ProgressInfo } from '@shared/types';
-import { normalizeClip, normalizeProgress } from '@shared/normalize';
-import { getClips, uploadFile, handleApiResult } from '@shared/api';
+import { Episode, Clip, ProgressInfo } from '../src/shared/types';
+import { normalizeClip, normalizeProgressInfo, normalizeProgress } from '../src/shared/normalize';
+import { getClips, uploadFile, handleApiResult } from '../src/shared/api';
+import { createProgressPoller, PollingOptions } from '../src/shared/polling';
 
 type Props = {
   onEpisodeUploaded: (id: string) => void;
   onCompleted?: () => void;
+  onClipsFetched?: (clips: Clip[]) => void;
   initialEpisodeId?: string;
   initialUploadStatus?: 'idle'|'uploading'|'processing'|'completed'|'error';
 };
@@ -18,6 +20,7 @@ type Props = {
 export default function EpisodeUpload({
   onEpisodeUploaded,
   onCompleted,
+  onClipsFetched,
   initialEpisodeId,
   initialUploadStatus = 'idle',
 }: Props) {
@@ -34,173 +37,78 @@ export default function EpisodeUpload({
   // Guard against duplicate clips fetch
   const clipsFetchedRef = useRef(false);
   const didFetchRef = useRef(false);
+  const pollerRef = useRef<any>(null);
 
   // 🔁 If parent passes an id+status, pick up polling
   useEffect(() => {
     if (initialEpisodeId) setEpisodeId(initialEpisodeId);
   }, [initialEpisodeId]);
 
+  // Auto-fetch clips when processing completes
   useEffect(() => {
-    setUploadStatus(initialUploadStatus);
-  }, [initialUploadStatus]);
-
-  // Fetch clips function with proper API endpoint and normalization
-  const fetchClips = async (episodeId: string) => {
-    try {
-      console.log('[CLIPS] Fetching clips for episode:', episodeId);
-      const result = await getClips(episodeId);
-      
-      handleApiResult(
-        result,
-        (data) => {
-          console.log('[CLIPS] Retrieved clips:', data);
-          if (Array.isArray(data.clips)) {
-            const normalized = data.clips.map(normalizeClip);
-            
-            // Filter ads and sort by score, then take top N
-            const TOP_N = 12; // make this easy to change
-            const isAd = (c: any) => Boolean(c?.is_advertisement || c?._ad_flag || c?.features?.is_advertisement);
-            
-            const ranked = [...normalized]
-              .filter(c => !isAd(c))
-              .sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
-              .slice(0, TOP_N);
-            
-            setClips(ranked);
-            console.log(`[CLIPS] Found ${normalized.length} clips, showing top ${ranked.length} after filtering`);
-          }
-        },
-        (error) => {
-          console.error('[CLIPS] Failed to fetch clips:', error);
-        }
-      );
-    } catch (error) {
-      console.error('[CLIPS] Unexpected error:', error);
-    }
-  };
-
-  // Poll for progress updates with proper cleanup
-  useEffect(() => {
-    if (!episodeId || uploadStatus !== 'processing') return;
-
-    let active = true;
-    let timer: NodeJS.Timeout;
-    const ctrl = new AbortController();
-    let retryCount = 0;
-    const maxRetries = 3;
-
-    async function poll() {
-      if (!active) return;
-      
-      try {
-        console.log('[POLL] Starting poll for episode:', episodeId);
-        const response = await fetch(`/api/progress/${episodeId}`, { signal: ctrl.signal });
-        console.log('[POLL] Response status:', response.status);
-        
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-        }
-
-        // Use shared normalization for consistent parsing
-        const data = await response.json();
-        console.log('[POLL] Parsed data:', data);
-        
-        const progressInfo = normalizeProgress(data);
-        
-        if (progressInfo) {
-          console.log('[POLL] Progress info:', progressInfo);
-          setProgressData(progressInfo);
-          setUploadProgress(progressInfo.percentage || 0);
-          console.log('[POLL] Updated progress:', progressInfo.stage, progressInfo.percentage);
-          
-          // Check if processing is complete or failed
-          if (progressInfo.stage === 'completed') {
-            console.log('[POLL] Episode completed successfully');
-            setUploadStatus('completed');
-            
-            // Persist episode ID for resume flow
-            localStorage.setItem('lastEpisodeId', episodeId);
-            
-            // Notify parent that processing is complete
-            onCompleted?.();
-            return; // Stop polling
-          } else if (progressInfo.stage === 'error') {
-            console.log('[POLL] Episode processing failed:', progressInfo.message);
-            if (active) {
-              setUploadStatus('error');
-              setError(progressInfo.message);
-            }
-            return; // Stop polling
-          }
-        } else {
-          console.warn('[POLL] No progress info found in response:', data);
-        }
-        
-        retryCount = 0; // Reset on success
-        
-        // Schedule next poll with adaptive interval
-        if (active) {
-          const interval = getPollingInterval(progressInfo?.stage || 'processing');
-          timer = setTimeout(poll, interval);
-        }
-        
-      } catch (err) {
-        if (!active) return;
-        
-        console.error('[POLL] Failed to fetch progress:', err);
-        retryCount++;
-        
-        if (retryCount >= maxRetries) {
-          console.error('[POLL] Max retries reached, stopping polling');
-          setError('Lost connection to server. Please refresh.');
-          setUploadStatus('error');
-        } else {
-          console.log(`[POLL] Retry ${retryCount}/${maxRetries} after error:`, err);
-          if (active) {
-            timer = setTimeout(poll, 2000 * retryCount); // Exponential backoff
-          }
-        }
-      }
-    }
-
-    poll();
-
-    return () => {
-      active = false;
-      if (timer) clearTimeout(timer);
-      ctrl.abort(); // cancel in-flight fetch
-    };
-  }, [episodeId, uploadStatus]);
-
-  // Ensure fetchClips is called exactly once when status hits completed
-  useEffect(() => {
-    if (!episodeId || uploadStatus !== 'processing') return;
-    const stage = progressData?.stage?.toLowerCase();
-    if (stage === 'completed' && !didFetchRef.current) {
+    console.log('[AUTO-FETCH] Checking conditions:', {
+      stage: progressData?.stage,
+      percentage: progressData?.percentage,
+      didFetch: didFetchRef.current,
+      episodeId
+    });
+    
+    // Check for completed state with more flexible conditions
+    const isCompleted = progressData?.stage === 'completed' || 
+                       (progressData?.percentage && progressData.percentage >= 100 && progressData?.stage !== 'error');
+    
+    if (isCompleted && !didFetchRef.current && episodeId) {
+      console.log('[AUTO-FETCH] Progress completed, fetching clips...');
       didFetchRef.current = true;
-      fetchClips(episodeId);
+      setGeneratingClips(true);
+      
+      getClips(episodeId)
+        .then(result => {
+          console.log('[AUTO-FETCH] Clips fetched:', result);
+          // Handle API result format
+          const rawClips = result?.ok ? result.data?.clips : (result as any)?.clips;
+          console.log('[AUTO-FETCH] Raw clips:', rawClips);
+          console.log('[AUTO-FETCH] Raw clips length:', rawClips?.length);
+          console.log('[AUTO-FETCH] First raw clip structure:', rawClips?.[0]);
+          
+          // Normalize clips like the parent component does
+          const normalized = Array.isArray(rawClips) ? rawClips.map(normalizeClip) : [];
+          const isAd = (c: any) => Boolean(c?.is_advertisement || c?._ad_flag || c?.features?.is_advertisement);
+          const ranked = normalized.filter(c => !isAd(c)).sort((a, b) => (b.score ?? 0) - (a.score ?? 0)).slice(0, 12);
+          
+          console.log('[AUTO-FETCH] Normalized clips:', ranked);
+          console.log('[AUTO-FETCH] Normalized clips length:', ranked?.length);
+          console.log('[AUTO-FETCH] First normalized clip:', ranked?.[0]);
+          
+          setClips(ranked);
+          setGeneratingClips(false);
+          onClipsFetched?.(ranked); // Pass normalized clips to parent
+          onCompleted?.();
+        })
+        .catch(err => {
+          console.error('[AUTO-FETCH] Failed to fetch clips:', err);
+          setGeneratingClips(false);
+          setError('Failed to load clips');
+        });
     }
-  }, [episodeId, uploadStatus, progressData]);
-
-  // Adaptive polling intervals
-  const getPollingInterval = (stage: string): number => {
-    switch (stage) {
-      case 'uploading': return 500;
-      case 'transcribing':
-      case 'transcription': return 3000;
-      case 'processing':
-      case 'scoring': return 2000;
-      case 'generating':
-      case 'finalizing': return 1000;
-      case 'completed': return 5000;
-      default: return 1500;
-    }
-  };
+  }, [progressData, episodeId, onCompleted]);
 
   const onDrop = useCallback(async (acceptedFiles: File[]) => {
-    // prevent starting a second upload while one is in-flight
     if (uploadStatus === 'uploading') return;
     if (acceptedFiles.length === 0) return;
+
+    // Reset state
+    if (pollerRef.current) {
+      pollerRef.current.stop();
+      pollerRef.current = null;
+    }
+    
+    setEpisodeId(null);
+    setProgressData(null);
+    setError(null);
+    setUploadStatus('idle');
+    setUploadProgress(0);
+    didFetchRef.current = false;
 
     const file = acceptedFiles[0];
     setUploadedFile(file);
@@ -219,8 +127,11 @@ export default function EpisodeUpload({
         throw new Error('File too large. Maximum size is 500MB.');
       }
 
-      // Upload file using API adapter
-      const result = await uploadFile(file);
+      // Upload file using API adapter with progress tracking
+      const result = await uploadFile(file, (progress) => {
+        setUploadProgress(progress);
+        console.log(`[UPLOAD] Progress: ${progress}%`);
+      });
       
       handleApiResult(
         result,
@@ -232,32 +143,55 @@ export default function EpisodeUpload({
           console.log('[UPLOAD] Episode ID set:', episodeId);
           setUploadProgress(25); // Initial progress after upload
           setUploadStatus('processing');
-
-          // Notify parent of new episode
+          
+          // Start polling for progress
+          const pollingOptions: PollingOptions = {
+            onSuccess: (data) => {
+              console.log('[POLLING] Success response:', data);
+              console.log('[POLLING] Raw progress data:', data?.progress);
+              const progressInfo = normalizeProgressInfo(data);
+              console.log('[POLLING] Progress info:', progressInfo);
+              setProgressData(progressInfo);
+              console.log(`[POLLING] Updated progress: ${progressInfo?.stage} ${progressInfo?.percentage}%`);
+            },
+            onError: (error, retryCount) => {
+              console.error(`[POLLING] Error (attempt ${retryCount}):`, error);
+              // Don't show error for scoring - it can take 30+ minutes
+              // Only show error for actual failures, not timeouts during scoring
+              if (retryCount >= 50 && !error.includes('signal timed out')) {
+                setError(`Processing failed: ${error}`);
+              }
+            },
+            on404: () => {
+              console.log('[POLLING] Episode not found, stopping');
+              setError('Episode not found');
+              return false;
+            },
+            onComplete: () => {
+              console.log('[POLLING] Processing completed!');
+              setUploadStatus('completed');
+              onCompleted?.();
+            }
+          };
+          
+          const poller = createProgressPoller(`http://localhost:8000/api/progress/${episodeId}`, pollingOptions);
+          pollerRef.current = poller;
+          poller.start();
+          
           onEpisodeUploaded(episodeId);
         },
         (error) => {
           console.error('[UPLOAD] Upload failed:', error);
-          throw new Error(error);
+          setError(error);
+          setUploadStatus('error');
         }
       );
-
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Upload failed');
+    } catch (err: any) {
+      console.error('[UPLOAD] Upload error:', err);
+      setError(err.message || 'Upload failed');
       setUploadStatus('error');
-      setUploadProgress(0);
     }
-  }, [onEpisodeUploaded]);
-
-  const { getRootProps, getInputProps, isDragActive } = useDropzone({
-    onDrop,
-    accept: {
-      'audio/*': ['.mp3', '.wav', '.m4a'],
-      'video/*': ['.mp4', '.mov', '.avi']
-    },
-    multiple: false,
-    disabled: uploadStatus === 'uploading'
-  });
+  }, [uploadStatus, onEpisodeUploaded]);
 
   const isValidFile = (file: File): boolean => {
     const validTypes = [
@@ -270,94 +204,58 @@ export default function EpisodeUpload({
            validExtensions.some(ext => file.name.toLowerCase().endsWith(ext));
   };
 
-  const getFileIcon = (file: File) => {
-    if (file.type.startsWith('audio/')) {
-      return <FileAudio className="w-8 h-8 text-primary-600" />;
-    }
-    if (file.type.startsWith('video/')) {
-      return <FileVideo className="w-8 h-8 text-secondary-600" />;
-    }
-    return <FileAudio className="w-8 h-8 text-gray-600" />;
-  };
+  const { getRootProps, getInputProps, isDragActive } = useDropzone({
+    onDrop,
+    accept: {
+      'audio/*': ['.mp3', '.wav', '.m4a'],
+      'video/*': ['.mp4', '.mov', '.avi']
+    },
+    multiple: false,
+    disabled: uploadStatus === 'uploading'
+  });
 
-  const formatFileSize = (bytes: number): string => {
-    if (bytes === 0) return '0 Bytes';
-    const k = 1024;
-    const sizes = ['Bytes', 'KB', 'MB', 'GB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-  };
-
-
-
-  const resetUpload = () => {
-    setUploadedFile(null);
-    setUploadStatus('idle');
-    setUploadProgress(0);
-    setError(null);
-    setEpisode(null);
-    setEpisodeId(null);
-    setProgressData(null);
-    setClips([]);
-    setGeneratingClips(false);
-    clipsFetchedRef.current = false; // Reset duplicate guard
-  };
-
-  const getProgressColor = (stage: string) => {
-    switch (stage) {
-      case 'uploading': return 'bg-blue-500';
-      case 'converting': return 'bg-yellow-500';
-      case 'transcribing': return 'bg-purple-500';
-      case 'processing': return 'bg-indigo-500';
-      case 'completed': return 'bg-green-500';
-      default: return 'bg-gray-500';
-    }
-  };
-
-  const getProgressIcon = (stage: string) => {
-    switch (stage) {
-      case 'uploading': return <Upload className="w-6 h-6 text-white/80" />;
-      case 'converting': return <Loader2 className="w-6 h-6 text-white/80 animate-spin" />;
-      case 'transcribing': return <Loader2 className="w-6 h-6 text-white/80 animate-spin" />;
-      case 'processing': return <Loader2 className="w-6 h-6 text-white/80 animate-spin" />;
-      case 'completed': return <CheckCircle className="w-6 h-6 text-green-400" />;
-      default: return <Clock className="w-6 h-6 text-white/60" />;
-    }
-  };
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (pollerRef.current) {
+        pollerRef.current.stop();
+      }
+    };
+  }, []);
 
   return (
-    <div className="rounded-2xl border border-[#1e2636] bg-white/[0.04] shadow-[0_10px_30px_rgba(0,0,0,0.35)] p-6 text-white">
-      <div className="text-center mb-6">
-        <h3 className="text-xl font-semibold text-white">Upload Your Episode</h3>
-        <p className="text-sm text-white/70 mt-1">
-          Drag and drop your audio or video file, or click to browse
-        </p>
-      </div>
-
-      <AnimatePresence mode="wait">
+    <div className="w-full max-w-2xl mx-auto">
+      <AnimatePresence>
         {uploadStatus === 'idle' && (
           <motion.div
-            key="upload-zone"
-            initial={{ opacity: 0, scale: 0.95 }}
-            animate={{ opacity: 1, scale: 1 }}
-            exit={{ opacity: 0, scale: 0.95 }}
-            transition={{ duration: 0.2 }}
+            key="upload"
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -20 }}
+            className="group relative rounded-2xl border border-neutral-200 bg-white shadow-card p-6 text-center hover:border-blue-400 hover:bg-gradient-to-br hover:from-blue-50 hover:to-purple-50 transition-all duration-500 cursor-pointer hover:shadow-card-hover"
+            {...(getRootProps() as any)}
           >
-            <label
-              htmlFor="file"
-              {...getRootProps()}
-              className="mt-4 block rounded-xl border-2 border-dashed border-white/15 bg-white/[0.03] p-6 text-center transition 
-                         hover:border-white/40 hover:bg-white/[0.06] cursor-pointer"
-            >
-              <input {...getInputProps()} />
-              <Upload className="w-12 h-12 text-white/40 mx-auto mb-4" />
-              <p className="text-white/90">
-                {isDragActive ? 'Drop your file here' : 'Choose a file or drag it here'}
-              </p>
-              <p className="text-xs text-white/55 mt-1">
-                Supports MP3, WAV, M4A, MP4, MOV, AVI (max 500MB)
-              </p>
-            </label>
+            <input {...getInputProps()} />
+            <div className="relative">
+              <div className="w-24 h-24 bg-gradient-to-br from-blue-100 to-purple-100 rounded-3xl flex items-center justify-center mx-auto mb-8 group-hover:scale-110 transition-transform duration-500 shadow-lg">
+                <Upload className="w-12 h-12 text-blue-600" />
+              </div>
+              <div className="absolute -top-2 -right-2 w-8 h-8 bg-gradient-to-r from-green-500 to-blue-500 rounded-full flex items-center justify-center shadow-lg">
+                <div className="w-3 h-3 bg-white rounded-full"></div>
+              </div>
+            </div>
+            <h3 className="text-3xl font-bold text-gray-900 mb-4">
+              {isDragActive ? 'Drop your file here' : 'Upload Your Podcast Episode'}
+            </h3>
+            <p className="text-lg text-gray-600 mb-8 max-w-lg mx-auto leading-relaxed">
+              Drag and drop your audio or video file, or click to browse
+            </p>
+            <div className="inline-flex items-center gap-3 bg-gradient-to-r from-gray-50 to-gray-100 px-6 py-3 rounded-2xl text-sm font-medium text-gray-700 border border-gray-200">
+              <FileAudio className="w-5 h-5 text-blue-500" />
+              <span>MP3, WAV, M4A, MP4, MOV, AVI</span>
+              <span className="text-gray-400">•</span>
+              <span>Max 500MB</span>
+            </div>
           </motion.div>
         )}
 
@@ -367,121 +265,144 @@ export default function EpisodeUpload({
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -20 }}
-            transition={{ duration: 0.3 }}
-            className="text-center"
+            className="rounded-2xl border border-neutral-200 bg-white shadow-card p-6 text-center"
           >
-            <div className="w-16 h-16 bg-white/10 rounded-full flex items-center justify-center mx-auto mb-4">
-              <Upload className="w-8 h-8 text-white animate-bounce" />
+            <div className="w-24 h-24 bg-gradient-to-br from-blue-100 to-purple-100 rounded-3xl flex items-center justify-center mx-auto mb-8 shadow-lg">
+              <Loader2 className="w-12 h-12 text-blue-600 animate-spin" />
             </div>
-            <h4 className="text-lg font-medium text-white mb-2">Uploading...</h4>
-            <div className="mt-4 rounded-lg bg-white/[0.06]">
-              <div className="h-2 w-full rounded-b-lg bg-white/10 overflow-hidden">
-                <div className="h-2 bg-white/80 transition-[width] duration-500" style={{ width: `${uploadProgress}%` }}/>
+            <h3 className="text-3xl font-bold text-gray-900 mb-4">Uploading Your Episode</h3>
+            <p className="text-lg text-gray-600 mb-8">Please wait while we upload your file...</p>
+            <div className="w-full max-w-md mx-auto">
+              <div className="flex justify-between text-sm text-gray-600 mb-2">
+                <span>Progress</span>
+                <span>{uploadProgress}%</span>
+              </div>
+              <div className="h-2 w-full rounded-full bg-neutral-200">
+                <div 
+                  className="h-2 rounded-full bg-primary-500 transition-all" 
+                  style={{ width: `${uploadProgress}%` }}
+                />
               </div>
             </div>
-            <p className="mt-2 text-xs text-white/70">{uploadProgress}% complete</p>
           </motion.div>
         )}
 
-        {uploadStatus === 'processing' && (
+        {uploadStatus === 'processing' && !error && !generatingClips && (
           <motion.div
             key="processing"
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -20 }}
-            transition={{ duration: 0.3 }}
-            className="text-center"
+            className="rounded-2xl border border-neutral-200 bg-white shadow-card p-6 text-center"
           >
-            <div className="w-16 h-16 bg-white/10 rounded-full flex items-center justify-center mx-auto mb-4">
-              {getProgressIcon(progressData?.stage || 'processing')}
+            <div className="w-24 h-24 bg-gradient-to-br from-blue-100 to-purple-100 rounded-3xl flex items-center justify-center mx-auto mb-8 shadow-lg">
+              <Loader2 className="w-12 h-12 text-blue-600 animate-spin" />
             </div>
-            <h4 className="text-lg font-medium text-white mb-2">
-              {progressData?.stage ? progressData.stage.charAt(0).toUpperCase() + progressData.stage.slice(1) : 'Processing Episode'}
-            </h4>
-            <p className="muted mb-4">
-              {progressData?.message || 'Transcribing audio and analyzing content...'}
+            <h3 className="text-3xl font-bold text-gray-900 mb-4">
+              {progressData?.stage === 'converting' && 'Converting Your File'}
+              {progressData?.stage === 'transcribing' && 'Transcribing Audio'}
+              {progressData?.stage === 'scoring' && 'Finding Viral Moments'}
+              {progressData?.stage === 'processing' && 'Processing Episode'}
+              {!progressData?.stage && 'Processing Your Episode'}
+            </h3>
+            <p className="text-lg text-gray-600 mb-8">
+              {progressData?.stage === 'converting' && 'Converting your file to the optimal format...'}
+              {progressData?.stage === 'transcribing' && 'Converting speech to text with AI...'}
+              {progressData?.stage === 'scoring' && 'Analyzing content for viral potential... This can take 10-30 minutes for longer episodes.'}
+              {progressData?.stage === 'processing' && 'Processing your episode...'}
+              {!progressData?.stage && 'This may take 10-30 minutes for longer files. We\'ll keep checking in the background.'}
             </p>
-            
-            {/* Real-time progress bar */}
-            <div className="mt-4 rounded-lg bg-white/[0.06]">
-              <div className="h-2 w-full rounded-b-lg bg-white/10 overflow-hidden">
-                <div className="h-2 bg-white/80 transition-[width] duration-500" style={{ width: `${uploadProgress}%` }}/>
+            <div className="w-full max-w-md mx-auto">
+              <div className="flex justify-between text-sm text-gray-600 mb-2">
+                <span>Progress</span>
+                <span>{progressData?.percentage || 0}%</span>
               </div>
-            </div>
-            
-            <div className="flex items-center justify-center space-x-2 mb-2">
-              <span className="text-lg font-semibold text-white">{uploadProgress.toFixed(1)}%</span>
-              <span className="muted">complete</span>
-            </div>
-            
-            {/* Stage indicator */}
-            {progressData && (
-              <div className="card-2 rounded-lg p-3 text-sm muted">
-                <div className="flex items-center space-x-2">
-                  <div className={`w-2 h-2 rounded-full ${getProgressColor(progressData.stage)}`}></div>
-                  <span className="capitalize text-white/80">{progressData.stage}</span>
-                </div>
-                <p className="mt-1 text-xs muted">{progressData.message}</p>
+              <div className="h-2 w-full rounded-full bg-neutral-200">
+                <div 
+                  className="h-2 rounded-full bg-primary-500 transition-all" 
+                  style={{ width: `${progressData?.percentage || 0}%` }}
+                />
               </div>
-            )}
+              {progressData?.message && (
+                <p className="text-xs text-gray-500 mt-3">{progressData.message}</p>
+              )}
+              
+            </div>
           </motion.div>
         )}
 
-        {uploadStatus === 'completed' && uploadedFile && (
+        {uploadStatus === 'completed' && clips.length > 0 && (
           <motion.div
             key="completed"
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -20 }}
-            transition={{ duration: 0.3 }}
-            className="text-center"
+            className="rounded-2xl border border-neutral-200 bg-white shadow-card p-6 text-center"
           >
-            <div className="w-16 h-16 bg-white/10 rounded-full flex items-center justify-center mx-auto mb-4">
-              <CheckCircle className="w-8 h-8 text-green-400" />
-            </div>
-            <h4 className="text-lg font-medium text-white mb-2">Upload Complete!</h4>
-            <div className="card-2 rounded-lg p-4 mb-4">
-              <div className="flex items-center space-x-3">
-                {getFileIcon(uploadedFile)}
-                <div className="text-left">
-                  <p className="font-medium text-white">{uploadedFile.name}</p>
-                  <p className="muted">{formatFileSize(uploadedFile.size)}</p>
-                </div>
-              </div>
-            </div>
-            <div className="flex justify-center">
-              <button
-                onClick={resetUpload}
-                className="bg-green-500 hover:bg-green-600 text-white rounded-lg px-4 py-2 transition-colors"
-              >
-                Upload Another File
-              </button>
-            </div>
+            <CheckCircle className="w-8 h-8 text-green-400 mx-auto mb-4" />
+            <p className="text-gray-900 mb-2">Processing complete!</p>
+            <p className="text-sm text-gray-600">Found {clips.length} viral clips</p>
           </motion.div>
         )}
 
-
-
-        {uploadStatus === 'error' && (
+        {error && (
           <motion.div
-            key="failed"
+            key="error"
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -20 }}
-            transition={{ duration: 0.3 }}
-            className="text-center"
+            className="rounded-2xl border border-neutral-200 bg-white shadow-card p-6 text-center"
           >
-            <div className="w-16 h-16 bg-red-100 rounded-full flex items-center justify-center mx-auto mb-4">
-              <AlertCircle className="w-8 h-8 text-red-600" />
+            <AlertCircle className="w-8 h-8 text-red-400 mx-auto mb-4" />
+            <p className="text-gray-900 mb-2">Something went wrong</p>
+            <p className="text-sm text-gray-600">{error}</p>
+            <div className="flex gap-2 justify-center">
+              <button
+                onClick={() => {
+                  setError(null);
+                  // Continue polling if we have an episodeId
+                  if (episodeId) {
+                    const pollingOptions: PollingOptions = {
+                      onSuccess: (data) => {
+                        console.log('[POLLING] Success response:', data);
+                        const progressInfo = normalizeProgressInfo(data);
+                        setProgressData(progressInfo);
+                      },
+                      onError: (error, retryCount) => {
+                        console.error(`[POLLING] Error (attempt ${retryCount}):`, error);
+                        // Don't show error for scoring timeouts
+                        if (retryCount >= 50 && !error.includes('signal timed out')) {
+                          setError(`Processing failed: ${error}`);
+                        }
+                      },
+                      on404: () => {
+                        setError('Episode not found');
+                        return false;
+                      }
+                    };
+                    
+                    const poller = createProgressPoller(`http://localhost:8000/api/progress/${episodeId}`, pollingOptions);
+                    pollerRef.current = poller;
+                    poller.start();
+                  }
+                }}
+                className="mt-4 px-4 py-2 bg-blue-500 hover:bg-blue-600 text-white rounded-lg transition-colors shadow-sm"
+              >
+                Continue Processing
+              </button>
+              <button
+                onClick={() => {
+                  setError(null);
+                  setUploadStatus('idle');
+                  setProgressData(null);
+                  setClips([]);
+                  didFetchRef.current = false;
+                }}
+                className="mt-4 px-4 py-2 bg-white border border-gray-300 hover:bg-gray-50 rounded-lg text-gray-700 transition-colors shadow-sm"
+              >
+                Start Over
+              </button>
             </div>
-            <h4 className="text-lg font-medium text-white mb-2">Upload Failed</h4>
-            <p className="text-sm text-red-400 mb-4">{error}</p>
-            <button
-              onClick={resetUpload}
-              className="bg-green-500 hover:bg-green-600 text-white rounded-lg px-4 py-2 transition-colors"
-            >
-              Try Again
-            </button>
           </motion.div>
         )}
       </AnimatePresence>
