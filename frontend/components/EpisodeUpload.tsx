@@ -46,47 +46,45 @@ export default function EpisodeUpload({
 
   // Auto-fetch clips when processing completes
   useEffect(() => {
-    console.log('[AUTO-FETCH] Checking conditions:', {
-      stage: progressData?.stage,
-      percentage: progressData?.percentage,
-      didFetch: didFetchRef.current,
-      episodeId
-    });
+    if (process.env.NODE_ENV === 'development') {
+      console.log('[AUTO-FETCH] Checking conditions:', {
+        stage: progressData?.stage,
+        percentage: progressData?.percentage,
+        didFetch: didFetchRef.current,
+        episodeId
+      });
+    }
     
     // Check for completed state with more flexible conditions
     const isCompleted = progressData?.stage === 'completed' || 
                        (progressData?.percentage && progressData.percentage >= 100 && progressData?.stage !== 'error');
     
     if (isCompleted && !didFetchRef.current && episodeId) {
-      console.log('[AUTO-FETCH] Progress completed, fetching clips...');
+      if (process.env.NODE_ENV === 'development') {
+        console.log('[AUTO-FETCH] Progress completed, fetching clips...');
+      }
       didFetchRef.current = true;
       setGeneratingClips(true);
-      
+
       getClips(episodeId)
         .then(result => {
-          console.log('[AUTO-FETCH] Clips fetched:', result);
           // Handle API result format
           const rawClips = result?.ok ? result.data?.clips : (result as any)?.clips;
-          console.log('[AUTO-FETCH] Raw clips:', rawClips);
-          console.log('[AUTO-FETCH] Raw clips length:', rawClips?.length);
-          console.log('[AUTO-FETCH] First raw clip structure:', rawClips?.[0]);
-          
+
           // Normalize clips like the parent component does
           const normalized = Array.isArray(rawClips) ? rawClips.map(normalizeClip) : [];
           const isAd = (c: any) => Boolean(c?.is_advertisement || c?._ad_flag || c?.features?.is_advertisement);
           const ranked = normalized.filter(c => !isAd(c)).sort((a, b) => (b.score ?? 0) - (a.score ?? 0)).slice(0, 12);
-          
-          console.log('[AUTO-FETCH] Normalized clips:', ranked);
-          console.log('[AUTO-FETCH] Normalized clips length:', ranked?.length);
-          console.log('[AUTO-FETCH] First normalized clip:', ranked?.[0]);
-          
+
           setClips(ranked);
           setGeneratingClips(false);
           onClipsFetched?.(ranked); // Pass normalized clips to parent
           onCompleted?.();
         })
         .catch(err => {
-          console.error('[AUTO-FETCH] Failed to fetch clips:', err);
+          if (process.env.NODE_ENV === 'development') {
+            console.error('[AUTO-FETCH] Failed to fetch clips:', err);
+          }
           setGeneratingClips(false);
           setError('Failed to load clips');
         });
@@ -130,32 +128,33 @@ export default function EpisodeUpload({
       // Upload file using API adapter with progress tracking
       const result = await uploadFile(file, (progress) => {
         setUploadProgress(progress);
-        console.log(`[UPLOAD] Progress: ${progress}%`);
       });
       
       handleApiResult(
         result,
         (data) => {
-          console.log('[UPLOAD] Upload successful, episode ID:', data.episodeId);
+          if (process.env.NODE_ENV === 'development') {
+            console.log('[UPLOAD] Upload successful, episode ID:', data.episodeId);
+          }
           const episodeId = data.episodeId;
-          
+
           setEpisodeId(episodeId);
-          console.log('[UPLOAD] Episode ID set:', episodeId);
           setUploadProgress(25); // Initial progress after upload
           setUploadStatus('processing');
           
           // Start polling for progress
           const pollingOptions: PollingOptions = {
             onSuccess: (data) => {
-              console.log('[POLLING] Success response:', data);
-              console.log('[POLLING] Raw progress data:', data?.progress);
               const progressInfo = normalizeProgressInfo(data);
-              console.log('[POLLING] Progress info:', progressInfo);
               setProgressData(progressInfo);
-              console.log(`[POLLING] Updated progress: ${progressInfo?.stage} ${progressInfo?.percentage}%`);
+              if (process.env.NODE_ENV === 'development') {
+                console.log(`[POLLING] Updated progress: ${progressInfo?.stage} ${progressInfo?.percentage}%`);
+              }
             },
             onError: (error, retryCount) => {
-              console.error(`[POLLING] Error (attempt ${retryCount}):`, error);
+              if (process.env.NODE_ENV === 'development') {
+                console.error(`[POLLING] Error (attempt ${retryCount}):`, error);
+              }
               // Don't show error for scoring - it can take 30+ minutes
               // Only show error for actual failures, not timeouts during scoring
               if (retryCount >= 50 && !error.includes('signal timed out')) {
@@ -163,12 +162,16 @@ export default function EpisodeUpload({
               }
             },
             on404: () => {
-              console.log('[POLLING] Episode not found, stopping');
+              if (process.env.NODE_ENV === 'development') {
+                console.log('[POLLING] Episode not found, stopping');
+              }
               setError('Episode not found');
               return false;
             },
             onComplete: () => {
-              console.log('[POLLING] Processing completed!');
+              if (process.env.NODE_ENV === 'development') {
+                console.log('[POLLING] Processing completed!');
+              }
               setUploadStatus('completed');
               onCompleted?.();
             }
@@ -181,13 +184,17 @@ export default function EpisodeUpload({
           onEpisodeUploaded(episodeId);
         },
         (error) => {
-          console.error('[UPLOAD] Upload failed:', error);
+          if (process.env.NODE_ENV === 'development') {
+            console.error('[UPLOAD] Upload failed:', error);
+          }
           setError(error);
           setUploadStatus('error');
         }
       );
     } catch (err: any) {
-      console.error('[UPLOAD] Upload error:', err);
+      if (process.env.NODE_ENV === 'development') {
+        console.error('[UPLOAD] Upload error:', err);
+      }
       setError(err.message || 'Upload failed');
       setUploadStatus('error');
     }
@@ -364,12 +371,13 @@ export default function EpisodeUpload({
                   if (episodeId) {
                     const pollingOptions: PollingOptions = {
                       onSuccess: (data) => {
-                        console.log('[POLLING] Success response:', data);
                         const progressInfo = normalizeProgressInfo(data);
                         setProgressData(progressInfo);
                       },
                       onError: (error, retryCount) => {
-                        console.error(`[POLLING] Error (attempt ${retryCount}):`, error);
+                        if (process.env.NODE_ENV === 'development') {
+                          console.error(`[POLLING] Error (attempt ${retryCount}):`, error);
+                        }
                         // Don't show error for scoring timeouts
                         if (retryCount >= 50 && !error.includes('signal timed out')) {
                           setError(`Processing failed: ${error}`);

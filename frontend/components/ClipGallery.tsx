@@ -18,31 +18,16 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
   const [titleVariants, setTitleVariants] = useState<string[]>([]);
   const [currentTitle, setCurrentTitle] = useState<string>("");
 
-  // Debug: Log clips when they change
   useEffect(() => {
-    console.log('ClipGallery received clips:', clips);
     if (clips && clips.length > 0) {
-      console.log('First clip previewUrl:', clips[0].previewUrl);
-      console.log('First clip features:', clips[0].features);
-      
       // Auto-generate titles for clips that need them
       clips.forEach((clip, index) => {
         const transcript = clip.transcript || clip.text;
         const isTranscriptSnippet = clip.title && clip.title.length > 50 && transcript && clip.title === transcript.substring(0, clip.title.length);
-        console.log(`Checking clip ${index} for title generation:`, {
-          id: clip.id,
-          title: clip.title,
-          text: transcript?.substring(0, 100) + '...',
-          isTranscriptSnippet,
-          needsTitle: (!clip.title || isTranscriptSnippet) && transcript
-        });
-        
-        // Force title generation for the first clip to test
+
         if (index === 0) {
-          console.log('FORCE GENERATING TITLE FOR FIRST CLIP:', clip.id);
           generateNewTitle(clip.id);
         } else if ((!clip.title || isTranscriptSnippet) && transcript) {
-          console.log('Auto-generating title for clip:', clip.id);
           generateNewTitle(clip.id);
         }
       });
@@ -58,16 +43,8 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
       // Auto-backfill title if missing or if it's just a transcript snippet
       const transcript = selected.transcript || selected.text;
       const isTranscriptSnippet = selected.title && selected.title.length > 50 && transcript && selected.title === transcript.substring(0, selected.title.length);
-      console.log('Checking selected clip for title generation:', {
-        id: selected.id,
-        title: selected.title,
-        transcript: transcript?.substring(0, 100) + '...',
-        isTranscriptSnippet,
-        needsTitle: (!selected.title || isTranscriptSnippet) && transcript
-      });
-      
+
       if ((!selected.title || isTranscriptSnippet) && transcript) {
-        console.log('Auto-generating title for selected clip:', selected.id);
         generateNewTitle(selected.id);
       }
     }
@@ -80,10 +57,6 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
   );
 
   const handlePlayPause = (clip: Clip) => {
-    console.log('Play button clicked for clip:', clip.id);
-    console.log('Clip previewUrl:', clip.previewUrl);
-    console.log('Clip features:', clip.features);
-    
     if (playingClipId === clip.id) {
       // Stop current audio
       const audio = document.querySelector(`audio[data-clip-id="${clip.id}"]`) as HTMLAudioElement;
@@ -105,17 +78,27 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
       setTimeout(() => {
         const newAudio = document.querySelector(`audio[data-clip-id="${clip.id}"]`) as HTMLAudioElement;
         if (newAudio) {
-          console.log('Attempting to play audio:', newAudio.src);
-          newAudio.play().catch(e => console.log('Audio play failed:', e));
+          if (process.env.NODE_ENV === 'development') {
+            console.log('Attempting to play audio:', newAudio.src);
+          }
+          newAudio.play().catch(e => {
+            if (process.env.NODE_ENV === 'development') {
+              console.log('Audio play failed:', e);
+            }
+          });
         } else {
-          console.log('Audio element not found');
+          if (process.env.NODE_ENV === 'development') {
+            console.log('Audio element not found');
+          }
         }
       }, 100);
     }
   };
 
   const generateNewTitle = async (clipId: string) => {
-    console.log('Generating title for clip:', clipId);
+    if (process.env.NODE_ENV === 'development') {
+      console.log('Generating title for clip:', clipId);
+    }
     setGenerating(true);
     try {
       const response = await fetch(`http://localhost:8000/api/clips/${clipId}/titles`, {
@@ -128,36 +111,35 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
         }),
         cache: 'no-store',
       });
-      
-      console.log('Title generation response status:', response.status);
-      
       if (!response.ok) {
         const errorText = await response.text();
-        console.error('Title generation failed:', response.status, errorText);
+        if (process.env.NODE_ENV === 'development') {
+          console.error('Title generation failed:', response.status, errorText);
+        }
         throw new Error(`HTTP ${response.status}: ${errorText}`);
       }
-      
+
       const data = await response.json();
-      console.log('Title generation response data:', data);
-      console.log('Generated title chosen:', data.chosen);
-      console.log('Generated title variants:', data.variants);
-      
+      if (process.env.NODE_ENV === 'development') {
+        console.log('Generated title chosen:', data.chosen);
+      }
+
       setCurrentTitle(data.chosen);
       setTitleVariants(data.variants);
-      
+
       // Update the selected clip's title in the parent state
       if (selected) {
-        console.log('Updating selected clip title from', selected.title, 'to', data.chosen);
         selected.title = data.chosen;
       }
-      
+
       // Notify parent component to update the clip
       if (onClipUpdate) {
-        console.log('Notifying parent of title update for clip:', clipId, 'new title:', data.chosen);
         onClipUpdate(clipId, { title: data.chosen });
       }
     } catch (error) {
-      console.error('[titles] generate error', error);
+      if (process.env.NODE_ENV === 'development') {
+        console.error('[titles] generate error', error);
+      }
       // Graceful fallback: keep the old title
     } finally {
       setGenerating(false);
@@ -187,7 +169,9 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
         selected.title = newTitle;
       }
     } catch (error) {
-      console.error('[titles] update error', error);
+      if (process.env.NODE_ENV === 'development') {
+        console.error('[titles] update error', error);
+      }
     }
   };
 
