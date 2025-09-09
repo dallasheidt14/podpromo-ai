@@ -46,9 +46,20 @@ from .features import (
     _platform_length_match,
     calculate_dynamic_length_score,
     
+    # Dynamic segmentation functions
+    find_natural_boundaries,
+    create_dynamic_segments,
+    
+    # Pipeline functions
+    filter_ads_from_features,
+    filter_intro_content_from_features,
+    split_mixed_segments,
+    find_viral_clips,
+    
     # Utility functions
     create_segment_hash,
     debug_segment_scoring,
+    detect_podcast_genre,
 )
 
 # Import remaining functions from monolithic file temporarily
@@ -106,9 +117,45 @@ __all__ = [
     "_platform_length_match",
     "calculate_dynamic_length_score",
     
+    # Dynamic segmentation functions
+    "find_natural_boundaries",
+    "create_dynamic_segments",
+    
+    # Pipeline functions
+    "filter_ads_from_features",
+    "filter_intro_content_from_features",
+    "split_mixed_segments", 
+    "find_viral_clips",
+    
+    # Explanation and analysis functions
+    "_explain_viral_potential_v4",
+    "_grade_breakdown",
+    "_score_to_grade",
+    "_heuristic_title",
+    
+    # Platform and tone mapping
+    "PLATFORM_GENRE_MULTIPLIERS",
+    "TONE_TO_GENRE_MAP",
+    "PLATFORM_MAP",
+    "resolve_platform",
+    "resolve_genre_from_tone",
+    "interpret_synergy",
+    "get_genre_detection_debug",
+    
+    # Advanced API functions
+    "find_viral_clips_with_tone",
+    "find_viral_clips_with_genre",
+    "find_candidates",
+    
+    # Question/List scoring V2
+    "_question_list_raw_v2",
+    "question_list_score_v2",
+    "attach_question_list_scores_v2",
+    
     # Utility functions
     "create_segment_hash",
     "debug_segment_scoring",
+    "detect_podcast_genre",
     
     # Additional functions from monolithic file
     "_grade_breakdown",

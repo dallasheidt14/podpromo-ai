@@ -141,10 +141,10 @@ export default function Controls() {
           marginTop: 8,
           fontSize: "14px"
         }}>
-          ✅ Weights updated! Use "🔄 Re-score with New Weights" button above to see your clips re-ranked.
+          ✅ Weights updated! Use &quot;🔄 Re-score with New Weights&quot; button above to see your clips re-ranked.
         </div>
       )}
-      <small style={{opacity:0.6}}>💡 Tip: After applying weights, click "🔄 Re-score with New Weights" to see clips re-ranked with your new settings!</small>
+      <small style={{opacity:0.6}}>💡 Tip: After applying weights, click &quot;🔄 Re-score with New Weights&quot; to see clips re-ranked with your new settings!</small>
     </div>
   );
 }

@@ -81,3 +81,10 @@ postgresql-installer.exe
 # FFmpeg temporary files
 *.ts
 *.m3u8
+outputs/*.ts
+outputs/*.m3u8
+uploads/*.ts
+uploads/*.m3u8
+# Allow TypeScript source files
+!shared/**/*.ts
+!frontend/**/*.ts

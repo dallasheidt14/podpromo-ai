@@ -33,7 +33,9 @@ export default function UsageDisplay({ userId }: UsageDisplayProps) {
           setUsage(data);
         }
       } catch (error) {
-        console.error("Failed to fetch usage:", error);
+        if (process.env.NODE_ENV === "development") {
+          console.error("Failed to fetch usage:", error);
+        }
       } finally {
         setLoading(false);
       }

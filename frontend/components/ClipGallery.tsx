@@ -2,7 +2,7 @@
 "use client";
 import React, { useMemo, useState, useEffect } from "react";
 import Modal from "./Modal";
-import { Clip } from "./ClipDetail";
+import { Clip } from "@shared/types";
 
 type Props = {
   clips: Clip[];
@@ -17,37 +17,28 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
   const [generating, setGenerating] = useState(false);
   const [titleVariants, setTitleVariants] = useState<string[]>([]);
   const [currentTitle, setCurrentTitle] = useState<string>("");
+  const [processedClips, setProcessedClips] = useState<Set<string>>(new Set());
+  const [generatingClips, setGeneratingClips] = useState<Set<string>>(new Set());
 
-  // Debug: Log clips when they change
   useEffect(() => {
-    console.log('ClipGallery received clips:', clips);
     if (clips && clips.length > 0) {
-      console.log('First clip previewUrl:', clips[0].previewUrl);
-      console.log('First clip features:', clips[0].features);
-      
-      // Auto-generate titles for clips that need them
+      // Auto-generate titles for clips that need them (only once per clip)
       clips.forEach((clip, index) => {
-        const transcript = clip.transcript || clip.text;
-        const isTranscriptSnippet = clip.title && clip.title.length > 50 && transcript && clip.title === transcript.substring(0, clip.title.length);
-        console.log(`Checking clip ${index} for title generation:`, {
-          id: clip.id,
-          title: clip.title,
-          text: transcript?.substring(0, 100) + '...',
-          isTranscriptSnippet,
-          needsTitle: (!clip.title || isTranscriptSnippet) && transcript
-        });
+        if (processedClips.has(clip.id) || generatingClips.has(clip.id)) return; // Skip if already processed or generating
         
-        // Force title generation for the first clip to test
+        const transcript = clip.text;
+        const isTranscriptSnippet = clip.title && clip.title.length > 50 && transcript && clip.title === transcript.substring(0, clip.title.length);
+
         if (index === 0) {
-          console.log('FORCE GENERATING TITLE FOR FIRST CLIP:', clip.id);
           generateNewTitle(clip.id);
+          setProcessedClips(prev => new Set([...Array.from(prev), clip.id]));
         } else if ((!clip.title || isTranscriptSnippet) && transcript) {
-          console.log('Auto-generating title for clip:', clip.id);
           generateNewTitle(clip.id);
+          setProcessedClips(prev => new Set([...Array.from(prev), clip.id]));
         }
       });
     }
-  }, [clips]);
+  }, [clips, processedClips, generatingClips]);
 
   // Initialize current title when selected clip changes
   useEffect(() => {
@@ -56,19 +47,12 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
       setTitleVariants([]);
       
       // Auto-backfill title if missing or if it's just a transcript snippet
-      const transcript = selected.transcript || selected.text;
+      const transcript = selected.text;
       const isTranscriptSnippet = selected.title && selected.title.length > 50 && transcript && selected.title === transcript.substring(0, selected.title.length);
-      console.log('Checking selected clip for title generation:', {
-        id: selected.id,
-        title: selected.title,
-        transcript: transcript?.substring(0, 100) + '...',
-        isTranscriptSnippet,
-        needsTitle: (!selected.title || isTranscriptSnippet) && transcript
-      });
-      
-      if ((!selected.title || isTranscriptSnippet) && transcript) {
-        console.log('Auto-generating title for selected clip:', selected.id);
+
+      if ((!selected.title || isTranscriptSnippet) && transcript && !processedClips.has(selected.id) && !generatingClips.has(selected.id)) {
         generateNewTitle(selected.id);
+        setProcessedClips(prev => new Set([...Array.from(prev), selected.id]));
       }
     }
   }, [selected]);
@@ -80,10 +64,6 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
   );
 
   const handlePlayPause = (clip: Clip) => {
-    console.log('Play button clicked for clip:', clip.id);
-    console.log('Clip previewUrl:', clip.previewUrl);
-    console.log('Clip features:', clip.features);
-    
     if (playingClipId === clip.id) {
       // Stop current audio
       const audio = document.querySelector(`audio[data-clip-id="${clip.id}"]`) as HTMLAudioElement;
@@ -105,17 +85,28 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
       setTimeout(() => {
         const newAudio = document.querySelector(`audio[data-clip-id="${clip.id}"]`) as HTMLAudioElement;
         if (newAudio) {
-          console.log('Attempting to play audio:', newAudio.src);
-          newAudio.play().catch(e => console.log('Audio play failed:', e));
+          if (process.env.NODE_ENV === 'development') {
+            console.log('Attempting to play audio:', newAudio.src);
+          }
+          newAudio.play().catch(e => {
+            if (process.env.NODE_ENV === 'development') {
+              console.log('Audio play failed:', e);
+            }
+          });
         } else {
-          console.log('Audio element not found');
+          if (process.env.NODE_ENV === 'development') {
+            console.log('Audio element not found');
+          }
         }
       }, 100);
     }
   };
 
   const generateNewTitle = async (clipId: string) => {
-    console.log('Generating title for clip:', clipId);
+    if (process.env.NODE_ENV === 'development') {
+      console.log('Generating title for clip:', clipId);
+    }
+    setGeneratingClips(prev => new Set([...Array.from(prev), clipId]));
     setGenerating(true);
     try {
       const response = await fetch(`http://localhost:8000/api/clips/${clipId}/titles`, {
@@ -129,38 +120,43 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
         cache: 'no-store',
       });
       
-      console.log('Title generation response status:', response.status);
-      
       if (!response.ok) {
         const errorText = await response.text();
-        console.error('Title generation failed:', response.status, errorText);
+        if (process.env.NODE_ENV === 'development') {
+          console.error('Title generation failed:', response.status, errorText);
+        }
         throw new Error(`HTTP ${response.status}: ${errorText}`);
       }
-      
+
       const data = await response.json();
-      console.log('Title generation response data:', data);
-      console.log('Generated title chosen:', data.chosen);
-      console.log('Generated title variants:', data.variants);
-      
+      if (process.env.NODE_ENV === 'development') {
+        console.log('Generated title chosen:', data.chosen);
+      }
+
       setCurrentTitle(data.chosen);
       setTitleVariants(data.variants);
-      
+
       // Update the selected clip's title in the parent state
       if (selected) {
-        console.log('Updating selected clip title from', selected.title, 'to', data.chosen);
         selected.title = data.chosen;
       }
-      
+
       // Notify parent component to update the clip
       if (onClipUpdate) {
-        console.log('Notifying parent of title update for clip:', clipId, 'new title:', data.chosen);
         onClipUpdate(clipId, { title: data.chosen });
       }
     } catch (error) {
-      console.error('[titles] generate error', error);
+      if (process.env.NODE_ENV === 'development') {
+        console.error('[titles] generate error', error);
+      }
       // Graceful fallback: keep the old title
     } finally {
       setGenerating(false);
+      setGeneratingClips(prev => {
+        const newSet = new Set(prev);
+        newSet.delete(clipId);
+        return newSet;
+      });
     }
   };
 
@@ -187,7 +183,9 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
         selected.title = newTitle;
       }
     } catch (error) {
-      console.error('[titles] update error', error);
+      if (process.env.NODE_ENV === 'development') {
+        console.error('[titles] update error', error);
+      }
     }
   };
 
@@ -283,9 +281,9 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
                 </div>
 
                 {/* Timing Information */}
-                {clip.start != null && clip.end != null && (
+                {clip.startTime != null && clip.endTime != null && (
                   <div className="text-xs text-blue-800 bg-gradient-to-r from-blue-100 to-yellow-100 px-3 py-2 rounded-lg border border-blue-200 relative z-10">
-                    <span className="font-semibold">⏱️ Duration: {Math.max(0, Math.round(clip.end - clip.start))}s ({Math.round(clip.start)}s-{Math.round(clip.end)}s)</span>
+                    <span className="font-semibold">⏱️ Duration: {Math.max(0, Math.round(clip.endTime - clip.startTime))}s ({Math.round(clip.startTime)}s-{Math.round(clip.endTime)}s)</span>
                   </div>
                 )}
 
@@ -326,16 +324,27 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
       </div>
 
       {/* Hidden audio element for playback */}
-      {playingClipId && (
-        <audio
-          key={playingClipId}
-          data-clip-id={playingClipId}
-          src={clips.find(c => c.id === playingClipId)?.previewUrl}
-          autoPlay
-          onEnded={() => setPlayingClipId(null)}
-          onError={() => setPlayingClipId(null)}
-        />
-      )}
+      {playingClipId && (() => {
+        const clip = clips.find(c => c.id === playingClipId);
+        const audioUrl = clip?.previewUrl ? 
+          (clip.previewUrl.startsWith('http') ? clip.previewUrl : `http://localhost:8000${clip.previewUrl}`) : 
+          null;
+        return audioUrl ? (
+          <audio
+            key={playingClipId}
+            data-clip-id={playingClipId}
+            src={audioUrl}
+            autoPlay
+            onEnded={() => setPlayingClipId(null)}
+            onError={(e) => {
+              if (process.env.NODE_ENV === 'development') {
+                console.error('Audio playback error:', e);
+              }
+              setPlayingClipId(null);
+            }}
+          />
+        ) : null;
+      })()}
 
       <Modal open={open} onClose={() => setOpen(false)}>
         <div>
@@ -350,14 +359,14 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
           )}
 
           {/* Timing Information */}
-          {selected?.start != null && selected?.end != null && (
+          {selected?.startTime != null && selected?.endTime != null && (
             <div className="mb-6 p-4 bg-blue-50 rounded-lg border border-blue-200">
               <div className="flex items-center gap-2">
                 <svg width="20" height="20" viewBox="0 0 24 24" className="text-blue-600">
                   <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z" fill="currentColor"/>
                 </svg>
                 <span className="text-lg font-semibold text-blue-900">
-                  Duration: {Math.max(0, Math.round(selected.end - selected.start))}s ({Math.round(selected.start)}s-{Math.round(selected.end)}s)
+                  Duration: {Math.max(0, Math.round(selected.endTime - selected.startTime))}s ({Math.round(selected.startTime)}s-{Math.round(selected.endTime)}s)
                 </span>
               </div>
             </div>
@@ -416,7 +425,11 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
           {selected?.previewUrl && (
             <div className="mb-4">
               <h5 className="font-medium mb-2">Preview:</h5>
-              <audio src={selected.previewUrl} controls className="w-full" />
+              <audio 
+                src={selected.previewUrl.startsWith('http') ? selected.previewUrl : `http://localhost:8000${selected.previewUrl}`} 
+                controls 
+                className="w-full" 
+              />
             </div>
           )}
         </div>

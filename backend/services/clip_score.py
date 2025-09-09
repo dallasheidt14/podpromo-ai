@@ -350,7 +350,7 @@ class ClipScoreService:
             seg["score"] = seg["raw_score"]  # For backward compatibility
             
             # Use V4 explanation system
-            seg["explain"] = explain_segment_v4(feats, current_weights)
+            seg["explain"] = explain_segment_v4(feats, genre=genre)
             
             # Add V4 viral score and platform recommendations
             length_s = float(seg["end"] - seg["start"])
@@ -647,7 +647,7 @@ class ClipScoreService:
         return False
 
     def _transcript_to_segments(self, transcript: List[TranscriptSegment], genre: str = 'general', platform: str = 'tiktok') -> List[Dict]:
-        """Combine fragmented transcript segments into coherent clips"""
+        """Create dynamic segments based on natural content boundaries and platform optimization"""
         try:
             # Convert TranscriptSegment objects to dicts
             transcript_dicts = []
@@ -663,56 +663,32 @@ class ClipScoreService:
             
             logger.info(f"Starting with {len(transcript_dicts)} raw transcript segments")
             
-            # COMBINE segments to reach minimum viable length
-            combined_segments = []
-            current_segment = None
-            target_duration = 20  # Aim for 20-second clips
-            max_duration = 45
-            min_duration = 15
-            
+            # Filter out intro/filler content first
+            filtered_segments = []
             for seg in transcript_dicts:
-                # Skip intro/filler
-                if self._is_intro_content(seg['text']) or self._is_repetitive_content(seg['text']):
-                    continue
-                    
-                if current_segment is None:
-                    current_segment = seg.copy()
-                else:
-                    # Check if adding this segment would exceed max
-                    potential_duration = seg['end'] - current_segment['start']
-                    
-                    if potential_duration <= max_duration:
-                        # Extend current segment
-                        current_segment['end'] = seg['end']
-                        current_segment['text'] += ' ' + seg['text']
-                        
-                        # Check if we've reached target duration
-                        if potential_duration >= target_duration:
-                            # Look for natural break point
-                            if self._is_natural_ending(seg['text']):
-                                combined_segments.append(current_segment)
-                                current_segment = None
-                    else:
-                        # Would be too long, save current and start new
-                        if current_segment['end'] - current_segment['start'] >= min_duration:
-                            combined_segments.append(current_segment)
-                        current_segment = seg.copy()
+                if not (self._is_intro_content(seg['text']) or self._is_repetitive_content(seg['text'])):
+                    filtered_segments.append(seg)
             
-            # Don't forget last segment
-            if current_segment and (current_segment['end'] - current_segment['start'] >= min_duration):
-                combined_segments.append(current_segment)
+            logger.info(f"Filtered to {len(filtered_segments)} non-intro segments")
             
-            logger.info(f"Combined into {len(combined_segments)} coherent segments")
+            # Use dynamic segmentation based on natural content boundaries
+            from services.secret_sauce_pkg.features import create_dynamic_segments
+            
+            dynamic_segments = create_dynamic_segments(filtered_segments, platform)
+            
+            logger.info(f"Created {len(dynamic_segments)} dynamic segments based on natural boundaries")
             
             # Log segment details for debugging
-            for i, seg in enumerate(combined_segments[:3]):
+            for i, seg in enumerate(dynamic_segments[:3]):
                 duration = seg['end'] - seg['start']
-                logger.info(f"Combined Segment {i+1}: {duration:.1f}s - {seg['text'][:60]}...")
+                boundary_type = seg.get('boundary_type', 'unknown')
+                confidence = seg.get('confidence', 0.0)
+                logger.info(f"Dynamic Segment {i+1}: {duration:.1f}s ({boundary_type}, conf={confidence:.2f}) - {seg['text'][:60]}...")
             
-            return combined_segments
+            return dynamic_segments
             
         except Exception as e:
-            logger.error(f"Segment combination failed: {e}, falling back to window-based")
+            logger.error(f"Dynamic segmentation failed: {e}, falling back to window-based")
             return self._window_based_segments(transcript_dicts, window=30, step=20)
     
     def _window_based_segments(self, transcript: List[Dict], window: float = 25, step: float = 15) -> List[Dict]:
@@ -874,11 +850,10 @@ class ClipScoreService:
         return selected_moments[:target_count]
 
     async def get_candidates(self, episode_id: str, platform: str = "tiktok_reels", genre: str = None) -> List[Dict]:
-        """Get AI-scored clip candidates for an episode with platform/genre optimization"""
+        """Get AI-scored clip candidates for an episode with platform/genre optimization using the complete pipeline"""
         try:
             from services.secret_sauce_pkg import (
-                compute_features_v4, score_segment_v4,
-                resolve_platform, detect_podcast_genre
+                find_viral_clips, resolve_platform, detect_podcast_genre
             )
 
             # Get episode
@@ -904,11 +879,19 @@ class ClipScoreService:
             # Convert transcript to segments using intelligent moment detection
             segments = self._transcript_to_segments(episode.transcript, genre=final_genre, platform=platform)
 
-            # Use rank_candidates for proper scoring pipeline
-            ranked_segments = self.rank_candidates(segments, episode.audio_path, top_k=10, platform=backend_platform, genre=final_genre, episode_id=episode_id)
+            # Use the complete viral clips pipeline with ad/intro filtering and dynamic segmentation
+            logger.info(f"Using complete viral clips pipeline with {len(segments)} segments")
+            viral_result = find_viral_clips(segments, episode.audio_path, genre=final_genre, platform=backend_platform)
+            
+            if "error" in viral_result:
+                logger.error(f"Viral clips pipeline failed: {viral_result['error']}")
+                return []
+            
+            clips = viral_result.get('clips', [])
+            logger.info(f"Found {len(clips)} viral clips using complete pipeline")
             
             # Convert to candidate format with title generation and grades
-            candidates = format_candidates(ranked_segments, final_genre, backend_platform, episode_id)
+            candidates = format_candidates(clips, final_genre, backend_platform, episode_id)
             
             # Filter overlapping candidates
             filtered_candidates = filter_overlapping_candidates(candidates)

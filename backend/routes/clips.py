@@ -250,38 +250,57 @@ def _is_ready(ep_id: str) -> bool:
         return False
 
 def _load_clips(ep_id: str) -> List[Dict[str, Any]]:
-    """Load clips for an episode"""
+    """Load clips for an episode from JSON file"""
     try:
-        from services.episode_service import EpisodeService
-        episode_service = EpisodeService()
-        episode = episode_service.get_episode(ep_id)
+        from pathlib import Path
+        from config.settings import UPLOAD_DIR
+        import json
         
-        if not episode or not hasattr(episode, 'clips'):
+        # Load clips from JSON file
+        episode_dir = Path(UPLOAD_DIR) / ep_id
+        clips_file = episode_dir / "clips.json"
+        
+        if not clips_file.exists():
+            print(f"[CLIPS] No clips file found for {ep_id} at {clips_file}")
             return []
-            
-        clips = episode.clips or []
+        
+        with open(clips_file, 'r', encoding='utf-8') as f:
+            clips_data = json.load(f)
+        
+        if not clips_data:
+            print(f"[CLIPS] Empty clips file for {ep_id}")
+            return []
         
         # Convert to frontend format
         formatted_clips = []
-        for clip in clips:
+        for clip in clips_data:
+            # Handle different possible field names
+            clip_id = clip.get('id', clip.get('clip_id', ''))
+            start_time = clip.get('startTime', clip.get('start_time', clip.get('start', 0)))
+            end_time = clip.get('endTime', clip.get('end_time', clip.get('end', 0)))
+            text = clip.get('text', clip.get('transcript', ''))
+            score = clip.get('score', clip.get('clip_score_100', 0))
+            
             formatted_clip = {
-                "id": getattr(clip, 'id', ''),
-                "startTime": getattr(clip, 'start_time', 0),
-                "endTime": getattr(clip, 'end_time', 0),
-                "text": getattr(clip, 'text', ''),
-                "score": getattr(clip, 'score', 0),
+                "id": str(clip_id),
+                "startTime": float(start_time),
+                "endTime": float(end_time),
+                "text": str(text),
+                "score": float(score),
                 "features": {
-                    "hook_score": getattr(clip, 'hook_score', 0),
-                    "arousal_score": getattr(clip, 'arousal_score', 0),
-                    "emotion_score": getattr(clip, 'emotion_score', 0),
-                    "payoff_score": getattr(clip, 'payoff_score', 0),
-                } if hasattr(clip, 'hook_score') else None,
-                "previewUrl": f"/api/preview/{ep_id}/{getattr(clip, 'id', '')}.mp3",
-                "vttUrl": f"/api/captions/{ep_id}/{getattr(clip, 'id', '')}.vtt",
+                    "hook_score": clip.get('features', {}).get('hook_score', 0),
+                    "arousal_score": clip.get('features', {}).get('arousal_score', 0),
+                    "emotion_score": clip.get('features', {}).get('emotion_score', 0),
+                    "payoff_score": clip.get('features', {}).get('payoff_score', 0),
+                } if clip.get('features') else None,
+                "previewUrl": f"/api/preview/{ep_id}/{clip_id}.mp3",
+                "vttUrl": f"/api/captions/{ep_id}/{clip_id}.vtt",
             }
             formatted_clips.append(formatted_clip)
-            
+        
+        print(f"[CLIPS] Loaded {len(formatted_clips)} clips for {ep_id}")
         return formatted_clips
+        
     except Exception as e:
         print(f"[CLIPS] Error loading clips for {ep_id}: {e}")
         return []

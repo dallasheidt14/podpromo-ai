@@ -2,19 +2,7 @@
 "use client";
 import React from "react";
 import Modal from "./Modal";
-
-export type Clip = {
-  id: string;
-  title?: string;
-  score?: number; // 0..1
-  start?: number; // seconds
-  end?: number;   // seconds
-  previewUrl?: string; // audio or video
-  downloadUrl?: string;
-  transcript?: string;
-  captionsVttUrl?: string;
-  [key: string]: any;
-};
+import { Clip } from "@shared/types";
 
 type Props = {
   clip: Clip | null;
@@ -26,8 +14,8 @@ export default function ClipDetail({ clip, open, onClose }: Props) {
   if (!clip) return null;
 
   const duration =
-    clip.start != null && clip.end != null
-      ? Math.max(0, (clip.end - clip.start) | 0)
+    clip.startTime != null && clip.endTime != null
+      ? Math.max(0, (clip.endTime - clip.startTime) | 0)
       : undefined;
 
   const isVideo = clip.previewUrl?.match(/\.(mp4|mov|webm|avi)$/i);
@@ -52,7 +40,7 @@ export default function ClipDetail({ clip, open, onClose }: Props) {
             )}
             {duration != null && (
               <span className="inline-flex items-center gap-1 rounded-full bg-neutral-100 px-3 py-1 text-sm text-neutral-700">
-                ⏱ Duration: {duration}s ({Math.round(clip.start!)}s-{Math.round(clip.end!)}s)
+                ⏱ Duration: {duration}s ({Math.round(clip.startTime!)}s-{Math.round(clip.endTime!)}s)
               </span>
             )}
           </div>
@@ -76,7 +64,7 @@ export default function ClipDetail({ clip, open, onClose }: Props) {
           <div className="rounded-xl border border-neutral-200 p-4">
             <h3 className="mb-2 text-sm font-medium text-neutral-600">Transcript</h3>
             <div className="max-h-44 overflow-auto whitespace-pre-wrap text-sm leading-relaxed text-neutral-800">
-              {clip.transcript || "No transcript available."}
+              {clip.text || "No transcript available."}
             </div>
           </div>
 
@@ -92,8 +80,8 @@ export default function ClipDetail({ clip, open, onClose }: Props) {
                   Download
                 </a>
               )}
-              {clip.captionsVttUrl && (
-                <a href={clip.captionsVttUrl} className="btn">
+              {clip.downloadUrl && (
+                <a href={clip.downloadUrl} className="btn">
                   Download Captions
                 </a>
               )}

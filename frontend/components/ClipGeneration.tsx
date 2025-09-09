@@ -3,8 +3,8 @@
 import { useState } from 'react';
 import { motion } from 'framer-motion';
 import { Video, Settings, Play, Sparkles, Clock, Target } from 'lucide-react';
-import { Episode } from '../src/shared/types';
-import { postGenerateClips, ensureOk } from '../src/shared/api';
+import { Episode } from '@shared/types';
+import { postGenerateClips, ensureOk } from '@shared/api';
 import { AnimatePresence } from 'framer-motion';
 
 interface ClipGenerationProps {
@@ -33,23 +33,30 @@ export default function ClipGeneration({ episode, onGenerateClips, isGenerating 
       
       if (result.ok) {
         const data = result.data;
-        console.log('Clip generation started:', data);
+        if (process.env.NODE_ENV === 'development') {
+          console.log('Clip generation started:', data);
+        }
         if (data.started) {
-          console.log('Job enqueued:', data.job?.id);
+          if (process.env.NODE_ENV === 'development') {
+            console.log('Job enqueued:', data.job?.id);
+          }
           // Trigger parent callback to start polling
           onGenerateClips();
         } else {
-          console.log('Using cached results');
           // Still trigger callback to refresh UI
           onGenerateClips();
         }
       } else {
-        console.error('Error starting clip generation:', result.error);
+        if (process.env.NODE_ENV === 'development') {
+          console.error('Error starting clip generation:', result.error);
+        }
         // In a real app, you'd show an error message to the user
       }
-      
+
     } catch (error) {
-      console.error('Unexpected error during clip generation:', error);
+      if (process.env.NODE_ENV === 'development') {
+        console.error('Unexpected error during clip generation:', error);
+      }
     }
   };
 

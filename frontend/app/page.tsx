@@ -1,11 +1,9 @@
 ﻿"use client";
 
-import { useEffect, useRef, useState } from 'react';
+import { useRef, useState } from 'react';
 import EpisodeUpload from '../components/EpisodeUpload';
 import ClipGallery from '../components/ClipGallery';
-import { normalizeClip } from '../src/shared/normalize';
-import { Clip } from '../src/shared/types';
-import { getClips, getProgress, handleApiResult } from '../src/shared/api';
+import { Clip } from '@shared/types';
 
 export default function Page() {
   const [episodeId, setEpisodeId] = useState<string | null>(null);

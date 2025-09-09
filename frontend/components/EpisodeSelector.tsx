@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect } from 'react';
-import { Episode } from '../src/shared/types';
+import { Episode } from '@shared/types';
 
 interface EpisodeSelectorProps {
   onEpisodeSelected: (episodeId: string) => void;
@@ -17,9 +17,8 @@ export default function EpisodeSelector({ onEpisodeSelected }: EpisodeSelectorPr
       const response = await fetch('/api/episodes');
       if (response.ok) {
         const data = await response.json();
-        console.log('[EpisodeSelector] Raw response:', data);
-        
-        // Handle the correct response format: {ok: true, episodes: [...]}
+
+        // Handle the correct response format: {ok: true, episodes: [...]} 
         if (data.ok && Array.isArray(data.episodes)) {
           // Convert backend format to frontend format
           const convertedEpisodes = data.episodes.map((ep: any) => ({
@@ -33,12 +32,16 @@ export default function EpisodeSelector({ onEpisodeSelected }: EpisodeSelectorPr
           }));
           setEpisodes(convertedEpisodes);
         } else {
-          console.warn('[EpisodeSelector] Unexpected response format:', data);
+          if (process.env.NODE_ENV === 'development') {
+            console.warn('[EpisodeSelector] Unexpected response format:', data);
+          }
           setEpisodes([]);
         }
       }
     } catch (error) {
-      console.error('Failed to load episodes:', error);
+      if (process.env.NODE_ENV === 'development') {
+        console.error('Failed to load episodes:', error);
+      }
       setEpisodes([]);
     } finally {
       setLoading(false);

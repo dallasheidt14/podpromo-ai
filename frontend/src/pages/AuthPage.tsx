@@ -1,7 +1,12 @@
 "use client";
 import { useState } from "react";
+import dynamic from "next/dynamic";
 import LoginForm from "@/src/components/LoginForm";
 import SignupForm from "@/src/components/SignupForm";
+
+// Dynamically import components that use context to avoid SSR issues
+const DynamicLoginForm = dynamic(() => import("@/src/components/LoginForm"), { ssr: false });
+const DynamicSignupForm = dynamic(() => import("@/src/components/SignupForm"), { ssr: false });
 
 export default function AuthPage() {
   const [isLogin, setIsLogin] = useState(true);
@@ -17,9 +22,9 @@ export default function AuthPage() {
         </div>
         
         {isLogin ? (
-          <LoginForm onSwitchToSignup={() => setIsLogin(false)} />
+          <DynamicLoginForm onSwitchToSignup={() => setIsLogin(false)} />
         ) : (
-          <SignupForm onSwitchToLogin={() => setIsLogin(true)} />
+          <DynamicSignupForm onSwitchToLogin={() => setIsLogin(true)} />
         )}
       </div>
     </div>

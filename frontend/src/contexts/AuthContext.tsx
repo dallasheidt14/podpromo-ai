@@ -33,7 +33,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           setUser(user);
         }
       } catch (error) {
-        console.error("Auth check failed:", error);
+        if (process.env.NODE_ENV === "development") {
+          console.error("Auth check failed:", error);
+        }
       } finally {
         setLoading(false);
       }
@@ -66,11 +68,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         return true;
       } else {
         const errorData = await response.json();
-        console.error("Login failed:", errorData.error);
+        if (process.env.NODE_ENV === "development") {
+          console.error("Login failed:", errorData.error);
+        }
         return false;
       }
     } catch (error) {
-      console.error("Login error:", error);
+      if (process.env.NODE_ENV === "development") {
+        console.error("Login error:", error);
+      }
       return false;
     } finally {
       setLoading(false);
@@ -101,11 +107,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         return true;
       } else {
         const errorData = await response.json();
-        console.error("Signup failed:", errorData.error);
+        if (process.env.NODE_ENV === "development") {
+          console.error("Signup failed:", errorData.error);
+        }
         return false;
       }
     } catch (error) {
-      console.error("Signup error:", error);
+      if (process.env.NODE_ENV === "development") {
+        console.error("Signup error:", error);
+      }
       return false;
     } finally {
       setLoading(false);

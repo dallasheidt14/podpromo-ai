@@ -83,7 +83,7 @@ export default function LoginForm({ onSwitchToSignup }: LoginFormProps) {
       
       <div className="mt-6 text-center">
         <p className="text-gray-600">
-          Don't have an account?{" "}
+          Don&apos;t have an account?{" "}
           <button
             onClick={onSwitchToSignup}
             className="text-blue-600 hover:text-blue-700 font-medium"
