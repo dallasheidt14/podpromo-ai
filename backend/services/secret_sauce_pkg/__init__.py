@@ -55,6 +55,8 @@ from .features import (
 from .__init__monolithic import (
     _grade_breakdown,
     _heuristic_title,
+    _sigmoid,
+    resolve_platform,
 )
 
 # Export all public functions and classes
@@ -111,4 +113,6 @@ __all__ = [
     # Additional functions from monolithic file
     "_grade_breakdown",
     "_heuristic_title",
+    "_sigmoid",
+    "resolve_platform",
 ]
