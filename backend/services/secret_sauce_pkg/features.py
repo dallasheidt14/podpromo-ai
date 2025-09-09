@@ -1371,6 +1371,8 @@ def find_viral_clips_enhanced(segments: List[Dict], audio_file: str, genre: str 
             'payoff_guard': PAYOFF_GUARD,
             'calibration': bool(CALIBRATION_V),
             'calibration_version': CALIBRATION_V,
+            'synergy_mode': SYNERGY_MODE,
+            'platform_len_v': PLATFORM_LEN_V,
             'total_segments': len(segments),
             'processed_segments': len(enhanced_segments),
             'top_clips_count': len(top_clips),
