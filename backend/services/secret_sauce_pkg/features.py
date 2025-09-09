@@ -1229,13 +1229,15 @@ def compute_features_v4_enhanced(segment: Dict, audio_file: str, y_sr=None, genr
     # Calculate final score using the scoring system
     from .scoring import score_segment_v4
     scored_result = score_segment_v4(result, genre=genre)
-    final_score = scored_result.get('viral_score_100', 0) / 100.0  # Convert from 0-100 to 0-1
-    display_score = scored_result.get('viral_score_100', 0)
+    viral_score_100 = scored_result.get('viral_score_100', 0)
+    final_score = viral_score_100 / 100.0  # Convert from 0-100 to 0-1
+    display_score = viral_score_100  # Keep in 0-100 range for quality filtering
     
     # Quantize final scores for stability
     from .types import quantize
     final_score = quantize(final_score)
-    display_score = quantize(display_score, 1.0)  # Quantize to whole numbers for display
+    # Keep display_score in 0-100 range for quality filtering
+    display_score = int(round(display_score))  # Round to whole numbers for display
     
     result.update({
         'final_score': final_score,
@@ -1299,13 +1301,48 @@ def find_viral_clips_enhanced(segments: List[Dict], audio_file: str, genre: str 
     
     # Process each segment with enhanced features
     enhanced_segments = []
+    skip_reasons = {}
     logger.info(f"Processing {len(segments)} segments with enhanced pipeline")
     
     for i, segment in enumerate(segments):
+        skip_reason = None
+        
+        # Check for skip reasons before processing
+        text = segment.get('text', '').strip()
+        if not text:
+            skip_reason = "empty_text"
+        elif len(text.split()) < 3:
+            skip_reason = "too_short_words"
+        elif segment.get('end', 0) - segment.get('start', 0) < 5:
+            skip_reason = "too_short_secs"
+        elif segment.get('is_advertisement', False):
+            skip_reason = "ad_flag"
+        elif segment.get('should_exclude', False):
+            skip_reason = "exclude_flag"
+        
+        if skip_reason:
+            skip_reasons[skip_reason] = skip_reasons.get(skip_reason, 0) + 1
+            logger.debug(f"Segment {i} skipped: {skip_reason}")
+            continue
+            
         try:
             enhanced_features = compute_features_v4_enhanced(
                 segment, audio_file, genre=genre, platform=platform, segments=segments
             )
+            
+            # Check for post-processing skip reasons
+            if enhanced_features.get('should_exclude', False):
+                skip_reason = "post_processing_exclude"
+            elif enhanced_features.get('final_score', 0) < 0.1:
+                skip_reason = "min_score_gate"
+            elif enhanced_features.get('payoff_score', 0) < 0.1 and enhanced_features.get('hook_score', 0) < 0.1:
+                skip_reason = "min_payoff_gate"
+            
+            if skip_reason:
+                skip_reasons[skip_reason] = skip_reasons.get(skip_reason, 0) + 1
+                logger.debug(f"Segment {i} skipped after processing: {skip_reason}")
+                continue
+            
             # Preserve original segment data with enhanced features
             enhanced_segment = {
                 **segment,  # Keep original segment data (text, start, end, etc.)
@@ -1353,7 +1390,8 @@ def find_viral_clips_enhanced(segments: List[Dict], audio_file: str, genre: str 
             'ads_removed': 0,  # Will be calculated by filtering functions
             'intros_removed': 0,  # Will be calculated by filtering functions
             'caps_applied': len(segments) - len(enhanced_segments)  # Segments filtered by caps
-        }
+        },
+        'drop_reasons': skip_reasons
     }
     
     return {
@@ -1884,18 +1922,20 @@ def find_natural_boundaries(text: str) -> List[Dict]:
                 "confidence": 0.9
             })
         
-        # Topic transitions
+        # Topic transitions (expanded and more sensitive)
         elif any(phrase in " ".join(words[max(0, i-2):i+3]) for phrase in [
             "but", "however", "meanwhile", "on the other hand", "speaking of",
-            "that reminds me", "by the way", "oh wait", "actually"
+            "that reminds me", "by the way", "oh wait", "actually", "now", "so",
+            "well", "okay", "right", "alright", "anyway", "moving on", "next",
+            "another thing", "also", "plus", "additionally", "furthermore"
         ]):
             boundaries.append({
                 "position": i,
                 "type": "topic_shift",
-                "confidence": 0.7
+                "confidence": 0.6  # Lowered from 0.7 to catch more transitions
             })
         
-        # Story/insight markers (expanded)
+        # Story/insight markers (expanded and more sensitive)
         elif any(phrase in " ".join(words[max(0, i-1):i+2]) for phrase in [
             "here's the thing", "the key is", "the key insight", "what i learned", "my take",
             "the bottom line", "in summary", "to wrap up", "main observation",
@@ -1903,12 +1943,14 @@ def find_natural_boundaries(text: str) -> List[Dict]:
             "here's why", "let me tell you", "you know what", "this is why", "the reason is",
             "the problem is", "the issue is", "the challenge is", "the solution is", "the answer is",
             "the truth is", "the reality is", "the fact is", "the secret is", "the trick is",
-            "the way to", "the best way", "the only way", "the right way", "the wrong way"
+            "the way to", "the best way", "the only way", "the right way", "the wrong way",
+            "i think", "i believe", "i feel", "i know", "i understand", "i realize",
+            "the point is", "the idea is", "the concept is", "the principle is"
         ]):
             boundaries.append({
                 "position": i,
                 "type": "insight_marker",
-                "confidence": 0.8
+                "confidence": 0.7  # Lowered from 0.8 to catch more insights
             })
         
         # Question/answer patterns
@@ -1988,7 +2030,7 @@ def create_dynamic_segments(segments: List[Dict], platform: str = 'tiktok') -> L
     all_boundaries = [{"position": 0, "type": "start", "confidence": 1.0}] + boundaries
     
     for i, boundary in enumerate(all_boundaries):
-        if boundary["confidence"] < 0.5:  # Lowered threshold to include more boundaries
+        if boundary["confidence"] < 0.3:  # Much lower threshold to include more boundaries
             continue  # Skip low-confidence boundaries
         
         # Calculate end position
@@ -2002,7 +2044,7 @@ def create_dynamic_segments(segments: List[Dict], platform: str = 'tiktok') -> L
         segment_words = words[boundary["position"]:end_position]
         segment_text = " ".join(segment_words)
         
-        if len(segment_words) < 5:  # Reduced to allow shorter segments
+        if len(segment_words) < 3:  # Further reduced to allow even shorter segments
             continue
         
         # Calculate timing based on word count and total duration

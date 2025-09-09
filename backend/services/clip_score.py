@@ -902,8 +902,8 @@ class ClipScoreService:
             filtered_candidates = filter_overlapping_candidates(candidates)
             logger.info(f"After overlap filtering: {len(filtered_candidates)} candidates")
             
-            # Apply quality filtering (temporarily lowered for debugging)
-            quality_filtered = filter_low_quality(filtered_candidates, min_score=20)
+            # Apply quality filtering with safety net
+            quality_filtered = filter_low_quality(filtered_candidates, min_score=15)
             logger.info(f"After quality filtering: {len(quality_filtered)} candidates")
             
             return quality_filtered[:10]  # Return top 10

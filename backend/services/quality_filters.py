@@ -37,35 +37,89 @@ def fails_quality(feats: dict) -> str | None:
     return None
 
 
-def filter_overlapping_candidates(candidates: List[Dict], min_gap: float = 15.0) -> List[Dict]:
-    """Remove overlapping candidates, keeping highest scoring ones"""
+def filter_overlapping_candidates(candidates: List[Dict], iou_threshold: float = 0.5) -> List[Dict]:
+    """Non-Maximum Suppression for overlapping candidates using IoU"""
     if not candidates:
         return candidates
-    sorted_candidates = sorted(candidates, key=lambda x: x["score"], reverse=True)
+    
+    # Sort by final_score (highest first)
+    sorted_candidates = sorted(candidates, key=lambda x: x.get("final_score", x.get("score", 0)), reverse=True)
+    
+    def calculate_iou(cand1: Dict, cand2: Dict) -> float:
+        """Calculate Intersection over Union for time overlap"""
+        start1, end1 = cand1.get("start", 0), cand1.get("end", 0)
+        start2, end2 = cand2.get("start", 0), cand2.get("end", 0)
+        
+        # Calculate intersection
+        intersection_start = max(start1, start2)
+        intersection_end = min(end1, end2)
+        intersection = max(0, intersection_end - intersection_start)
+        
+        # Calculate union
+        union = (end1 - start1) + (end2 - start2) - intersection
+        
+        return intersection / union if union > 0 else 0.0
+    
     filtered: List[Dict] = []
     for candidate in sorted_candidates:
-        overlaps = False
+        # Check if this candidate overlaps significantly with any already selected
+        should_keep = True
         for selected in filtered:
-            if candidate["start"] < selected["end"] and candidate["end"] > selected["start"]:
-                overlaps = True
+            iou = calculate_iou(candidate, selected)
+            if iou > iou_threshold:
+                should_keep = False
                 break
-        if not overlaps:
+        
+        if should_keep:
             filtered.append(candidate)
+    
+    # Safety net: if no candidates survived, keep the best one
+    if not filtered and candidates:
+        filtered = [candidates[0]]
+    
     return filtered
 
 
-def filter_low_quality(candidates: List[Dict], min_score: int = 40) -> List[Dict]:
-    """Filter out low-quality candidates"""
+def filter_low_quality(candidates: List[Dict], min_score: int = 20) -> List[Dict]:
+    """Filter out low-quality candidates with safety net"""
+    if not candidates:
+        return candidates
+    
+    # Sort by final_score (highest first)
+    sorted_candidates = sorted(candidates, key=lambda x: x.get("final_score", x.get("score", 0)), reverse=True)
+    
     filtered: List[Dict] = []
-    for candidate in candidates:
-        if candidate.get("display_score", 0) < min_score:
+    for candidate in sorted_candidates:
+        # Use final_score for quality gates, not display_score
+        final_score = candidate.get("final_score", 0)
+        display_score = candidate.get("display_score", 0)
+        
+        # Convert final_score to 0-100 range if it's in 0-1 range
+        if final_score <= 1.0:
+            final_score_100 = final_score * 100
+        else:
+            final_score_100 = final_score
+        
+        # Quality gates
+        if final_score_100 < min_score:
             continue
+            
         text = candidate.get("text", "")
-        if len(text.split()) < 20:
+        if len(text.split()) < 10:  # Reduced from 20 to be less strict
             continue
         if text and text[0].islower():
             continue
+            
         filtered.append(candidate)
-    if len(filtered) < 3 and len(candidates) >= 3:
-        return candidates[:5]
+    
+    # Safety net: if no candidates passed quality filter, keep the best ones
+    if not filtered:
+        # Keep top 3 candidates regardless of score
+        filtered = sorted_candidates[:3]
+        logger.warning(f"No candidates passed quality filter, keeping top {len(filtered)} candidates")
+    elif len(filtered) < 2 and len(candidates) >= 2:
+        # If only 1 candidate passed, add the second best
+        filtered = sorted_candidates[:2]
+        logger.warning(f"Only 1 candidate passed quality filter, keeping top 2")
+    
     return filtered
