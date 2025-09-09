@@ -17,6 +17,10 @@ from .scoring import (
     viral_potential_from_segment,
     explain_segment_from_segment
 )
+# Import Phase 1, 2 & 3 enhancements
+from .types import Features, Scores
+from .scoring_utils import whiten_paths, synergy_bonus, platform_length_score_v2, apply_genre_blending, find_optimal_boundaries, prosody_arousal_score, payoff_guard, apply_calibration
+
 from .features import (
     # Main feature computation functions
     compute_features_v4,
@@ -55,6 +59,7 @@ from .features import (
     filter_intro_content_from_features,
     split_mixed_segments,
     find_viral_clips,
+    find_viral_clips_enhanced,
     
     # Utility functions
     create_segment_hash,
@@ -162,4 +167,22 @@ __all__ = [
     "_heuristic_title",
     "_sigmoid",
     "resolve_platform",
+    
+    # Phase 1 Enhanced Features
+    "compute_features_v4_enhanced",
+    "Features",
+    "Scores",
+    "whiten_paths",
+    "synergy_bonus",
+    "platform_length_score_v2",
+    
+    # Phase 2 Enhanced Features
+    "find_viral_clips_enhanced",
+    "apply_genre_blending",
+    "find_optimal_boundaries",
+    
+    # Phase 3 Enhanced Features
+    "prosody_arousal_score",
+    "payoff_guard",
+    "apply_calibration",
 ]

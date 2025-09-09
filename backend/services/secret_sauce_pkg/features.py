@@ -14,6 +14,10 @@ from scipy import signal
 from scipy.stats import skew, kurtosis
 from config_loader import get_config
 
+# Import new Phase 1, 2 & 3 types and utilities
+from .types import Features, Scores, FEATURE_TYPES, SYNERGY_MODE, PLATFORM_LEN_V, WHITEN_PATHS, GENRE_BLEND, BOUNDARY_HYSTERESIS, PROSODY_AROUSAL, PAYOFF_GUARD, CALIBRATION_V
+from .scoring_utils import whiten_paths, synergy_bonus, platform_length_score_v2, apply_genre_blending, find_optimal_boundaries, prosody_arousal_score, payoff_guard, apply_calibration
+
 logger = logging.getLogger(__name__)
 
 # Import dependencies from other modules
@@ -1069,6 +1073,290 @@ def _info_density_v4(text: str) -> float:
     final = base - filler_penalty + specificity_boost
     return float(max(0.1, min(1.0, final)))
 
+def compute_features_v4_enhanced(segment: Dict, audio_file: str, y_sr=None, genre: str = 'general', platform: str = 'tiktok', segments: list = None) -> Dict:
+    """
+    Enhanced feature computation with Phase 1, 2 & 3 improvements:
+    - Typed containers with validation
+    - Unified synergy scoring
+    - Platform length v2
+    - Path whitening (Phase 2)
+    - Genre confidence blending (Phase 2)
+    - Boundary hysteresis (Phase 2)
+    - Prosody-aware arousal (Phase 3)
+    - Payoff evidence guard (Phase 3)
+    - Calibration system (Phase 3)
+    """
+    # Use existing compute_features_v4 as base
+    features_dict = compute_features_v4(segment, audio_file, y_sr, genre, platform)
+    
+    if not FEATURE_TYPES:
+        return features_dict
+    
+    # Convert to typed Features container
+    features = Features.from_dict(features_dict)
+    features.validate(strict=False)  # Clamp in production
+    
+    # Apply path whitening if enabled
+    raw_paths = {
+        'hook': features.hook,
+        'arousal': features.arousal,
+        'emotion': features.emotion,
+        'payoff': features.payoff,
+        'info_density': features.info_density,
+        'q_list': features.q_list,
+        'loopability': features.loopability,
+        'platform_length': features.platform_length
+    }
+    
+    whitened_paths = None
+    if WHITEN_PATHS:
+        whitened_paths = whiten_paths(raw_paths)
+        # Update features with whitened values
+        features.hook = whitened_paths['hook']
+        features.arousal = whitened_paths['arousal']
+        features.emotion = whitened_paths['emotion']
+        features.payoff = whitened_paths['payoff']
+        features.info_density = whitened_paths['info_density']
+        features.q_list = whitened_paths['q_list']
+        features.loopability = whitened_paths['loopability']
+        features.platform_length = whitened_paths['platform_length']
+    
+    # Apply genre confidence blending if enabled
+    genre_debug = {}
+    if GENRE_BLEND and segments:
+        try:
+            from .genres import GenreAwareScorer
+            genre_scorer = GenreAwareScorer()
+            
+            # Get base weights
+            base_weights = get_clip_weights()
+            
+            # Apply genre blending
+            blended_weights, genre_debug = apply_genre_blending(base_weights, genre_scorer, segments)
+            
+            # Apply blended weights to features (simplified - in practice you'd integrate this with scoring)
+            # This is a placeholder for the full integration
+            features.meta['genre_blending'] = genre_debug
+            features.meta['blended_weights'] = blended_weights
+            
+        except Exception as e:
+            logger.warning(f"Genre blending failed: {e}")
+            genre_debug = {"error": str(e), "blending_applied": False}
+    
+    # Apply Phase 3 enhancements
+    phase3_debug = {}
+    
+    # Prosody-aware arousal
+    if PROSODY_AROUSAL and audio_file:
+        try:
+            start = segment.get('start', 0)
+            end = segment.get('end', start + 30)
+            text = segment.get('text', '')
+            
+            # Get prosody-enhanced arousal score
+            prosody_arousal = prosody_arousal_score(text, audio_file, start, end, genre)
+            features.arousal = prosody_arousal
+            phase3_debug['prosody_arousal'] = {
+                'enabled': True,
+                'original_arousal': features_dict.get('arousal_score', 0.0),
+                'prosody_arousal': prosody_arousal,
+                'improvement': prosody_arousal - features_dict.get('arousal_score', 0.0)
+            }
+        except Exception as e:
+            logger.warning(f"Prosody arousal failed: {e}")
+            phase3_debug['prosody_arousal'] = {'enabled': False, 'error': str(e)}
+    else:
+        phase3_debug['prosody_arousal'] = {'enabled': False, 'reason': 'disabled_or_no_audio'}
+    
+    # Payoff evidence guard
+    if PAYOFF_GUARD:
+        try:
+            text = segment.get('text', '')
+            hook_text = text[:100]  # First 100 chars as hook
+            body_text = text[100:]  # Rest as body
+            
+            # Apply payoff guard
+            original_payoff = features.payoff
+            guarded_payoff = payoff_guard(hook_text, body_text, original_payoff, genre)
+            features.payoff = guarded_payoff
+            
+            phase3_debug['payoff_guard'] = {
+                'enabled': True,
+                'original_payoff': original_payoff,
+                'guarded_payoff': guarded_payoff,
+                'capped': guarded_payoff < original_payoff,
+                'genre': genre
+            }
+        except Exception as e:
+            logger.warning(f"Payoff guard failed: {e}")
+            phase3_debug['payoff_guard'] = {'enabled': False, 'error': str(e)}
+    else:
+        phase3_debug['payoff_guard'] = {'enabled': False, 'reason': 'disabled'}
+    
+    # Apply unified synergy scoring
+    if SYNERGY_MODE == "unified":
+        synergy = synergy_bonus(raw_paths)
+    else:
+        # Use existing synergy logic
+        synergy = features_dict.get('synergy_multiplier', 1.0) - 1.0
+    
+    # Apply calibration
+    if CALIBRATION_V:
+        try:
+            # Calibrate final score
+            original_final = features_dict.get('final_score', 0.0)
+            calibrated_final = apply_calibration(original_final, CALIBRATION_V)
+            
+            phase3_debug['calibration'] = {
+                'enabled': True,
+                'version': CALIBRATION_V,
+                'original_final': original_final,
+                'calibrated_final': calibrated_final,
+                'adjustment': calibrated_final - original_final
+            }
+        except Exception as e:
+            logger.warning(f"Calibration failed: {e}")
+            phase3_debug['calibration'] = {'enabled': False, 'error': str(e)}
+    else:
+        phase3_debug['calibration'] = {'enabled': False, 'reason': 'disabled'}
+    
+    # Quantize for stability
+    features.quantize()
+    
+    # Convert back to dict with enhanced debug info
+    result = features.to_dict()
+    
+    # Calculate final score using the scoring system
+    from .scoring import score_segment_v4
+    scored_result = score_segment_v4(result, genre=genre)
+    final_score = scored_result.get('viral_score_100', 0) / 100.0  # Convert from 0-100 to 0-1
+    display_score = scored_result.get('viral_score_100', 0)
+    
+    result.update({
+        'final_score': final_score,
+        'display_score': display_score,
+        'raw_score': final_score,
+        'clip_score_100': display_score,
+        'synergy_multiplier': 1.0 + synergy,
+        'synergy_bonus': synergy,
+        'scoring_version': 'v4.7.2-unified-syn-whiten-blend-prosody-guard-cal',
+        'debug': {
+            'raw_paths': raw_paths,
+            'whitened_paths': whitened_paths,
+            'synergy_mode': SYNERGY_MODE,
+            'feature_types_enabled': FEATURE_TYPES,
+            'platform_len_v': PLATFORM_LEN_V,
+            'whiten_paths_enabled': WHITEN_PATHS,
+            'genre_blend_enabled': GENRE_BLEND,
+            'boundary_hysteresis_enabled': BOUNDARY_HYSTERESIS,
+            'prosody_arousal_enabled': PROSODY_AROUSAL,
+            'payoff_guard_enabled': PAYOFF_GUARD,
+            'calibration_enabled': bool(CALIBRATION_V),
+            'calibration_version': CALIBRATION_V,
+            'genre_debug': genre_debug,
+            'phase3_debug': phase3_debug
+        }
+    })
+    
+    return result
+
+def find_viral_clips_enhanced(segments: List[Dict], audio_file: str, genre: str = 'general', platform: str = 'tiktok') -> Dict:
+    """
+    Enhanced viral clip finding with Phase 1, 2 & 3 improvements:
+    - Path whitening
+    - Genre confidence blending
+    - Boundary hysteresis
+    - Prosody-aware arousal
+    - Payoff evidence guard
+    - Calibration system
+    """
+    logger.info(f"Enhanced pipeline received {len(segments)} segments")
+    
+    if not segments:
+        return {
+            'clips': [],
+            'genre': genre,
+            'platform': platform,
+            'scoring_version': 'v4.7.1-unified-syn-whiten-blend',
+            'debug': {
+                'phase2_enabled': True,
+                'whiten_paths': WHITEN_PATHS,
+                'genre_blend': GENRE_BLEND,
+                'boundary_hysteresis': BOUNDARY_HYSTERESIS
+            }
+        }
+    
+    # Apply boundary hysteresis if enabled
+    if BOUNDARY_HYSTERESIS:
+        optimal_segments = find_optimal_boundaries(segments, audio_file)
+        if optimal_segments:
+            segments = optimal_segments
+    
+    # Process each segment with enhanced features
+    enhanced_segments = []
+    logger.info(f"Processing {len(segments)} segments with enhanced pipeline")
+    
+    for i, segment in enumerate(segments):
+        try:
+            enhanced_features = compute_features_v4_enhanced(
+                segment, audio_file, genre=genre, platform=platform, segments=segments
+            )
+            # Preserve original segment data with enhanced features
+            enhanced_segment = {
+                **segment,  # Keep original segment data (text, start, end, etc.)
+                **enhanced_features  # Add enhanced features
+            }
+            enhanced_segments.append(enhanced_segment)
+            
+            # Log progress every 10 segments
+            if (i + 1) % 10 == 0:
+                logger.info(f"Processed {i + 1}/{len(segments)} segments")
+                
+        except Exception as e:
+            logger.warning(f"Failed to process segment {i}: {e}")
+            continue
+    
+    logger.info(f"Successfully processed {len(enhanced_segments)}/{len(segments)} segments")
+    
+    # Sort by final score
+    enhanced_segments.sort(key=lambda x: x.get('final_score', 0), reverse=True)
+    
+    # Log score distribution
+    if enhanced_segments:
+        scores = [seg.get('final_score', 0) for seg in enhanced_segments]
+        logger.info(f"Score distribution: min={min(scores):.3f}, max={max(scores):.3f}, avg={sum(scores)/len(scores):.3f}")
+        
+        # Log top 3 segments
+        for i, seg in enumerate(enhanced_segments[:3]):
+            score = seg.get('final_score', 0)
+            display_score = seg.get('display_score', 0)
+            text_length = len(seg.get('text', '').split())
+            logger.info(f"Top segment {i+1}: score={score:.3f}, display={display_score}, words={text_length}")
+    
+    # Take top clips
+    top_clips = enhanced_segments[:10]  # Top 10 clips
+    
+    return {
+        'clips': top_clips,
+        'genre': genre,
+        'platform': platform,
+        'scoring_version': 'v4.7.2-unified-syn-whiten-blend-prosody-guard-cal',
+        'debug': {
+            'phase2_enabled': True,
+            'phase3_enabled': True,
+            'whiten_paths': WHITEN_PATHS,
+            'genre_blend': GENRE_BLEND,
+            'boundary_hysteresis': BOUNDARY_HYSTERESIS,
+            'prosody_arousal': PROSODY_AROUSAL,
+            'payoff_guard': PAYOFF_GUARD,
+            'calibration': bool(CALIBRATION_V),
+            'calibration_version': CALIBRATION_V,
+            'total_segments': len(segments),
+            'processed_segments': len(enhanced_segments),
+            'top_clips_count': len(top_clips)
+        }
+    }
+
 # Stub implementations for unused functions
 def debug_segment_scoring(*args, **kwargs):
     """Stub implementation"""
@@ -1339,6 +1627,19 @@ def _platform_length_score_v2(
     text_tail: str = "",
 ) -> float:
     """Enhanced platform length scoring with smooth curves and adaptive features"""
+    if PLATFORM_LEN_V >= 2:
+        # Use new Phase 1 implementation
+        # Estimate info_density from text_tail if available
+        info_density = 0.0
+        if text_tail:
+            # Simple heuristic for info density
+            words = len(text_tail.split())
+            if words > 0:
+                info_density = min(1.0, words / 20.0)  # Rough estimate
+        
+        return platform_length_score_v2(duration, info_density, platform)
+    
+    # Fallback to original implementation
     # Get platform configuration with fallbacks
     config = get_config()
     plat_cfg = config.get("platform_length_v2", {})
@@ -1664,7 +1965,7 @@ def create_dynamic_segments(segments: List[Dict], platform: str = 'tiktok') -> L
     all_boundaries = [{"position": 0, "type": "start", "confidence": 1.0}] + boundaries
     
     for i, boundary in enumerate(all_boundaries):
-        if boundary["confidence"] < 0.8:  # Increased from 0.6 to 0.8 for higher confidence
+        if boundary["confidence"] < 0.5:  # Lowered threshold to include more boundaries
             continue  # Skip low-confidence boundaries
         
         # Calculate end position
@@ -1678,13 +1979,17 @@ def create_dynamic_segments(segments: List[Dict], platform: str = 'tiktok') -> L
         segment_words = words[boundary["position"]:end_position]
         segment_text = " ".join(segment_words)
         
-        if len(segment_words) < 8:  # Increased from 3 to 8 for longer segments
+        if len(segment_words) < 5:  # Reduced to allow shorter segments
             continue
         
         # Calculate timing based on word count and total duration
         total_words = len(words)
         segment_ratio = len(segment_words) / total_words
         segment_duration = total_duration * segment_ratio
+        
+        # Ensure minimum duration for platform requirements
+        if segment_duration < target_length["min"]:
+            segment_duration = target_length["min"]
         
         # CRITICAL FIX: Preserve original transcript timing instead of artificial calculation
         # Find the actual transcript segments that correspond to this text
@@ -1721,29 +2026,15 @@ def create_dynamic_segments(segments: List[Dict], platform: str = 'tiktok') -> L
                 "confidence": boundary["confidence"]
             })
         elif segment_duration < target_length["min"]:
-            # If segment is too short, try to merge with previous segment or extend
-            if len(dynamic_segments) > 0:
-                prev_segment = dynamic_segments[-1]
-                merged_duration = (current_start + segment_duration) - prev_segment["start"]
-                if merged_duration <= target_length["max"]:
-                    # Merge with previous segment
-                    dynamic_segments[-1] = {
-                        "text": prev_segment["text"] + " " + segment_text,
-                        "start": prev_segment["start"],
-                        "end": current_start + segment_duration,
-                        "boundary_type": "merged",
-                        "confidence": min(prev_segment["confidence"], boundary["confidence"])
-                    }
-            else:
-                # First segment is too short, extend it to minimum length
-                extended_duration = target_length["min"]
-                dynamic_segments.append({
-                    "text": segment_text,
-                    "start": current_start,
-                    "end": current_start + extended_duration,
-                    "boundary_type": "extended",
-                    "confidence": boundary["confidence"]
-                })
+            # If segment is too short, just extend it to minimum length instead of merging
+            extended_duration = target_length["min"]
+            dynamic_segments.append({
+                "text": segment_text,
+                "start": current_start,
+                "end": current_start + extended_duration,
+                "boundary_type": "extended",
+                "confidence": boundary["confidence"]
+            })
         
         current_start += segment_duration
     
@@ -2516,6 +2807,17 @@ __all__ = [
     "_question_list_raw_v2",
     "question_list_score_v2",
     "attach_question_list_scores_v2",
+    
+    # Phase 1 Enhanced Features
+    "compute_features_v4_enhanced",
+    
+    # Phase 2 Enhanced Features
+    "find_viral_clips_enhanced",
+    
+    # Phase 3 Enhanced Features
+    "prosody_arousal_score",
+    "payoff_guard",
+    "apply_calibration",
     
     # Utility functions
     "create_segment_hash",

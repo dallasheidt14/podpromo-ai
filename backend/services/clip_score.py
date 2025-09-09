@@ -853,7 +853,7 @@ class ClipScoreService:
         """Get AI-scored clip candidates for an episode with platform/genre optimization using the complete pipeline"""
         try:
             from services.secret_sauce_pkg import (
-                find_viral_clips, resolve_platform, detect_podcast_genre
+                find_viral_clips_enhanced, resolve_platform, detect_podcast_genre
             )
 
             # Get episode
@@ -879,25 +879,32 @@ class ClipScoreService:
             # Convert transcript to segments using intelligent moment detection
             segments = self._transcript_to_segments(episode.transcript, genre=final_genre, platform=platform)
 
-            # Use the complete viral clips pipeline with ad/intro filtering and dynamic segmentation
-            logger.info(f"Using complete viral clips pipeline with {len(segments)} segments")
-            viral_result = find_viral_clips(segments, episode.audio_path, genre=final_genre, platform=backend_platform)
+            # Use the enhanced viral clips pipeline with all Phase 1-3 improvements
+            logger.info(f"Using enhanced viral clips pipeline with {len(segments)} segments")
+            viral_result = find_viral_clips_enhanced(segments, episode.audio_path, genre=final_genre, platform=backend_platform)
             
             if "error" in viral_result:
-                logger.error(f"Viral clips pipeline failed: {viral_result['error']}")
+                logger.error(f"Enhanced viral clips pipeline failed: {viral_result['error']}")
                 return []
             
             clips = viral_result.get('clips', [])
-            logger.info(f"Found {len(clips)} viral clips using complete pipeline")
+            logger.info(f"Found {len(clips)} viral clips using enhanced pipeline")
             
             # Convert to candidate format with title generation and grades
             candidates = format_candidates(clips, final_genre, backend_platform, episode_id)
+            logger.info(f"Formatted {len(candidates)} candidates")
+            
+            # Debug: Log candidate scores
+            for i, candidate in enumerate(candidates[:3]):  # Log first 3 candidates
+                logger.info(f"Candidate {i}: display_score={candidate.get('display_score', 'MISSING')}, text_length={len(candidate.get('text', '').split())}")
             
             # Filter overlapping candidates
             filtered_candidates = filter_overlapping_candidates(candidates)
+            logger.info(f"After overlap filtering: {len(filtered_candidates)} candidates")
             
             # Apply quality filtering (temporarily lowered for debugging)
-            quality_filtered = filter_low_quality(filtered_candidates, min_score=40)
+            quality_filtered = filter_low_quality(filtered_candidates, min_score=20)
+            logger.info(f"After quality filtering: {len(quality_filtered)} candidates")
             
             return quality_filtered[:10]  # Return top 10
             
