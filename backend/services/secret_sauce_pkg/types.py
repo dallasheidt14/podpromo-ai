@@ -132,7 +132,7 @@ GENRE_BLEND = True  # Phase 2 - Enable genre confidence blending
 BOUNDARY_HYSTERESIS = True  # Phase 2 - Enable boundary stability
 PROSODY_AROUSAL = True  # Phase 3 - Enable prosody-aware arousal
 PAYOFF_GUARD = True  # Phase 3 - Enable payoff evidence guard
-CALIBRATION_V = "2025.09.1"  # Phase 3 - Calibration version
+CALIBRATION_V = "2025.09.2"  # Phase 3 - Enhanced calibration version
 
 # Phase 1: Segment caps and filtering
 MIN_WORDS = 5

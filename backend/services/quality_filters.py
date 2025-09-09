@@ -81,45 +81,78 @@ def filter_overlapping_candidates(candidates: List[Dict], iou_threshold: float =
 
 
 def filter_low_quality(candidates: List[Dict], min_score: int = 20) -> List[Dict]:
-    """Filter out low-quality candidates with safety net"""
+    """Filter out low-quality candidates using episode-relative percentile + rank gating"""
     if not candidates:
         return candidates
     
-    # Sort by final_score (highest first)
-    sorted_candidates = sorted(candidates, key=lambda x: x.get("final_score", x.get("score", 0)), reverse=True)
+    import numpy as np
     
-    filtered: List[Dict] = []
-    for candidate in sorted_candidates:
-        # Use final_score for quality gates, not display_score
+    # Sort by final_score (highest first), then payoff, then earlier start for tie-breaking
+    sorted_candidates = sorted(candidates, key=lambda x: (
+        x.get("final_score", x.get("score", 0)),
+        x.get("payoff_score", 0),
+        -x.get("start", 0)  # Earlier start is better (negative for descending sort)
+    ), reverse=True)
+    
+    # Extract final scores for percentile calculation
+    scores = [c.get("final_score", 0) for c in candidates]
+    if not scores:
+        return candidates
+    
+    # Calculate episode-relative thresholds
+    mn, mx = min(scores), max(scores)
+    spread = mx - mn
+    
+    # Low-contrast relaxer: if spread < 0.20, use p60 instead of p70
+    percentile_threshold = 60 if spread < 0.20 else 70
+    cutoff_score = np.percentile(scores, percentile_threshold)
+    
+    logger.info(f"Quality filter: spread={spread:.3f}, using p{percentile_threshold}, cutoff={cutoff_score:.3f}")
+    
+    # Episode-relative + rank gating
+    kept_by_percentile = []
+    kept_by_rank = []
+    
+    for i, candidate in enumerate(sorted_candidates):
         final_score = candidate.get("final_score", 0)
-        display_score = candidate.get("display_score", 0)
         
-        # Convert final_score to 0-100 range if it's in 0-1 range
-        if final_score <= 1.0:
-            final_score_100 = final_score * 100
-        else:
-            final_score_100 = final_score
+        # Percentile gate: keep if above cutoff
+        if final_score >= cutoff_score:
+            kept_by_percentile.append(candidate)
         
-        # Quality gates
-        if final_score_100 < min_score:
-            continue
-            
+        # Rank gate: always keep top 3
+        if i < 3:
+            kept_by_rank.append(candidate)
+    
+    # Combine both criteria (union)
+    kept_ids = set()
+    for candidate in kept_by_percentile + kept_by_rank:
+        kept_ids.add(id(candidate))
+    
+    filtered = [c for c in candidates if id(c) in kept_ids]
+    
+    # Additional quality gates (text-based)
+    text_filtered = []
+    for candidate in filtered:
         text = candidate.get("text", "")
-        if len(text.split()) < 10:  # Reduced from 20 to be less strict
+        if len(text.split()) < 8:  # Reduced from 10 to be less strict
             continue
         if text and text[0].islower():
             continue
-            
-        filtered.append(candidate)
+        text_filtered.append(candidate)
     
-    # Safety net: if no candidates passed quality filter, keep the best ones
-    if not filtered:
-        # Keep top 3 candidates regardless of score
-        filtered = sorted_candidates[:3]
-        logger.warning(f"No candidates passed quality filter, keeping top {len(filtered)} candidates")
-    elif len(filtered) < 2 and len(candidates) >= 2:
-        # If only 1 candidate passed, add the second best
-        filtered = sorted_candidates[:2]
-        logger.warning(f"Only 1 candidate passed quality filter, keeping top 2")
+    # Final backstop: if still no candidates, keep top 3
+    if not text_filtered:
+        text_filtered = sorted_candidates[:3]
+        logger.warning(f"No candidates passed text quality gates, keeping top {len(text_filtered)} candidates")
     
-    return filtered
+    # Soft floor: if we started with many segments but ended with few, bump to min 3
+    if len(text_filtered) < 3 and len(candidates) >= 8:
+        # Add more from top candidates
+        additional_needed = 3 - len(text_filtered)
+        additional_candidates = [c for c in sorted_candidates if c not in text_filtered][:additional_needed]
+        text_filtered.extend(additional_candidates)
+        logger.info(f"Applied soft floor: added {len(additional_candidates)} candidates to reach minimum 3")
+    
+    logger.info(f"Quality filter result: {len(candidates)} → {len(text_filtered)} candidates")
+    return text_filtered

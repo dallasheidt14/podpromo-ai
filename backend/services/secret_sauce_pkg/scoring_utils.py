@@ -394,8 +394,28 @@ def apply_calibration(score: float, calibration_version: str = "2025.09.1") -> f
     """
     if calibration_version == "2025.09.1":
         return piecewise_calibrate(score)
+    elif calibration_version == "2025.09.2":
+        return piecewise_calibrate_v2(score)
     else:
         return score  # No calibration for unknown versions
+
+def piecewise_calibrate_v2(score: float) -> float:
+    """
+    Enhanced piecewise calibration to stretch the 0.35-0.55 band.
+    Brightens mids by ~10-15% and compresses extremes slightly.
+    """
+    if score <= 0.35:
+        # Compress low scores slightly
+        return score * 0.95
+    elif score <= 0.55:
+        # Brighten mid-range scores by 12%
+        return score * 1.12
+    elif score <= 0.75:
+        # Slight brightening for upper-mid scores
+        return score * 1.05
+    else:
+        # Compress high scores slightly to prevent ceiling effects
+        return min(0.95, score * 0.98)
 
 def prosody_arousal_score(text: str, audio_file: str, start: float, end: float, genre: str = 'general') -> float:
     """

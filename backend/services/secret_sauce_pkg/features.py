@@ -1380,12 +1380,30 @@ def find_viral_clips_enhanced(segments: List[Dict], audio_file: str, genre: str 
     
     # Calculate health metrics
     import statistics
+    import numpy as np
+    
     durations = [seg.get('end', 0) - seg.get('start', 0) for seg in enhanced_segments]
+    scores = [seg.get('final_score', 0) for seg in enhanced_segments]
+    
+    # Calculate score spread and percentiles
+    score_spread = max(scores) - min(scores) if scores else 0
+    p70_score = np.percentile(scores, 70) if scores else 0
+    p60_score = np.percentile(scores, 60) if scores else 0
+    
     health_metrics = {
         'segments': len(enhanced_segments),
         'sec_p50': statistics.median(durations) if durations else 0,
         'sec_p90': statistics.quantiles(durations, n=10)[8] if len(durations) >= 10 else max(durations) if durations else 0,
         'yield_rate': len(top_clips) / max(1, len(enhanced_segments)),
+        'score_analysis': {
+            'min': min(scores) if scores else 0,
+            'max': max(scores) if scores else 0,
+            'avg': statistics.mean(scores) if scores else 0,
+            'spread': score_spread,
+            'p70': p70_score,
+            'p60': p60_score,
+            'low_contrast': score_spread < 0.20
+        },
         'filters': {
             'ads_removed': 0,  # Will be calculated by filtering functions
             'intros_removed': 0,  # Will be calculated by filtering functions
