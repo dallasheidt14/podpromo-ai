@@ -25,11 +25,15 @@ export default function UpgradeButton({ userId, currentPlan, onUpgrade }: Upgrad
         // Redirect to Paddle checkout
         window.location.href = data.url;
       } else {
-        console.error("No checkout URL received");
+        if (process.env.NODE_ENV === "development") {
+          console.error("No checkout URL received");
+        }
         setLoading(false);
       }
     } catch (error) {
-      console.error("Upgrade failed:", error);
+      if (process.env.NODE_ENV === "development") {
+        console.error("Upgrade failed:", error);
+      }
       setLoading(false);
     }
   };
