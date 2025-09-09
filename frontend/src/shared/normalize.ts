@@ -99,7 +99,7 @@ export function normalizeClip(raw: any): Clip {
     hook_confidence: Number(features.hook_confidence || 0),
     audio_modifier: Number(features.audio_modifier || 0),
     laughter_boost: Number(features.laughter_boost || 0),
-    time_weighted_score: Number(features.time_weighted_score || 0),
+    time_weighted_score: Number(features.time_weighted_score || 0)
   };
   
   // Normalize score to 0-1 range
