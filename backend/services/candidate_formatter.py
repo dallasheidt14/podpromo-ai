@@ -47,7 +47,7 @@ def format_candidates(
             "question_score": features.get("question_score", 0.0),
             "info_density": features.get("info_density", 0.0),
             "loopability": features.get("loopability", 0.0),
-            "platform_length_match": features.get("platform_len_match", 0.0),
+            "platform_length_match": features.get("platform_len_match", features.get("platform_length_match", 0.0)),
             "Viral Potential": seg.get("display_score", 0),
             "Hook Power": features.get("hook_score", 0.0) * 100,
             "Energy Level": features.get("arousal_score", 0.0) * 100,
