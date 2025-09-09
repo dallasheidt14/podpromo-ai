@@ -133,3 +133,19 @@ BOUNDARY_HYSTERESIS = True  # Phase 2 - Enable boundary stability
 PROSODY_AROUSAL = True  # Phase 3 - Enable prosody-aware arousal
 PAYOFF_GUARD = True  # Phase 3 - Enable payoff evidence guard
 CALIBRATION_V = "2025.09.1"  # Phase 3 - Calibration version
+
+# Phase 1: Segment caps and filtering
+MIN_WORDS = 5
+MAX_WORDS = 100
+MIN_SEC = 8
+MAX_SEC = 60
+
+def _keep(seg: Dict) -> bool:
+    """
+    Filter segments based on word count and duration caps.
+    Applied after segmentation and after any extend/merge/snap step.
+    """
+    word_count = len(seg.get('text', '').split())
+    duration = seg.get('end', 0) - seg.get('start', 0)
+    
+    return (MIN_WORDS <= word_count <= MAX_WORDS) and (MIN_SEC <= duration <= MAX_SEC)

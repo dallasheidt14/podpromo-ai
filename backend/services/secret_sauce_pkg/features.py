@@ -15,8 +15,8 @@ from scipy.stats import skew, kurtosis
 from config_loader import get_config
 
 # Import new Phase 1, 2 & 3 types and utilities
-from .types import Features, Scores, FEATURE_TYPES, SYNERGY_MODE, PLATFORM_LEN_V, WHITEN_PATHS, GENRE_BLEND, BOUNDARY_HYSTERESIS, PROSODY_AROUSAL, PAYOFF_GUARD, CALIBRATION_V
-from .scoring_utils import whiten_paths, synergy_bonus, platform_length_score_v2, apply_genre_blending, find_optimal_boundaries, prosody_arousal_score, payoff_guard, apply_calibration
+from .types import Features, Scores, FEATURE_TYPES, SYNERGY_MODE, PLATFORM_LEN_V, WHITEN_PATHS, GENRE_BLEND, BOUNDARY_HYSTERESIS, PROSODY_AROUSAL, PAYOFF_GUARD, CALIBRATION_V, MIN_WORDS, MAX_WORDS, MIN_SEC, MAX_SEC, _keep
+from .scoring_utils import whiten_paths, synergy_bonus, platform_length_score_v2, apply_genre_blending, find_optimal_boundaries, prosody_arousal_score, payoff_guard, apply_calibration, pick_boundary, snap_to_nearest_pause_or_punct
 
 logger = logging.getLogger(__name__)
 
@@ -1232,6 +1232,11 @@ def compute_features_v4_enhanced(segment: Dict, audio_file: str, y_sr=None, genr
     final_score = scored_result.get('viral_score_100', 0) / 100.0  # Convert from 0-100 to 0-1
     display_score = scored_result.get('viral_score_100', 0)
     
+    # Quantize final scores for stability
+    from .types import quantize
+    final_score = quantize(final_score)
+    display_score = quantize(display_score, 1.0)  # Quantize to whole numbers for display
+    
     result.update({
         'final_score': final_score,
         'display_score': display_score,
@@ -1336,6 +1341,21 @@ def find_viral_clips_enhanced(segments: List[Dict], audio_file: str, genre: str 
     # Take top clips
     top_clips = enhanced_segments[:10]  # Top 10 clips
     
+    # Calculate health metrics
+    import statistics
+    durations = [seg.get('end', 0) - seg.get('start', 0) for seg in enhanced_segments]
+    health_metrics = {
+        'segments': len(enhanced_segments),
+        'sec_p50': statistics.median(durations) if durations else 0,
+        'sec_p90': statistics.quantiles(durations, n=10)[8] if len(durations) >= 10 else max(durations) if durations else 0,
+        'yield_rate': len(top_clips) / max(1, len(enhanced_segments)),
+        'filters': {
+            'ads_removed': 0,  # Will be calculated by filtering functions
+            'intros_removed': 0,  # Will be calculated by filtering functions
+            'caps_applied': len(segments) - len(enhanced_segments)  # Segments filtered by caps
+        }
+    }
+    
     return {
         'clips': top_clips,
         'genre': genre,
@@ -1353,7 +1373,8 @@ def find_viral_clips_enhanced(segments: List[Dict], audio_file: str, genre: str 
             'calibration_version': CALIBRATION_V,
             'total_segments': len(segments),
             'processed_segments': len(enhanced_segments),
-            'top_clips_count': len(top_clips)
+            'top_clips_count': len(top_clips),
+            'health': health_metrics
         }
     }
 
@@ -2018,23 +2039,29 @@ def create_dynamic_segments(segments: List[Dict], platform: str = 'tiktok') -> L
         
         # Check if segment meets platform requirements
         if target_length["min"] <= segment_duration <= target_length["max"]:
-            dynamic_segments.append({
+            segment = {
                 "text": segment_text,
                 "start": current_start,
                 "end": current_start + segment_duration,
                 "boundary_type": boundary["type"],
                 "confidence": boundary["confidence"]
-            })
+            }
+            # Apply caps filtering
+            if _keep(segment):
+                dynamic_segments.append(segment)
         elif segment_duration < target_length["min"]:
             # If segment is too short, just extend it to minimum length instead of merging
             extended_duration = target_length["min"]
-            dynamic_segments.append({
+            segment = {
                 "text": segment_text,
                 "start": current_start,
                 "end": current_start + extended_duration,
                 "boundary_type": "extended",
                 "confidence": boundary["confidence"]
-            })
+            }
+            # Apply caps filtering
+            if _keep(segment):
+                dynamic_segments.append(segment)
         
         current_start += segment_duration
     
@@ -2051,6 +2078,9 @@ def create_dynamic_segments(segments: List[Dict], platform: str = 'tiktok') -> L
             seg["end"] = seg["start"] + target_length["min"]
             seg["boundary_type"] = "extended"
         final_segments.append(seg)
+    
+    # Apply final caps filtering to ensure all segments meet requirements
+    final_segments = [seg for seg in final_segments if _keep(seg)]
     
     return final_segments
 

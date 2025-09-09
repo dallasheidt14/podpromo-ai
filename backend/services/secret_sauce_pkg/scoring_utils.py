@@ -3,7 +3,7 @@ Advanced scoring utilities for Phase 1 improvements.
 """
 
 import numpy as np
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 from .types import _c01, quantize
 
 # Path constants
@@ -443,3 +443,35 @@ def prosody_arousal_score(text: str, audio_file: str, start: float, end: float, 
         audio_features["zcr"],
         audio_features["pitch_std"]
     )
+
+# Phase 1: Hysteresis + Snap-to Boundary Selection
+MIN_DELTA = 0.03
+STICKY_BONUS = 0.005
+
+def pick_boundary(current: Dict, candidates: List[Dict]) -> Dict:
+    """
+    Pick the best boundary using hysteresis to prevent jitter.
+    Only moves to a new boundary if score improvement exceeds MIN_DELTA.
+    """
+    if not candidates:
+        return current
+    
+    # Add sticky bonus to current boundary to prevent unnecessary changes
+    best_score = current.get('score', 0) + STICKY_BONUS
+    best_boundary = current
+    
+    for candidate in candidates:
+        candidate_score = candidate.get('score', 0)
+        if candidate_score > best_score + MIN_DELTA:
+            best_score = candidate_score
+            best_boundary = candidate
+    
+    return best_boundary
+
+def snap_to_nearest_pause_or_punct(boundary: Dict, window_ms: float = 250) -> Dict:
+    """
+    Snap boundary to nearest punctuation or pause within window_ms.
+    """
+    # This is a simplified implementation - in practice you'd analyze audio
+    # for silence/pause detection or look for punctuation in text
+    return boundary
