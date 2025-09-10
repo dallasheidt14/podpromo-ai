@@ -903,6 +903,10 @@ class EpisodeService:
             else:
                 segments = result.get("segments", [])
             
+            # Convert generator to list if needed
+            if hasattr(segments, '__iter__') and not isinstance(segments, (list, tuple)):
+                segments = list(segments)
+            
             total_segments = len(segments)
             
             for i, segment in enumerate(segments):
@@ -986,6 +990,7 @@ class EpisodeService:
                     start=seg.start,
                     end=seg.end,
                     text=seg.text.strip(),
+                    raw_text=seg.text.strip(),  # Keep punctuation intact for EOS
                     words=words  # Store word-level data
                 ))
                 
@@ -1009,6 +1014,9 @@ class EpisodeService:
             if episode:
                 episode.words = all_words
                 episode.word_count = word_count
+                
+                # Store raw episode text with punctuation intact for EOS
+                episode.raw_text = " ".join([seg.text for seg in segments_list])
                 
                 # Attach words to segments for local EOS detection
                 self._attach_words_to_segments(all_words, segments_list)

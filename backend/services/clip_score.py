@@ -1045,16 +1045,17 @@ class ClipScoreService:
             # Build EOS index early to determine fallback mode
             from services.secret_sauce_pkg.features import build_eos_index
             episode_words = getattr(episode, 'words', None) if episode else None
-            eos_times, word_end_times = build_eos_index(segments, episode_words)
+            episode_raw_text = getattr(episode, 'raw_text', None) if episode else None
+            eos_times, word_end_times, eos_source = build_eos_index(segments, episode_words, episode_raw_text)
             
             # One-time fallback mode decision per episode (freeze this value)
             eos_density = len(eos_times) / max(len(word_end_times), 1)
             episode_fallback_mode = eos_density < 0.020
-            logger.info(f"Episode fallback mode: {episode_fallback_mode} (density={eos_density:.3f})")
+            logger.info(f"EOS_UNIFIED: count={len(eos_times)}, src={eos_source}, density={eos_density:.3f}, fallback={episode_fallback_mode}")
 
             # Use the enhanced viral clips pipeline with all Phase 1-3 improvements
             logger.info(f"Using enhanced viral clips pipeline with {len(segments)} segments")
-            viral_result = find_viral_clips_enhanced(segments, episode.audio_path, genre=final_genre, platform=backend_platform, fallback_mode=episode_fallback_mode)
+            viral_result = find_viral_clips_enhanced(segments, episode.audio_path, genre=final_genre, platform=backend_platform, fallback_mode=episode_fallback_mode, effective_eos_times=eos_times, effective_word_end_times=word_end_times, eos_source=eos_source)
             
             if "error" in viral_result:
                 logger.error(f"Enhanced viral clips pipeline failed: {viral_result['error']}")
@@ -1144,10 +1145,31 @@ class ClipScoreService:
             quality_filtered = filter_low_quality(filtered_candidates, min_score=15)
             logger.info(f"After quality filtering: {len(quality_filtered)} candidates")
             
-            # POST-NMS: Log final durations
-            logger.info("POST-NMS: durs=%s",
-                [round(c.get("end", 0) - c.get("start", 0), 1) for c in quality_filtered]
-            )
+            # Quality gate: require finished thoughts in non-fallback mode
+            if not episode_fallback_mode:
+                finished_clips = []
+                for c in quality_filtered:
+                    if c.get('finished_thought', 0) == 1:
+                        finished_clips.append(c)
+                    else:
+                        # Check for one-sentence aphorisms (≤12 words ending in .)
+                        text = c.get('text', '').strip()
+                        if text.endswith('.') and len(text.split()) <= 12:
+                            c['finished_thought'] = 1
+                            c['finish_reason'] = 'aphorism'
+                            finished_clips.append(c)
+                        else:
+                            logger.info(f"Quality gate: dropping unresolved clip {c.get('id', 'unknown')} (no EOS finish)")
+                
+                if finished_clips:
+                    quality_filtered = finished_clips
+                    logger.info(f"Quality gate: kept {len(finished_clips)} finished clips")
+                else:
+                    logger.warning("Quality gate: no finished clips found, keeping all for safety")
+            
+            # POST-NMS: Log final durations (cast to float to avoid numpy dtype issues)
+            safe_durs = [float(round(c.get("end", 0) - c.get("start", 0), 1)) for c in quality_filtered]
+            logger.info("POST-NMS: durs=%s", safe_durs)
             
             # Diversity check: warn if all candidates have same duration
             durs = [round(c.get("end", 0) - c.get("start", 0), 1) for c in quality_filtered]
@@ -1212,23 +1234,45 @@ class ClipScoreService:
             
             # Final sanity check before save
             assert len(ranked_clips) > 0, "Should have at least one clip"
-            finished_ratio = sum(c.get("finished_thought", 0) for c in ranked_clips) / len(ranked_clips)
             
-            # Comprehensive telemetry with consistent fallback mode
-            finished_count = sum(c.get('finished_thought', 0) for c in ranked_clips)
-            sparse_finished_count = sum(1 for c in ranked_clips if c.get('sparse_finished', False))
-            finished_ratio = finished_count / max(len(ranked_clips), 1)
-            sparse_ratio = sparse_finished_count / max(len(ranked_clips), 1)
+            # Source of truth for finish-thought tracking with state tracking
+            FT = {
+                "mode": episode_fallback_mode,
+                "state": {},  # clip_id -> "finished" | "sparse_finished" | "unresolved"
+                "finished": 0,
+                "sparse_finished": 0,
+                "total": len(ranked_clips)
+            }
+            
+            # Initialize state and count finished clips
+            for i, c in enumerate(ranked_clips):
+                clip_id = c.get('id', f'clip_{i}')
+                if c.get('finished_thought', 0) == 1:
+                    FT["state"][clip_id] = "finished"
+                    FT["finished"] += 1
+                elif c.get('sparse_finished', False):
+                    FT["state"][clip_id] = "sparse_finished"
+                    FT["sparse_finished"] += 1
+                else:
+                    FT["state"][clip_id] = "unresolved"
+            
+            # Calculate ratios consistently from FT state
+            ratio_strict = FT["finished"] / max(FT["total"], 1)
+            if FT["mode"]:  # fallback mode
+                ratio_sparse_ok = (FT["finished"] + FT["sparse_finished"]) / max(FT["total"], 1)
+            else:
+                ratio_sparse_ok = ratio_strict
             
             # Calculate longest clip duration
             longest_dur = max((c.get("end", 0) - c.get("start", 0)) for c in ranked_clips) if ranked_clips else 0.0
             
-            logger.info(f"TELEMETRY: word_count={len(word_end_times)} eos_count={len(eos_times)} eos_density={len(eos_times)/max(len(word_end_times), 1):.3f} fallback_mode={episode_fallback_mode}")
-            logger.info(f"FT_SUMMARY: fallback={episode_fallback_mode} finished={finished_count}/{len(ranked_clips)} ratio={finished_ratio:.2f} sparse_ok={sparse_ratio:.2f} longest={longest_dur:.1f}s")
+            logger.info(f"TELEMETRY: word_count={len(word_end_times)} eos_count={len(eos_times)} eos_density={len(eos_times)/max(len(word_end_times), 1):.3f} eos_count_src={eos_source} fallback_mode={episode_fallback_mode}")
+            logger.info(f"FT_SUMMARY: finished={FT['finished']} sparse={FT['sparse_finished']} total={FT['total']} ratio_strict={ratio_strict:.2f} ratio_sparse_ok={ratio_sparse_ok:.2f} longest={longest_dur:.1f}s")
             logger.info(f"POST_SAFETY: kept={len(ranked_clips)} ids={[c.get('id', 'unknown') for c in ranked_clips]}")
             
-            if finished_ratio < 0.6:
-                logger.warning(f"FINISH_RATIO_LOW: {finished_ratio:.2f}")
+            # Log finish ratio status (only if low in non-fallback mode)
+            if not episode_fallback_mode and ratio_strict < 0.6:
+                logger.warning(f"FINISH_RATIO_LOW: {ratio_strict:.2f} (non-fallback mode requires finished thoughts)")
             
             return ranked_clips, default_clip_id
             

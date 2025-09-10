@@ -150,6 +150,7 @@ class Episode(BaseModel):
     clips: Optional[List[Dict[str, Any]]] = None  # Store generated clips
     words: Optional[List[Dict[str, Any]]] = None  # Store word-level timestamps
     word_count: Optional[int] = None  # Store word count for EOS index
+    raw_text: Optional[str] = None  # Store raw text with punctuation intact for EOS
     error: Optional[str] = None
     uploaded_at: Optional[datetime] = None
     processed_at: Optional[datetime] = None

@@ -584,9 +584,12 @@ def choose_variant(base: dict, variants: list, audio_file: str, genre: str, plat
     
     # Guard against zero-length variants after any EOS snapping
     MIN_DUR = 1.0  # sec
-    variants = [v for v in variants if (v.get("end", 0) - v.get("start", 0)) >= MIN_DUR]
+    def valid(v): 
+        return (v.get("end", 0) - v.get("start", 0)) >= MIN_DUR
+    
+    variants = [v for v in variants if valid(v)]
     if not variants:
-        logger.warning(f"VARIANT_FILTER: {seed} all variants too short, using base")
+        logger.warning(f"NO_VALID_VARIANTS_AFTER_EOS: {seed} all variants too short, using base")
         return base
     
     # Re-score every variant (compute features again with new start/end!)
@@ -616,8 +619,7 @@ def choose_variant(base: dict, variants: list, audio_file: str, genre: str, plat
     if eos_times and word_end_times:
         normalized_scored = []
         for v in scored:
-            # Determine fallback mode based on EOS density
-            fallback_mode = len(eos_times) < 50 or len(word_end_times) < 500
+            # Use the effective EOS data for finish-thought normalization
             normalized_v, result = finish_thought_normalize(v, eos_times, word_end_times, platform, fallback_mode)
             normalized_scored.append(normalized_v)
             if result != "snap_ok":
@@ -1775,7 +1777,7 @@ def compute_features_v4_enhanced(segment: Dict, audio_file: str, y_sr=None, genr
     
     return result
 
-def find_viral_clips_enhanced(segments: List[Dict], audio_file: str, genre: str = 'general', platform: str = 'tiktok', fallback_mode: bool = None) -> Dict:
+def find_viral_clips_enhanced(segments: List[Dict], audio_file: str, genre: str = 'general', platform: str = 'tiktok', fallback_mode: bool = None, effective_eos_times: List[float] = None, effective_word_end_times: List[float] = None, eos_source: str = None) -> Dict:
     """
     Enhanced viral clip finding with Phase 1, 2 & 3 improvements:
     - Path whitening
@@ -1787,15 +1789,20 @@ def find_viral_clips_enhanced(segments: List[Dict], audio_file: str, genre: str 
     """
     logger.info(f"Enhanced pipeline received {len(segments)} segments")
     
-    # Build EOS index for Finish-Thought Gate
-    # Note: episode_words should be passed from the caller for better accuracy
-    eos_times, word_end_times = build_eos_index(segments)
-    logger.info(f"EOS index: {len(eos_times)} EOS markers, {len(word_end_times)} word boundaries")
-    
-    # Use provided fallback_mode or determine from EOS density
-    if fallback_mode is None:
-        eos_density = len(eos_times) / max(len(word_end_times), 1)
-        fallback_mode = eos_density < 0.020
+    # Use effective EOS data if provided, otherwise build from segments
+    if effective_eos_times is not None and effective_word_end_times is not None:
+        eos_times = effective_eos_times
+        word_end_times = effective_word_end_times
+        logger.info(f"EOS_REUSED: count={len(eos_times)}, src={eos_source} (inherited), fallback={fallback_mode}")
+    else:
+        # Build EOS index for Finish-Thought Gate (fallback)
+        eos_times, word_end_times, eos_source = build_eos_index(segments)
+        logger.info(f"EOS index: {len(eos_times)} EOS markers, {len(word_end_times)} word boundaries, source={eos_source}")
+        
+        # Use provided fallback_mode or determine from EOS density
+        if fallback_mode is None:
+            eos_density = len(eos_times) / max(len(word_end_times), 1)
+            fallback_mode = eos_density < 0.020
     
     if not segments:
         return {
@@ -3649,149 +3656,168 @@ def cfg_for_finish_thought(fallback_mode: bool, platform: str) -> dict:
             "min_viable_after_shrink_sec": cfg["min_viable_after_shrink_sec"]["normal"]
         }
 
-def build_eos_index(segments: List[Dict], episode_words: List[Dict] = None) -> Tuple[List[float], List[float]]:
+def build_eos_index(segments: List[Dict], episode_words: List[Dict] = None, episode_raw_text: str = None) -> Tuple[List[float], List[float], str]:
     """
     Build End-of-Sentence (EOS) index from transcript segments with word-level timings.
-    Always returns an EOS index, using fallback methods if word data is sparse.
+    Unifies multiple EOS sources: word timings (best), punctuation+VAD (fallback), segment boundaries (last resort).
     
     Args:
         segments: List of transcript segments with start/end times and optional words
-        episode_words: Episode-level word timestamps (preferred over segment words)
+        episode_words: Episode-level word timestamps (preferred)
+        episode_raw_text: Episode raw text with punctuation intact (fallback)
         
     Returns:
-        Tuple of (eos_times, word_end_times) - both sorted lists of timestamps
+        Tuple of (eos_times, word_end_times, eos_source) - EOS markers, word boundaries, and source type
     """
     eos_times = set()
     word_end_times = []
+    eos_source = "none"
     
-    # Prefer segment-level words for local EOS detection, fall back to episode-level
-    all_words = []
-    segment_word_count = 0
+    # 1) Try episode-level word timings (best)
+    episode_eos = []
+    if episode_words and len(episode_words) >= 100:
+        episode_eos = _build_eos_from_words(episode_words)
+        if episode_eos:
+            eos_times.update(episode_eos)
+            eos_source = "episode"
+            logger.info(f"EOS from episode words: {len(episode_eos)} markers")
     
-    # First try to extract words from segments
-    for segment in segments:
-        words = segment.get('words', [])
-        if words:
-            all_words.extend(words)
-            segment_word_count += len(words)
-    
-    if segment_word_count > 0:
-        logger.info(f"Using segment-level words: {segment_word_count} words from {len(segments)} segments")
-    elif episode_words and len(episode_words) >= 500:
-        all_words = episode_words
-        logger.info(f"Using episode-level words: {len(all_words)} words (fallback)")
-    else:
-        logger.info(f"Using segment-level words: {len(all_words)} words (sparse)")
-    
-    # Method 1: Use word-level timings if available (most accurate)
-    if all_words and len(all_words) >= 100:  # Lower threshold for better coverage
-        # Calculate gap statistics for adaptive EOS detection
-        gaps = []
-        for i, word in enumerate(all_words[:-1]):
-            word_end = word.get('end', 0)
-            next_word = all_words[i + 1]
-            next_start = next_word.get('start', 0)
-            gap_ms = (next_start - word_end) * 1000
-            if gap_ms > 0:
-                gaps.append(gap_ms)
+    # 2) Try segment-level words (next best)
+    if not eos_times:
+        segment_word_count = 0
+        for segment in segments:
+            words = segment.get('words', [])
+            if words:
+                segment_eos = _build_eos_from_words(words)
+                eos_times.update(segment_eos)
+                segment_word_count += len(words)
         
-        # Calculate adaptive gap threshold
-        GAP_EOS_MS_BASE = 280
-        if gaps:
-            import statistics
-            median_gap = statistics.median(gaps)
-            iqr_gaps = [g for g in gaps if abs(g - median_gap) <= statistics.stdev(gaps) if len(gaps) > 1]
-            iqr_gap = statistics.median(iqr_gaps) if iqr_gaps else median_gap
-            GAP_EOS_MS = max(GAP_EOS_MS_BASE, median_gap + iqr_gap)
-        else:
-            GAP_EOS_MS = GAP_EOS_MS_BASE
-        
-        # Discourse closers for conversational EOS
-        discourse_closers = {"right?", "you know?", "that's it.", "that's right.", "all set.", "we're done."}
-        
-        for i, word in enumerate(all_words[:-1]):
-            word_text = word.get('text', '').strip()
-            word_end = word.get('end', 0)
-            next_word = all_words[i + 1]
-            next_start = next_word.get('start', 0)
-            
-            # 1) Punctuation EOS
-            if word_text.endswith(('.', '?', '!', '…')):
-                eos_times.add(word_end)
-            
-            # 2) Gap-based EOS (adaptive threshold)
-            pause_ms = (next_start - word_end) * 1000
-            if pause_ms >= GAP_EOS_MS:
-                eos_times.add(word_end)
-            
-            # 3) Discourse closer EOS
-            if word_text.lower() in discourse_closers:
-                eos_times.add(word_end)
-            
-            word_end_times.append(word_end)
-        
-        # Add last word end
-        if all_words:
-            word_end_times.append(all_words[-1].get('end', 0))
-        
-        # Log EOS density for tuning
-        eos_density = len(eos_times) / max(len(word_end_times), 1)
-        logger.info(f"EOS detection: {len(eos_times)} markers, {len(word_end_times)} words, density={eos_density:.3f}")
-    else:
-        # Method 2: Fallback to segment-level analysis
-        logger.warning(f"EOS_SPARSE: Only {len(all_words)} words available; using fallback EOS (punctuation+VAD)")
-        eos_times, word_end_times = build_eos_fallback(segments)
+        if eos_times:
+            eos_source = "segment"
+            logger.info(f"EOS from segment words: {len(eos_times)} markers from {segment_word_count} words")
     
-    # Convert to sorted lists
-    eos_times = sorted(list(eos_times))
-    word_end_times = sorted(word_end_times)
+    # 3) Fallback to punctuation+VAD (if no word-based EOS)
+    if not eos_times and episode_raw_text:
+        fallback_eos = _build_eos_from_punctuation_vad(episode_raw_text, segments)
+        if fallback_eos:
+            eos_times.update(fallback_eos)
+            eos_source = "fallback"
+            logger.info(f"EOS from punctuation+VAD: {len(fallback_eos)} markers")
     
-    # Check EOS density and warn if too sparse
-    word_count = len(word_end_times)
-    eos_density = len(eos_times) / max(word_count, 1)
+    # 4) Last resort: segment boundaries
+    if not eos_times:
+        seg_boundary_eos = [s.get('end', 0) for s in segments if s.get('end', 0) > 0]
+        if seg_boundary_eos:
+            eos_times.update(seg_boundary_eos)
+            eos_source = "segment_boundary"
+            logger.info(f"EOS from segment boundaries: {len(seg_boundary_eos)} markers")
     
-    if word_count < 500:
-        logger.warning(f"EOS_SPARSE: Only {word_count} word boundaries for full episode (expected 1000+)")
-    if eos_density < 0.02:
-        logger.warning(f"EOS_SPARSE: EOS density {eos_density:.3f} too low (expected 0.02+)")
+    # Build word_end_times from available words
+    all_words = episode_words or []
+    if not all_words:
+        for segment in segments:
+            words = segment.get('words', [])
+            if words:
+                all_words.extend(words)
     
-    logger.info(f"EOS index built: {len(eos_times)} EOS markers, {len(word_end_times)} word boundaries (density: {eos_density:.3f})")
-    return eos_times, word_end_times
+    for word in all_words:
+        word_end_times.append(word.get('end', 0))
+    
+    # Log final EOS density
+    eos_density = len(eos_times) / max(len(word_end_times), 1) if word_end_times else 0
+    logger.info(f"EOS unified: {len(eos_times)} markers, {len(word_end_times)} words, density={eos_density:.3f}, source={eos_source}")
+    
+    return sorted(list(eos_times)), sorted(word_end_times), eos_source
 
-def build_eos_fallback(segments: List[Dict], pause_ms: int = 300) -> Tuple[set, List[float]]:
-    """
-    Fallback EOS index using sentence punctuation and segment-level analysis.
+def _build_eos_from_words(words: List[Dict]) -> List[float]:
+    """Build EOS markers from word-level timings with adaptive gap detection."""
+    eos_times = []
     
-    Args:
-        segments: List of transcript segments
-        pause_ms: Minimum pause duration for prosody EOS
-        
-    Returns:
-        Tuple of (eos_times_set, word_end_times_list)
-    """
-    eos_times = set()
-    word_end_times = []
+    if not words or len(words) < 2:
+        return eos_times
     
-    for i, segment in enumerate(segments):
-        text = segment.get('text', '').strip()
-        end_time = segment.get('end', 0)
-        
-        # Punctuation EOS
-        if text.endswith(('.', '?', '!')):
-            eos_times.add(end_time)
-        
-        # Add segment end as word boundary
-        word_end_times.append(end_time)
-        
-        # Prosody EOS (pause between segments)
-        if i < len(segments) - 1:
-            next_segment = segments[i + 1]
-            next_start = next_segment.get('start', 0)
-            pause_duration = (next_start - end_time) * 1000
-            if pause_duration >= pause_ms:
-                eos_times.add(end_time)
+    # Calculate gap statistics for adaptive EOS detection
+    gaps = []
+    for i, word in enumerate(words[:-1]):
+        word_end = word.get('end', 0)
+        next_word = words[i + 1]
+        next_start = next_word.get('start', 0)
+        gap_ms = (next_start - word_end) * 1000
+        if gap_ms > 0:
+            gaps.append(gap_ms)
     
-    return eos_times, word_end_times
+    # Calculate adaptive gap threshold
+    GAP_EOS_MS_BASE = 280
+    if gaps:
+        import statistics
+        median_gap = statistics.median(gaps)
+        iqr_gaps = [g for g in gaps if abs(g - median_gap) <= statistics.stdev(gaps) if len(gaps) > 1]
+        iqr_gap = statistics.median(iqr_gaps) if iqr_gaps else median_gap
+        GAP_EOS_MS = max(GAP_EOS_MS_BASE, median_gap + iqr_gap)
+    else:
+        GAP_EOS_MS = GAP_EOS_MS_BASE
+    
+    # Discourse closers for conversational EOS
+    discourse_closers = {"right?", "you know?", "that's it.", "that's right.", "all set.", "we're done."}
+    
+    for i, word in enumerate(words[:-1]):
+        word_text = word.get('text', '').strip()
+        word_end = word.get('end', 0)
+        next_word = words[i + 1]
+        next_start = next_word.get('start', 0)
+        
+        # 1) Punctuation EOS
+        if word_text.endswith(('.', '?', '!', '…')):
+            eos_times.append(word_end)
+        
+        # 2) Gap-based EOS (adaptive threshold)
+        pause_ms = (next_start - word_end) * 1000
+        if pause_ms >= GAP_EOS_MS:
+            eos_times.append(word_end)
+        
+        # 3) Discourse closer EOS
+        if word_text.lower() in discourse_closers:
+            eos_times.append(word_end)
+    
+    return eos_times
+
+def _build_eos_from_punctuation_vad(raw_text: str, segments: List[Dict]) -> List[float]:
+    """Build EOS markers from punctuation and VAD segment boundaries."""
+    eos_times = []
+    
+    if not raw_text or not segments:
+        return eos_times
+    
+    # Find punctuation-based EOS by mapping text positions to time
+    text_pos = 0
+    for segment in segments:
+        seg_text = segment.get('text', '')
+        seg_start = segment.get('start', 0)
+        seg_end = segment.get('end', 0)
+        
+        # Find sentence endings in this segment
+        for i, char in enumerate(seg_text):
+            if char in '.!?':
+                # Map character position to time within segment
+                char_ratio = i / max(len(seg_text), 1)
+                char_time = seg_start + (seg_end - seg_start) * char_ratio
+                eos_times.append(char_time)
+        
+        text_pos += len(seg_text) + 1  # +1 for space
+    
+    # Add VAD segment boundaries as EOS
+    for segment in segments:
+        seg_end = segment.get('end', 0)
+        if seg_end > 0:
+            eos_times.append(seg_end)
+    
+    return eos_times
+
+def build_eos_fallback(segments: List[Dict]) -> Tuple[List[float], List[float]]:
+    """Fallback EOS building using punctuation and VAD (legacy function)."""
+    # This is now handled by the unified build_eos_index function
+    return [], []
+
 
 def next_eos_after(time: float, eos_times: List[float]) -> Optional[float]:
     """Find next EOS after given time using binary search."""
@@ -3820,6 +3846,13 @@ def snap_to_last_word_end(time: float, word_end_times: List[float]) -> float:
     else:
         return time
 
+def ends_on_eos(end_s: float, eos_list: List[float], tol_ms: float = 120) -> bool:
+    """Check if clip ends within tolerance of an EOS marker."""
+    if not eos_list:
+        return False
+    delta = min(abs(end_s - t) for t in eos_list)
+    return (delta * 1000.0) <= tol_ms
+
 def finish_thought_normalize(candidate: Dict, eos_times: List[float], word_end_times: List[float], platform: str = "default", fallback_mode: bool = False) -> Tuple[Dict, str]:
     """
     Normalize candidate to end on a finished thought (EOS).
@@ -3847,6 +3880,7 @@ def finish_thought_normalize(candidate: Dict, eos_times: List[float], word_end_t
     # 2) Check if already near EOS
     if near_eos(c['end'], eos_times, cfg["near_eos_tol_sec"]):
         c['finished_thought'] = 1
+        c['finish_reason'] = 'eos'
         return c, "snap_ok"
     
     # 3) Try forward extend
@@ -3858,6 +3892,7 @@ def finish_thought_normalize(candidate: Dict, eos_times: List[float], word_end_t
             c['end'] = snap_to_last_word_end(next_eos, word_end_times)
             c['duration'] = c['end'] - c['start']
             c['finished_thought'] = 1
+            c['finish_reason'] = 'eos'
             return c, "extended"
     
     # 4) Try backward shrink
@@ -3866,6 +3901,7 @@ def finish_thought_normalize(candidate: Dict, eos_times: List[float], word_end_t
         c['end'] = snap_to_last_word_end(prev_eos, word_end_times)
         c['duration'] = c['end'] - c['start']
         c['finished_thought'] = 1
+        c['finish_reason'] = 'eos'
         return c, "shrunk"
     
     # 5) Fallback mode punctuation backstop
@@ -3873,6 +3909,7 @@ def finish_thought_normalize(candidate: Dict, eos_times: List[float], word_end_t
         try:
             if likely_finished_text(c.get('text', '')):
                 c['finished_thought'] = 1
+                c['finish_reason'] = 'text'
                 return c, "text_finished"
         except Exception as e:
             logger.exception("LIKELY_FINISHED_TEXT_ERROR: %s", e)
@@ -3884,10 +3921,18 @@ def finish_thought_normalize(candidate: Dict, eos_times: List[float], word_end_t
         text = c.get('text', '').strip()
         if len(text.split()) >= 20:  # Substantial content
             c['finished_thought'] = 1
+            c['finish_reason'] = 'ultra_aggressive'
             return c, "sparse_finished"
     
-    # 7) Unresolved - mark as unfinished
+    # 7) Final EOS hit check - if we ended up near an EOS, mark as finished
+    if ends_on_eos(c['end'], eos_times, tol_ms=120):
+        c['finished_thought'] = 1
+        c['finish_reason'] = 'eos'
+        return c, "final_eos_check"
+    
+    # 8) Unresolved - mark as unfinished
     c['finished_thought'] = 0
+    c['finish_reason'] = 'unresolved'
     return c, "unresolved"
 
 def prefer_finished_sibling(candidate: Dict, siblings: List[Dict]) -> Dict:
