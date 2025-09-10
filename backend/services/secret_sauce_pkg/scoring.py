@@ -9,6 +9,11 @@ from config_loader import get_config
 
 logger = logging.getLogger(__name__)
 
+# Scoring version and feature flags
+SCORING_VERSION = "v4.8-unified-2025-09"
+USE_PL_V2 = True     # read platform_length_score_v2 if present
+USE_Q_LIST = True    # include q_list_score with a small weight
+
 def get_clip_weights():
     """Get normalized clip weights (sum to 1.0)"""
     weights = dict(get_config()["weights"])
@@ -29,29 +34,37 @@ def score_segment_v4(features: Dict, apply_penalties: bool = True, genre: str = 
         genre_profile = genre_scorer.genres.get(genre, genre_scorer.genres['general'])
         path_scores = genre_profile.get_scoring_paths(features)
     else:
+        # Platform length v2 + q_list_score integration
+        pl = (
+            f.get("platform_length_score_v2", f.get("platform_len_match", 0.0))
+            if USE_PL_V2 else
+            f.get("platform_len_match", 0.0)
+        )
+        ql = (f.get("q_list_score", 0.0) if USE_Q_LIST else 0.0)
+        
         # Default 4-path system for general genre with platform length match and insight detection
-        # FIXED: Default path with higher hook weight
-        path_a = (0.50 * f.get("hook_score", 0.0) + 0.15 * f.get("arousal_score", 0.0) + 
-                  0.10 * f.get("payoff_score", 0.0) + 0.10 * f.get("info_density", 0.0) + 
-                  0.10 * f.get("platform_len_match", 0.0) + 0.03 * f.get("loopability", 0.0) + 
-                  0.02 * f.get("insight_score", 0.0))
+        # FIXED: Default path with higher hook weight and increased length weight
+        path_a = (0.42 * f.get("hook_score", 0.0) + 0.15 * f.get("arousal_score", 0.0) + 
+                  0.10 * f.get("payoff_score", 0.0) + 0.12 * f.get("info_density", 0.0) + 
+                  0.18 * pl + 0.03 * f.get("loopability", 0.0) + 
+                  0.02 * f.get("insight_score", 0.0) + 0.02 * ql)
         
         # NEW: Insight content boost
         path_b = (0.30 * f.get("payoff_score", 0.0) + 0.25 * f.get("info_density", 0.0) + 
                   0.15 * f.get("emotion_score", 0.0) + 0.10 * f.get("hook_score", 0.0) + 
-                  0.10 * f.get("platform_len_match", 0.0) + 0.05 * f.get("arousal_score", 0.0) + 
+                  0.10 * pl + 0.05 * f.get("arousal_score", 0.0) + 
                   0.05 * f.get("insight_score", 0.0))
         
         # NEW: Insight content boost
         path_c = (0.30 * f.get("arousal_score", 0.0) + 0.20 * f.get("emotion_score", 0.0) + 
                   0.20 * f.get("hook_score", 0.0) + 0.10 * f.get("loopability", 0.0) + 
-                  0.10 * f.get("platform_len_match", 0.0) + 0.05 * f.get("question_score", 0.0) + 
+                  0.10 * pl + 0.05 * f.get("question_score", 0.0) + 
                   0.05 * f.get("insight_score", 0.0))
         
         # NEW: Insight content boost
         path_d = (0.25 * f.get("question_score", 0.0) + 0.25 * f.get("info_density", 0.0) + 
                   0.20 * f.get("payoff_score", 0.0) + 0.20 * f.get("hook_score", 0.0) + 
-                  0.10 * f.get("platform_len_match", 0.0))
+                  0.10 * pl)
         
         path_scores = {"hook": path_a, "payoff": path_b, "energy": path_c, "structured": path_d}
     
@@ -98,6 +111,14 @@ def score_segment_v4(features: Dict, apply_penalties: bool = True, genre: str = 
     
     # Calculate final score
     final_score = base_score * synergy_multiplier + bonuses_applied
+    
+    # Platform-fit boost for excellent length matches
+    pl_v2 = f.get("platform_length_score_v2", f.get("platform_len_match", 0.0))
+    if pl_v2 >= 0.90:
+        platform_fit_boost = 0.02  # +2% additive nudge for ideal length
+        final_score += platform_fit_boost
+        bonus_reasons.append(f"platform_fit_boost_{platform_fit_boost}")
+    
     final_score = max(0.0, min(1.0, final_score))  # Clamp to [0, 1]
     
     # Convert to 0-100 scale

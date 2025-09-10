@@ -15,7 +15,10 @@ export interface Clip {
   duration: number;
   score?: number;
   url?: string;
+  text?: string;
   transcript?: string;
+  raw_text?: string;
+  full_transcript?: string;
   is_advertisement?: boolean;
   features?: Record<string, any>;
   [key: string]: any;

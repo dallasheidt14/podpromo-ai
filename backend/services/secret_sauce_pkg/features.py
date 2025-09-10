@@ -3,7 +3,7 @@ Feature computation module for viral detection system.
 Contains feature extraction and computation functions.
 """
 
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Iterable, Optional
 import logging
 import numpy as np
 import librosa
@@ -12,7 +12,31 @@ import hashlib
 from functools import lru_cache
 from scipy import signal
 from scipy.stats import skew, kurtosis
+from bisect import bisect_left
 from config_loader import get_config
+
+# Finish-Thought Gate Configuration
+FINISH_THOUGHT_CONFIG = {
+    "eos_pause_ms": 260,
+    "near_eos_tol_sec": {
+        "normal": 0.30,
+        "sparse": 0.50  # More forgiving in fallback mode
+    },
+    "max_extend_sec": {
+        "safety_pass": 1.8,    # Wider on safety pass
+        "shorts": 1.2,
+        "reels": 1.2,
+        "tiktok": 1.2,
+        "youtube": 1.5,
+        "default": 1.2,
+        "sparse_bonus": 0.3  # Allow +0.3s more in fallback
+    },
+    "min_viable_after_shrink_sec": {
+        "normal": 7.5,
+        "safety_pass": 6.0,     # Allow deeper shrink to avoid drops
+        "sparse": 6.5  # More lenient in sparse mode
+    }
+}
 
 # Import new Phase 1, 2 & 3 types and utilities
 from .types import Features, Scores, FEATURE_TYPES, SYNERGY_MODE, PLATFORM_LEN_V, WHITEN_PATHS, GENRE_BLEND, BOUNDARY_HYSTERESIS, PROSODY_AROUSAL, PAYOFF_GUARD, CALIBRATION_V, MIN_WORDS, MAX_WORDS, MIN_SEC, MAX_SEC, _keep
@@ -183,6 +207,14 @@ def compute_features_v4(segment: Dict, audio_file: str, y_sr=None, genre: str = 
         feats.setdefault("_debug", {})
         feats["_debug"]["hook_v5"] = h_dbg
     
+    # Add missing fields that enhanced version returns (set to zeros for compatibility)
+    feats.update({
+        'insight_conf': 0.0,
+        'q_list_score': 0.0,
+        'prosody_arousal': 0.0,
+        'platform_length_score_v2': 0.0,
+    })
+    
     return feats
 
 def compute_features(segment: Dict, audio_file: str, y_sr=None, version: str = "v4", genre: str = 'general', platform: str = 'tiktok') -> Dict:
@@ -297,6 +329,380 @@ def _loopability_heuristic(text: str) -> float:
     
     return float(np.clip(score, 0.0, 1.0))
 
+def score_variant(variant: dict, audio_file: str, genre: str, platform: str) -> dict:
+    """Re-score a variant with new boundaries"""
+    try:
+        # Re-compute features for the variant with new start/end
+        features = compute_features_v4_enhanced(variant, audio_file, genre=genre, platform=platform)
+        variant.update(features)
+        return variant
+    except Exception as e:
+        logger.warning(f"Failed to score variant: {e}")
+        return variant
+
+# Cliffhanger detection patterns
+CLIFF_END_RE = re.compile(
+    r"(what if|because|so that|that's why|here's why|the reason|which means|"
+    r"and then|but then|until|unless|so|but|and)\s*$",
+    re.IGNORECASE
+)
+
+# End-boundary detection patterns
+END_CUE_RE = re.compile(
+    r"(i'll never forget|when i|because|but then|and then|that'?s when|"
+    r"which|so that|until|unless|but|and)\s*$", re.IGNORECASE
+)
+
+# Memory/narrative continuation cues
+MEMORY_CUE_RE = re.compile(r"(i'?ll never forget|the moment|that'?s when)\b", re.IGNORECASE)
+
+def looks_like_cliffhanger(text_end: str) -> bool:
+    """Detect if text ends with a cliffhanger or unfinished thought"""
+    if not text_end: 
+        return False
+    t = text_end.strip()
+    if t.endswith("..."): 
+        return True
+    if CLIFF_END_RE.search(t): 
+        return True
+    # Interrogative with no follow-up (ends with '?')
+    return t.endswith("?")
+
+def is_unfinished_tail(text: str) -> bool:
+    """Detect if text ends without proper sentence completion"""
+    t = (text or "").strip()
+    if not t: 
+        return False
+    if t.endswith(("...", "…")): 
+        return True
+    if END_CUE_RE.search(t[-160:]): 
+        return True
+    # No sentence-ending punctuation
+    return not any(t.endswith(p) for p in (".", "!", "?", ".", "!", "?"))
+
+def wants_continuation(text: str) -> bool:
+    """Detect if text has memory/narrative cues that want continuation"""
+    tail = (text or "").strip()[-200:].lower()
+    return MEMORY_CUE_RE.search(tail) is not None
+
+def extend_to_next_boundary(segment, max_extra_s, segments_list):
+    """Try to extend segment to next safe boundary"""
+    if not segments_list:
+        return segment
+    
+    cur_end = segment.get('end', 0)
+    hard_cap = cur_end + max_extra_s
+    
+    # Find current segment index
+    current_idx = -1
+    for i, seg in enumerate(segments_list):
+        if abs(seg.get('start', 0) - segment.get('start', 0)) < 0.1:
+            current_idx = i
+            break
+    
+    if current_idx == -1:
+        return segment
+    
+    # Look for next safe boundary
+    j = current_idx
+    while j + 1 < len(segments_list) and segments_list[j + 1].get('end', 0) <= hard_cap:
+        nxt = segments_list[j + 1]
+        txt = nxt.get('text', '').strip()
+        pause = max(0.0, nxt.get('start', 0) - segments_list[j].get('end', 0))
+        
+        # Boundary rules: sentence punctuation, pause, or speaker change
+        if (txt.endswith((".", "!", "?")) or 
+            pause >= 0.4 or 
+            nxt.get('speaker') != segments_list[j].get('speaker')):
+            # Found safe boundary - extend to this segment
+            extended = segment.copy()
+            extended['end'] = nxt.get('end', cur_end)
+            extended['text'] = ' '.join([seg.get('text', '') for seg in segments_list[current_idx:j+2]])
+            return extended
+        j += 1
+    
+    return segment  # No better boundary found
+
+def apply_cliffhanger_guard(c):
+    """Apply cliffhanger guard to penalize unfinished thoughts and prefer resolving variants"""
+    text = c.get('text', '').strip()
+    if not text: 
+        return
+
+    if looks_like_cliffhanger(text[-120:]):  # last ~120 chars
+        dur = c.get('end', 0) - c.get('start', 0)
+        payoff = c.get('payoff_score', 0.0)
+        pl_v2 = c.get('platform_length_score_v2', 0.0)
+
+        # If short & low-payoff cliffhanger → penalize unless it's long enough or value is present
+        if dur < 16.0 and payoff < 0.30:
+            c['final_score'] = min(c['final_score'], 0.60)  # soft cap
+            c.setdefault('flags', {}).setdefault('caps_applied', []).append('cliff_end_penalty')
+
+        # If there exists a longer sibling (your variant set) with payoff improvement,
+        # mark this one as disfavored so the selector picks the longer.
+        c.setdefault('flags', {}).setdefault('caps_applied', []).append('prefer_longer_variant_for_resolution')
+
+def promote_to_resolution(seed_variants, current_best):
+    """Promote hook-without-payoff clips to find resolving siblings"""
+    hook = current_best.get('hook_score', 0.0)
+    payoff = current_best.get('payoff_score', 0.0)
+
+    if hook >= 0.90 and payoff < 0.30:
+        resolving = [v for v in seed_variants if v.get('payoff_score', 0.0) >= 0.35]
+        if resolving:
+            # choose shortest that hits payoff threshold and decent pl_v2
+            resolving.sort(key=lambda v: (v.get('end', 0) - v.get('start', 0),
+                                          -v.get('platform_length_score_v2', 0.0)))
+            chosen = resolving[0]
+            chosen.setdefault('flags', {}).setdefault('caps_applied', []).append('promoted_to_resolution')
+            return chosen
+    return current_best
+
+def end_completeness_adjust(v):
+    """Apply end-completeness bonus and unfinished penalty"""
+    text = v.get("text", "").strip()
+    if not text:
+        return
+    
+    ends_clean = text.endswith((".", "!", "?"))
+    payoff = v.get("payoff_score", 0.0)
+    dur = v.get("end", 0) - v.get("start", 0)
+    
+    # Micro-bonus for complete sentences (helps 13-16s picks)
+    if ends_clean and payoff >= 0.25 and dur >= 16.0:
+        v["final_score"] += 0.05  # increased from 0.03 for better tie-breaking
+        v.setdefault('flags', {}).setdefault('caps_applied', []).append('end_completeness_bonus')
+    elif not ends_clean and dur <= 12.0:
+        v["final_score"] -= 0.02  # penalty for short unfinished clips
+        v.setdefault('flags', {}).setdefault('caps_applied', []).append('unfinished_penalty')
+
+def finalize_variant_text(v, segments_list):
+    """Finalize variant text by extending to proper sentence boundaries"""
+    if is_unfinished_tail(v.get("text", "")):
+        # Try to extend to next boundary
+        extended = extend_to_next_boundary(v, max_extra_s=9.0, segments_list=segments_list)
+        if extended != v and extended.get('end', 0) > v.get('end', 0):
+            # Re-score the extended variant
+            from .scoring import score_segment_v4
+            extended_score = score_segment_v4(extended)
+            extended['final_score'] = extended_score.get('final_score', 0)
+            extended['payoff_score'] = extended_score.get('payoff_score', 0)
+            
+            # Accept if score drop small and payoff improves
+            if (extended.get('final_score', 0) >= v.get('final_score', 0) - 0.02 and 
+                extended.get('payoff_score', 0) >= v.get('payoff_score', 0) + 0.05):
+                extended.setdefault('flags', {}).setdefault('caps_applied', []).append('end_extended_to_sentence')
+                return extended
+            else:
+                v.setdefault('flags', {}).setdefault('caps_applied', []).append('kept_unfinished_tail_due_to_score_drop')
+    
+    # Check for memory continuation cues
+    if (wants_continuation(v.get("text", "")) and 
+        v.get("payoff_score", 0.0) < 0.35 and 
+        v.get('end', 0) - v.get('start', 0) < 26.0):
+        extended = extend_to_next_boundary(v, max_extra_s=9.0, segments_list=segments_list)
+        if extended != v and extended.get('end', 0) > v.get('end', 0):
+            from .scoring import score_segment_v4
+            extended_score = score_segment_v4(extended)
+            extended['final_score'] = extended_score.get('final_score', 0)
+            extended['payoff_score'] = extended_score.get('payoff_score', 0)
+            extended.setdefault('flags', {}).setdefault('caps_applied', []).append('memory_continuation_extension')
+            return extended
+    
+    # Apply small penalty for unfinished tails
+    if is_unfinished_tail(v.get("text", "")):
+        v['final_score'] = max(0, v.get('final_score', 0) - 0.03)
+        v.setdefault('flags', {}).setdefault('caps_applied', []).append('unfinished_tail_penalty')
+    
+    return v
+
+def choose_variant(base: dict, variants: list, audio_file: str, genre: str, platform: str, eos_times: list = None, word_end_times: list = None, fallback_mode: bool = None) -> dict:
+    """Choose the best variant by re-scoring and comparing with payoff-aware selection"""
+    
+    # Platform-specific constraints
+    MIN_DUR = 7.5  # Hard floor for any short clip
+    MAX_DUR = 59.0 if platform in ["youtube", "youtube_shorts"] else 30.0  # Platform cap
+    ALLOWED_DURS = [8, 12, 18, 21, 30]  # Preferred duration buckets
+    
+    # Always have a seed label
+    seed = (base.get("id") or base.get("seed_id") or 
+            base.get("debug_id") or f"seg_{base.get('index', '?')}")
+    
+    # Apply duration constraints to all variants
+    def enforce_duration_constraints(variant):
+        start = variant.get('start', 0)
+        end = variant.get('end', 0)
+        
+        # 1) Ensure end >= start
+        end = max(end, start)
+        variant['end'] = end
+        dur = end - start
+        
+        # 2) Guard against zero/negative duration
+        if dur < (MIN_DUR - 0.05):
+            # Try to extend to next EOS within platform budget
+            if eos_times:
+                next_eos = None
+                for eos_time in eos_times:
+                    if eos_time > end and eos_time <= end + 10.0:  # Within 10s
+                        next_eos = eos_time
+                        break
+                if next_eos:
+                    end = min(next_eos, start + MAX_DUR)
+                    variant['end'] = end
+                    dur = end - start
+        
+        # 3) Final floor check
+        if dur < (MIN_DUR - 0.05):
+            logger.warning(f"FINAL_VARIANT_FLOOR_BREACH: {seed} dur={dur:.2f}s")
+            return None  # Skip this variant; do NOT return zero-length
+        
+        # 4) Clamp to maximum duration
+        if dur > MAX_DUR:
+            logger.warning(f"VARIANT_CAP_BREACH: {seed} dur={dur:.2f}s - clamping to {MAX_DUR}s")
+            variant['end'] = start + MAX_DUR
+            dur = MAX_DUR
+        
+        # 5) Snap to nearest allowed duration if close
+        if ALLOWED_DURS:
+            closest_allowed = min(ALLOWED_DURS, key=lambda x: abs(x - dur))
+            if abs(closest_allowed - dur) <= 1.0:  # Within 1 second
+                variant['end'] = start + closest_allowed
+                dur = closest_allowed
+        
+        return variant
+    
+    # Apply constraints to base and all variants
+    base = enforce_duration_constraints(base.copy())
+    if base is None:
+        logger.error(f"FINAL_VARIANT_FLOOR_BREACH: {seed} base variant failed duration check")
+        return None
+    
+    variants = [enforce_duration_constraints(v.copy()) for v in variants]
+    variants = [v for v in variants if v is not None]  # Filter out failed variants
+    
+    # Guard against zero-length variants after any EOS snapping
+    MIN_DUR = 1.0  # sec
+    variants = [v for v in variants if (v.get("end", 0) - v.get("start", 0)) >= MIN_DUR]
+    if not variants:
+        logger.warning(f"VARIANT_FILTER: {seed} all variants too short, using base")
+        return base
+    
+    # Re-score every variant (compute features again with new start/end!)
+    scored = [score_variant(v, audio_file, genre, platform) for v in [base] + variants]
+    
+    # Payoff-aware variant selection
+    def pick_best_variant(variants):
+        def vscore(v):
+            payoff = v.get('payoff_score', 0.0)
+            pl_v2 = v.get('platform_length_score_v2', v.get('platform_len_match', 0.0))
+            # Payoff-aware scoring: nudge toward variants that actually deliver
+            return pl_v2 + 0.20 * min(payoff, 0.5)  # up to +0.10 bonus
+        
+        # Prefer better payoff; tie-break by longer dur (smoother endings)
+        return sorted(variants, key=lambda v: (round(vscore(v), 3),
+                                               round(v.get('end', 0) - v.get('start', 0), 2)))[-1]
+    
+    # Apply cliffhanger guard to all variants
+    for v in scored:
+        apply_cliffhanger_guard(v)
+    
+    # Apply end-completeness adjustment to all variants
+    for v in scored:
+        end_completeness_adjust(v)
+    
+    # NEW: Apply Finish-Thought Gate to all variants if EOS data is available
+    if eos_times and word_end_times:
+        normalized_scored = []
+        for v in scored:
+            # Determine fallback mode based on EOS density
+            fallback_mode = len(eos_times) < 50 or len(word_end_times) < 500
+            normalized_v, result = finish_thought_normalize(v, eos_times, word_end_times, platform, fallback_mode)
+            normalized_scored.append(normalized_v)
+            if result != "snap_ok":
+                logger.debug(f"FINISH_THOUGHT: {v.get('id', 'unknown')} -> {result}")
+        scored = normalized_scored
+    
+    # Pick best variant using payoff-aware selection
+    best = pick_best_variant(scored)
+    
+    # Apply promotion to resolution if needed
+    best = promote_to_resolution(scored, best)
+    
+    # C) Sibling promotion - prefer longer finished siblings when short is unresolved
+    if fallback_mode is None:
+        fallback_mode = len(eos_times) < 50 or len(word_end_times) < 500 if eos_times else True
+    
+    # Check if current best has unfinished tail penalty
+    if best.get('caps') and 'unfinished_tail_penalty' in best.get('caps', []):
+        promoted = pick_finished_sibling(scored, platform, MAX_DUR)
+        if promoted:
+            best = promoted
+            logger.info(f"SIBLING_PROMOTED: {seed} -> longer finished sibling (unfinished tail)")
+    
+    # Also promote in fallback mode
+    if fallback_mode:
+        promoted = pick_finished_sibling(scored, platform, MAX_DUR)
+        if promoted and promoted != best:
+            best = promoted
+            logger.info(f"SIBLING_PROMOTED: {seed} -> longer finished sibling (fallback)")
+    
+    # Finalize variant text (extend to sentence boundaries)
+    # Note: We need the original segments list for boundary extension
+    # For now, we'll apply the text finalization without the segments list
+    best = finalize_variant_text(best, [])
+    
+    # Final safety check
+    final_dur = best.get('end', 0) - best.get('start', 0)
+    if final_dur < MIN_DUR:
+        logger.error(f"FINAL_VARIANT_FLOOR_BREACH: {best.get('id', 'unknown')} dur={final_dur:.2f}s")
+        best['end'] = best.get('start', 0) + MIN_DUR
+    
+    return best
+
+def grow_to_bins(segment: dict, audio_file: str, genre: str, platform: str, eos_times: list = None, word_end_times: list = None, fallback_mode: bool = None) -> dict:
+    """Generate length variants and choose the best one with flexible extension"""
+    TARGETS = [12.0, 18.0, 24.0, 30.0]
+    MIN_SEC, MAX_SEC = 8.0, 60.0
+    MAX_EXTEND = 10.0  # Allow up to 10s extension per hop
+    
+    base_dur = segment.get('end', 0) - segment.get('start', 0)
+    base_pl_v2 = segment.get('platform_length_score_v2', 0.0)
+    
+    # Find nearest target
+    nearest_target = min(TARGETS, key=lambda x: abs(x - base_dur))
+    
+    variants = []
+    for target in TARGETS:
+        if target != nearest_target and MIN_SEC <= target <= MAX_SEC:
+            # Allow ±1.0s jitter and flexible extension
+            for jitter in [-1.0, 0.0, 1.0]:
+                adjusted_target = max(MIN_SEC, min(MAX_SEC, target + jitter))
+                if abs(adjusted_target - base_dur) <= MAX_EXTEND:
+                    variant = segment.copy()
+                    variant['end'] = segment['start'] + adjusted_target
+                    variants.append(variant)
+    
+    if not variants:
+        return segment
+    
+    # Choose best variant
+    chosen = choose_variant(segment, variants, audio_file, genre, platform, eos_times, word_end_times, fallback_mode)
+    chosen_dur = chosen.get('end', 0) - chosen.get('start', 0)
+    chosen_pl_v2 = chosen.get('platform_length_score_v2', 0.0)
+    
+    # VAR: Log variant selection
+    logger.info("VAR: seed=%s base=%.1fs -> chosen=%.1fs drop=%.3f pl_v2 %.2f→%.2f",
+        segment.get('_id', 'unknown'), base_dur, chosen_dur, 
+        segment.get('final_score', 0) - chosen.get('final_score', 0),
+        base_pl_v2, chosen_pl_v2
+    )
+    
+    return chosen
+
+# payoff_guard is imported from scoring_utils
+
 def _ad_penalty(text: str) -> dict:
     """Enhanced ad detection with comprehensive patterns"""
     t = text.lower()
@@ -315,7 +721,20 @@ def _ad_penalty(text: str) -> dict:
         "code", "off your order", "fuel smarter", "play harder",
         "visit", "website", "promo", "discount", "save", "deal",
         "offer", "special", "limited time", "exclusive", "free",
-        "subscribe", "follow", "like and subscribe", "link in bio"
+        "subscribe", "follow", "like and subscribe", "link in bio",
+        # Enhanced finance promo detection
+        "chase sapphire", "amex platinum", "gold card", "credit card",
+        "points per dollar", "sign up bonus", "annual fee", "membership rewards",
+        "tap to apply", "apply now", "exclusive offer", "preferred", "reserve",
+        # Additional promo patterns from user feedback
+        "day pass", "instant access", "starting at", "subscribe now",
+        "watch live on", "sign up", "apply now", "terms apply", "/month",
+        # Expanded patterns to catch trace examples
+        "join the", "million customers", "thousand customers", "call 1-800",
+        "visit", "grainger", "just $", "customers who choose",
+        # Additional patterns from user feedback
+        "balance of nature", "supplement", "fiberns spice", "call 1-800-grainger",
+        "starting at just $", "day pass", "instant access", "terms apply"
     ]):
         return {"flag": True, "penalty": 0.95, "reason": "obvious_promotion"}
     
@@ -1226,6 +1645,64 @@ def compute_features_v4_enhanced(segment: Dict, audio_file: str, y_sr=None, genr
     # Convert back to dict with enhanced debug info
     result = features.to_dict()
     
+    # ---- compute or default optional signals ----
+    # Helper functions for safe computation
+    def _maybe_call(fn, *a, **kw):
+        try:
+            return fn(*a, **kw)
+        except Exception:
+            return None
+
+    def _maybe_get(d, k, default=0.0):
+        v = d.get(k)
+        return default if v is None else v
+    
+    # question/list patterns
+    # Ad detection first
+    ad_result = _ad_penalty(text)
+    ad_penalty = ad_result.get("penalty", 0.0)
+    should_exclude = ad_result.get("flag", False)
+    
+    # Apply payoff guard to widen detection for narrative speech
+    base_payoff = result.get('payoff_score', 0.0)
+    # Split text into hook (first 100 chars) and body (rest)
+    hook_text = text[:100] if text else ""
+    body_text = text[100:] if text else ""
+    enhanced_payoff = payoff_guard(hook_text, body_text, base_payoff, genre)
+    result['payoff_score'] = enhanced_payoff
+    
+    # Calculate duration for enhanced features
+    duration_s = segment.get("end", 0) - segment.get("start", 0)
+    
+    q_list_score = 0.0
+    if "_question_list_raw_v2" in globals():
+        q_list_score = float(max(0.0, min(1.0, _question_list_raw_v2(text, duration_s, genre))))
+    
+    # platform-length v2 (fit + density) - defensive compute + fallback
+    pl_v2_val = None
+    try:
+        if "platform_length_score_v2" in globals():
+            pl_v2_val = float(globals()["platform_length_score_v2"](
+                seconds=duration_s,
+                info_density=result.get('info_density', 0.0),
+                platform=platform
+            ))
+    except Exception as e:
+        logger and logger.warning(f"pl_v2 compute failed: {e}")
+    
+    platform_length_score_v2 = max(0.0, min(1.0, pl_v2_val)) if pl_v2_val is not None else result.get('platform_len_match', 0.0)
+    
+    # prosody-aware arousal (if audio was present and prosody computed)
+    prosody_arousal = None
+    if "_audio_prosody_score" in globals() and audio_file:
+        try:
+            prosody_arousal = float(max(0.0, min(1.0, _audio_prosody_score(audio_file, start_ts, end_ts))))
+        except Exception:
+            prosody_arousal = None
+    
+    # insight confidence (if detector exposes it)
+    insight_conf = locals().get("insight_conf", None)  # or pull from your detect_insight() result if available
+    
     # Calculate final score using the scoring system
     from .scoring import score_segment_v4
     scored_result = score_segment_v4(result, genre=genre)
@@ -1233,11 +1710,25 @@ def compute_features_v4_enhanced(segment: Dict, audio_file: str, y_sr=None, genr
     final_score = viral_score_100 / 100.0  # Convert from 0-100 to 0-1
     display_score = viral_score_100  # Keep in 0-100 range for quality filtering
     
+    # Apply anti-bait cap to prevent micro-clips from scoring too high
+    from .scoring_utils import apply_anti_bait_cap
+    word_count = len(text.split()) if text else 0
+    features_for_cap = {
+        'text': text,
+        'words': word_count,
+        'hook_score': result.get('hook_score', 0),
+        'payoff_score': enhanced_payoff,
+        'ad_penalty': ad_penalty,
+        'final_score': final_score,
+        '_has_answer': False  # Will be set by question-answer stitching if applicable
+    }
+    final_score = apply_anti_bait_cap(features_for_cap)
+    
     # Quantize final scores for stability
     from .types import quantize
     final_score = quantize(final_score)
     # Keep display_score in 0-100 range for quality filtering
-    display_score = int(round(display_score))  # Round to whole numbers for display
+    display_score = int(round(final_score * 100))  # Convert back to 0-100 range
     
     result.update({
         'final_score': final_score,
@@ -1247,7 +1738,18 @@ def compute_features_v4_enhanced(segment: Dict, audio_file: str, y_sr=None, genr
         'synergy_multiplier': 1.0 + synergy,
         'synergy_bonus': synergy,
         'scoring_version': 'v4.7.2-unified-syn-whiten-blend-prosody-guard-cal',
-        'debug': {
+        
+        # newly surfaced (optional but now returned)
+        'insight_conf': _maybe_get(locals(), 'insight_conf', 0.0),
+        'q_list_score': _maybe_get(locals(), 'q_list_score', 0.0),
+        'prosody_arousal': _maybe_get(locals(), 'prosody_arousal', 0.0),
+        'platform_length_score_v2': _maybe_get(locals(), 'platform_length_score_v2', 0.0),
+        
+    # Ad detection enforcement
+    'ad_penalty': _maybe_get(locals(), 'ad_penalty', 0.0),
+    'should_exclude': _maybe_get(locals(), 'should_exclude', False),
+    
+    'debug': {
             'raw_paths': raw_paths,
             'whitened_paths': whitened_paths,
             'synergy_mode': SYNERGY_MODE,
@@ -1261,13 +1763,19 @@ def compute_features_v4_enhanced(segment: Dict, audio_file: str, y_sr=None, genr
             'calibration_enabled': bool(CALIBRATION_V),
             'calibration_version': CALIBRATION_V,
             'genre_debug': genre_debug,
-            'phase3_debug': phase3_debug
+            'phase3_debug': phase3_debug,
+            'scoring_version': 'v4.8-unified-2025-09',
+            'weights_version': '2025-09-01',
+            'flags': {
+                'USE_PL_V2': True,
+                'USE_Q_LIST': True
+            }
         }
     })
     
     return result
 
-def find_viral_clips_enhanced(segments: List[Dict], audio_file: str, genre: str = 'general', platform: str = 'tiktok') -> Dict:
+def find_viral_clips_enhanced(segments: List[Dict], audio_file: str, genre: str = 'general', platform: str = 'tiktok', fallback_mode: bool = None) -> Dict:
     """
     Enhanced viral clip finding with Phase 1, 2 & 3 improvements:
     - Path whitening
@@ -1278,6 +1786,16 @@ def find_viral_clips_enhanced(segments: List[Dict], audio_file: str, genre: str 
     - Calibration system
     """
     logger.info(f"Enhanced pipeline received {len(segments)} segments")
+    
+    # Build EOS index for Finish-Thought Gate
+    # Note: episode_words should be passed from the caller for better accuracy
+    eos_times, word_end_times = build_eos_index(segments)
+    logger.info(f"EOS index: {len(eos_times)} EOS markers, {len(word_end_times)} word boundaries")
+    
+    # Use provided fallback_mode or determine from EOS density
+    if fallback_mode is None:
+        eos_density = len(eos_times) / max(len(word_end_times), 1)
+        fallback_mode = eos_density < 0.020
     
     if not segments:
         return {
@@ -1360,8 +1878,38 @@ def find_viral_clips_enhanced(segments: List[Dict], audio_file: str, genre: str 
     
     logger.info(f"Successfully processed {len(enhanced_segments)}/{len(segments)} segments")
     
-    # Sort by final score
-    enhanced_segments.sort(key=lambda x: x.get('final_score', 0), reverse=True)
+    # DYN: Duration histogram after dynamic segmentation
+    durations = [s['end'] - s['start'] for s in enhanced_segments]
+    hist, _ = np.histogram(durations, bins=[0, 12.5, 18.5, 24.5, 30.5, 60])
+    logger.info("DYN: %d segs | dur histogram=%s", len(enhanced_segments), hist.tolist())
+    
+    # Generate length variants for top segments
+    for i, segment in enumerate(enhanced_segments[:10]):  # Only for top 10 to avoid performance issues
+        if segment.get('final_score', 0) > 0.3:  # Only for decent segments
+            segment['_id'] = f"seg_{i}"
+            
+            # Try answer-stitching for questions before growing to bins
+            from .scoring_utils import looks_like_question, try_stitch_answer
+            if looks_like_question(segment.get('text', '')):
+                next_segment = enhanced_segments[i + 1] if i + 1 < len(enhanced_segments) else None
+                stitched = try_stitch_answer(segment, next_segment)
+                if stitched:
+                    # Re-score the stitched segment
+                    stitched = score_variant(stitched, audio_file, genre, platform)
+                    if stitched.get('final_score', 0) > segment.get('final_score', 0):
+                        enhanced_segments[i] = stitched
+                        continue
+            
+            enhanced_segments[i] = grow_to_bins(segment, audio_file, genre, platform, eos_times, word_end_times, fallback_mode)
+    
+    # Sort by final score, then platform fit, then duration (prefer longer)
+    def sort_key(seg):
+        return (
+            round(seg.get('final_score', 0), 3),
+            round(seg.get('platform_length_score_v2', 0.0), 3),
+            round((seg.get('end', 0) - seg.get('start', 0)), 2)
+        )
+    enhanced_segments.sort(key=sort_key, reverse=True)
     
     # Log score distribution
     if enhanced_segments:
@@ -1378,9 +1926,18 @@ def find_viral_clips_enhanced(segments: List[Dict], audio_file: str, genre: str 
     # Take top clips
     top_clips = enhanced_segments[:10]  # Top 10 clips
     
+    # Diversity guard: ensure at least one long platform-fit clip
+    if len(top_clips) >= 4 and max(c.get('end', 0) - c.get('start', 0) for c in top_clips) < 16.0:
+        # Find best long candidate from pre-NMS pool
+        long_best = next((c for c in enhanced_segments 
+                         if (c.get('end', 0) - c.get('start', 0)) >= 18.0 
+                         and c.get('platform_length_score_v2', 0) >= 0.80), None)
+        if long_best and long_best not in top_clips:
+            top_clips[-1] = long_best  # Replace last slot
+            top_clips.sort(key=sort_key, reverse=True)  # Re-sort
+    
     # Calculate health metrics
     import statistics
-    import numpy as np
     
     durations = [seg.get('end', 0) - seg.get('start', 0) for seg in enhanced_segments]
     scores = [seg.get('final_score', 0) for seg in enhanced_segments]
@@ -1672,6 +2229,78 @@ def attach_question_list_scores_v2(segments: list[dict]) -> None:
 def emotion_score_v2(*args, **kwargs):
     """Stub implementation"""
     return 0.0
+
+def _emotion_raw_v2(text: str, arousal: float = 0.0) -> float:
+    """
+    Enhanced emotion detection with arousal coupling.
+    """
+    if not text:
+        return 0.0
+    
+    text_lower = text.lower()
+    
+    # Enhanced emotion keywords with affective lexicon
+    emotion_keywords = [
+        'excited', 'thrilled', 'amazed', 'surprised', 'shocked', 'stunned',
+        'happy', 'joyful', 'delighted', 'pleased', 'satisfied', 'content',
+        'sad', 'disappointed', 'frustrated', 'angry', 'mad', 'upset',
+        'worried', 'anxious', 'nervous', 'scared', 'afraid', 'terrified',
+        'proud', 'confident', 'grateful', 'thankful', 'appreciative',
+        'love', 'hate', 'adore', 'despise', 'enjoy', 'dislike',
+        'fascinated', 'intrigued', 'curious', 'interested', 'bored',
+        'inspired', 'motivated', 'determined', 'focused', 'confused',
+        'surprised', 'shocked', 'stunned', 'amazed', 'impressed',
+        'disgusted', 'revolted', 'sickened', 'horrified', 'appalled',
+        'jealous', 'envious', 'resentful', 'bitter', 'cynical',
+        'hopeful', 'optimistic', 'pessimistic', 'doubtful', 'skeptical',
+        'embarrassed', 'ashamed', 'guilty', 'regretful', 'remorseful',
+        'relieved', 'relaxed', 'calm', 'peaceful', 'serene',
+        'overwhelmed', 'stressed', 'pressured', 'burdened', 'exhausted',
+        'energized', 'pumped', 'hyped', 'enthusiastic', 'passionate',
+        'furious', 'livid', 'enraged', 'irate', 'fuming',
+        'ecstatic', 'euphoric', 'blissful', 'elated', 'overjoyed',
+        'devastated', 'crushed', 'heartbroken', 'miserable', 'wretched',
+        'nostalgic', 'sentimental', 'melancholy', 'wistful', 'yearning',
+        'grateful', 'thankful', 'appreciative', 'blessed', 'fortunate',
+        'proud', 'accomplished', 'achieved', 'successful', 'victorious',
+        'defeated', 'beaten', 'crushed', 'demoralized', 'discouraged',
+        'hopeful', 'optimistic', 'confident', 'assured', 'certain',
+        'doubtful', 'uncertain', 'hesitant', 'cautious', 'wary',
+        'surprised', 'shocked', 'stunned', 'amazed', 'impressed',
+        'disappointed', 'let down', 'disillusioned', 'disenchanted',
+        'excited', 'thrilled', 'pumped', 'hyped', 'enthusiastic',
+        'bored', 'uninterested', 'apathetic', 'indifferent', 'blasé',
+        'fascinated', 'intrigued', 'captivated', 'engrossed', 'absorbed',
+        'confused', 'bewildered', 'perplexed', 'puzzled', 'baffled',
+        'inspired', 'motivated', 'encouraged', 'uplifted', 'empowered',
+        'discouraged', 'demoralized', 'disheartened', 'deflated', 'crushed',
+        'determined', 'resolved', 'committed', 'dedicated', 'focused',
+        'distracted', 'unfocused', 'scattered', 'disorganized', 'chaotic',
+        'peaceful', 'calm', 'serene', 'tranquil', 'placid',
+        'agitated', 'restless', 'uneasy', 'uncomfortable', 'disturbed',
+        'content', 'satisfied', 'fulfilled', 'complete', 'whole',
+        'empty', 'hollow', 'void', 'incomplete', 'unfulfilled',
+        'grateful', 'thankful', 'appreciative', 'blessed', 'fortunate',
+        'resentful', 'bitter', 'cynical', 'jaded', 'disillusioned',
+        'hopeful', 'optimistic', 'confident', 'assured', 'certain',
+        'pessimistic', 'negative', 'gloomy', 'dismal', 'bleak',
+    ]
+    
+    # Count emotion keywords
+    emotion_count = sum(1 for keyword in emotion_keywords if keyword in text_lower)
+    
+    # Calculate base emotion score
+    total_words = len(text.split())
+    if total_words == 0:
+        return 0.0
+    
+    base_emotion = min(emotion_count / total_words * 20, 1.0)
+    
+    # Enhanced arousal coupling: if high arousal and contains affective tokens, boost emotion score
+    if arousal >= 0.65 and emotion_count >= 2:
+        base_emotion = max(base_emotion, 0.25)
+    
+    return min(base_emotion, 1.0)
 
 # Regex for outro detection
 _OUTRO_RE = re.compile(
@@ -2014,15 +2643,18 @@ def create_dynamic_segments(segments: List[Dict], platform: str = 'tiktok') -> L
     """
     dynamic_segments = []
     
-    # Platform-specific optimal lengths (adjusted for better content)
+    # Platform-specific target bins (allow extension to others via grow_to_bins)
+    TARGETS = [12.0, 18.0, 24.0, 30.0]
+    MIN_SEC, MAX_SEC = 8.0, 60.0
+    
     platform_lengths = {
-        'tiktok': {'min': 12, 'max': 30, 'optimal': 20},
-        'instagram': {'min': 12, 'max': 30, 'optimal': 22},
-        'instagram_reels': {'min': 12, 'max': 30, 'optimal': 22},
-        'youtube': {'min': 15, 'max': 60, 'optimal': 35},
-        'youtube_shorts': {'min': 15, 'max': 60, 'optimal': 35},
-        'twitter': {'min': 8, 'max': 25, 'optimal': 18},
-        'linkedin': {'min': 15, 'max': 45, 'optimal': 30}
+        'tiktok': {'min': MIN_SEC, 'max': MAX_SEC, 'targets': TARGETS},
+        'instagram': {'min': MIN_SEC, 'max': MAX_SEC, 'targets': TARGETS},
+        'instagram_reels': {'min': MIN_SEC, 'max': MAX_SEC, 'targets': TARGETS},
+        'youtube': {'min': MIN_SEC, 'max': MAX_SEC, 'targets': TARGETS + [45.0, 60.0]},
+        'youtube_shorts': {'min': MIN_SEC, 'max': MAX_SEC, 'targets': TARGETS + [45.0, 60.0]},
+        'twitter': {'min': MIN_SEC, 'max': MAX_SEC, 'targets': [8.0, 12.0, 18.0, 24.0]},
+        'linkedin': {'min': MIN_SEC, 'max': MAX_SEC, 'targets': TARGETS + [45.0]}
     }
     
     target_length = platform_lengths.get(platform, platform_lengths['tiktok'])
@@ -2074,30 +2706,33 @@ def create_dynamic_segments(segments: List[Dict], platform: str = 'tiktok') -> L
         if segment_duration < target_length["min"]:
             segment_duration = target_length["min"]
         
-        # CRITICAL FIX: Preserve original transcript timing instead of artificial calculation
-        # Find the actual transcript segments that correspond to this text
-        original_start = None
-        original_end = None
+        # CRITICAL FIX: Find actual transcript segments that overlap with this text range
+        # Calculate approximate time range for this text segment
+        text_ratio = boundary["position"] / total_words
+        end_ratio = end_position / total_words
+        approx_start_time = total_start + (text_ratio * total_duration)
+        approx_end_time = total_start + (end_ratio * total_duration)
         
-        # Look for the first and last words in the original transcript
-        for j, word in enumerate(words):
-            if j == boundary["position"]:
-                # Find which original segment contains this word
-                for orig_seg in segments:
-                    if word in orig_seg.get("text", "").split():
-                        original_start = orig_seg.get("start", current_start)
-                        break
-            if j == end_position - 1:
-                # Find which original segment contains this word
-                for orig_seg in segments:
-                    if word in orig_seg.get("text", "").split():
-                        original_end = orig_seg.get("end", current_start + segment_duration)
-                        break
+        # Find original segments that overlap with this time range
+        overlapping_segments = []
+        for orig_seg in segments:
+            orig_start = orig_seg.get("start", 0)
+            orig_end = orig_seg.get("end", 0)
+            # Check if this original segment overlaps with our calculated time range
+            if orig_start < approx_end_time and orig_end > approx_start_time:
+                overlapping_segments.append(orig_seg)
         
-        # Use original timing if found, otherwise fall back to calculated timing
-        if original_start is not None and original_end is not None:
+        # Use the actual text from overlapping segments
+        if overlapping_segments:
+            # Reconstruct text from actual transcript segments
+            segment_text = " ".join([seg.get("text", "") for seg in overlapping_segments])
+            original_start = min(seg.get("start", 0) for seg in overlapping_segments)
+            original_end = max(seg.get("end", 0) for seg in overlapping_segments)
             segment_duration = original_end - original_start
             current_start = original_start
+        else:
+            # Fallback to calculated timing
+            segment_duration = total_duration * segment_ratio
         
         # Check if segment meets platform requirements
         if target_length["min"] <= segment_duration <= target_length["max"]:
@@ -2653,6 +3288,14 @@ def find_candidates(segments: List[Dict], audio_file: str, platform: str = 'tikt
             'interpretation': 'excellent' if compatibility >= 1.1 else 'good' if compatibility >= 1.0 else 'challenging' if compatibility >= 0.9 else 'difficult'
         }
     
+    # Sanity logs for pl_v2 debugging (temporarily keep)
+    if logger and segment_idx < 5:  # first few only
+        logger.info(
+            "pl_v2 dbg: dur=%.1f info=%.2f platform=%s -> v2=%s (v1=%.2f)",
+            duration_s, result.get('info_density', 0.0), platform,
+            str(platform_length_score_v2), float(result.get('platform_len_match', 0.0))
+        )
+    
     return result
 
 def filter_ads_from_features(all_features: List[Dict]) -> List[Dict]:
@@ -2933,3 +3576,421 @@ __all__ = [
     "_sigmoid",
     "detect_podcast_genre",
 ]
+
+# ============================================================================
+# Finish-Thought Gate: EOS Index and Word-Boundary Functions
+# ============================================================================
+
+def likely_finished_text(text: str) -> bool:
+    """Check if text likely represents a finished thought based on punctuation and closure patterns."""
+    import re
+    from typing import List
+    
+    t = (text or "").strip()
+    if not t:
+        return False
+
+    # 1) Hard stop via punctuation
+    if t[-1] in ".?!…":
+        return True
+
+    # 2) Soft endings via phrase patterns
+    ending_phrases_1 = {"right?", "okay?", "ok?", "right."}
+    ending_phrases_2 = {
+        "that's it", "that's right", "all set", "we're done",
+        "you know?", "you know.", "we are done"
+    }
+    ending_phrases_3 = {
+        "and that's why", "that is the point", "that's my point"
+    }
+
+    # Tokenize last bit; keep sentence-ending punctuation as tokens
+    word_re = re.compile(r"[A-Za-z0-9']+|[.?!…]")
+    tokens = word_re.findall(t.lower())
+    
+    if not tokens:
+        return False
+
+    # Check 1/2/3-token tails
+    last1 = " ".join(tokens[-1:])
+    last2 = " ".join(tokens[-2:]) if len(tokens) >= 2 else ""
+    last3 = " ".join(tokens[-3:]) if len(tokens) >= 3 else ""
+
+    if last1 in ending_phrases_1:
+        return True
+    if last2 in ending_phrases_2:
+        return True
+    if last3 in ending_phrases_3:
+        return True
+
+    return False
+
+def cfg_for_finish_thought(fallback_mode: bool, platform: str) -> dict:
+    """Get finish-thought configuration based on fallback mode and platform."""
+    cfg = FINISH_THOUGHT_CONFIG
+    
+    # Get base extend time for platform
+    max_extend_config = cfg["max_extend_sec"]
+    if isinstance(max_extend_config, dict):
+        base_extend = max_extend_config.get(platform, max_extend_config.get("default", 1.2))
+    else:
+        base_extend = max_extend_config
+    
+    if fallback_mode:
+        return {
+            "near_eos_tol_sec": cfg["near_eos_tol_sec"]["sparse"],
+            "max_extend_sec": base_extend + cfg["max_extend_sec"].get("sparse_bonus", 0.3),
+            "min_viable_after_shrink_sec": cfg["min_viable_after_shrink_sec"]["sparse"]
+        }
+    else:
+        return {
+            "near_eos_tol_sec": cfg["near_eos_tol_sec"]["normal"],
+            "max_extend_sec": base_extend,
+            "min_viable_after_shrink_sec": cfg["min_viable_after_shrink_sec"]["normal"]
+        }
+
+def build_eos_index(segments: List[Dict], episode_words: List[Dict] = None) -> Tuple[List[float], List[float]]:
+    """
+    Build End-of-Sentence (EOS) index from transcript segments with word-level timings.
+    Always returns an EOS index, using fallback methods if word data is sparse.
+    
+    Args:
+        segments: List of transcript segments with start/end times and optional words
+        episode_words: Episode-level word timestamps (preferred over segment words)
+        
+    Returns:
+        Tuple of (eos_times, word_end_times) - both sorted lists of timestamps
+    """
+    eos_times = set()
+    word_end_times = []
+    
+    # Prefer segment-level words for local EOS detection, fall back to episode-level
+    all_words = []
+    segment_word_count = 0
+    
+    # First try to extract words from segments
+    for segment in segments:
+        words = segment.get('words', [])
+        if words:
+            all_words.extend(words)
+            segment_word_count += len(words)
+    
+    if segment_word_count > 0:
+        logger.info(f"Using segment-level words: {segment_word_count} words from {len(segments)} segments")
+    elif episode_words and len(episode_words) >= 500:
+        all_words = episode_words
+        logger.info(f"Using episode-level words: {len(all_words)} words (fallback)")
+    else:
+        logger.info(f"Using segment-level words: {len(all_words)} words (sparse)")
+    
+    # Method 1: Use word-level timings if available (most accurate)
+    if all_words and len(all_words) >= 100:  # Lower threshold for better coverage
+        # Calculate gap statistics for adaptive EOS detection
+        gaps = []
+        for i, word in enumerate(all_words[:-1]):
+            word_end = word.get('end', 0)
+            next_word = all_words[i + 1]
+            next_start = next_word.get('start', 0)
+            gap_ms = (next_start - word_end) * 1000
+            if gap_ms > 0:
+                gaps.append(gap_ms)
+        
+        # Calculate adaptive gap threshold
+        GAP_EOS_MS_BASE = 280
+        if gaps:
+            import statistics
+            median_gap = statistics.median(gaps)
+            iqr_gaps = [g for g in gaps if abs(g - median_gap) <= statistics.stdev(gaps) if len(gaps) > 1]
+            iqr_gap = statistics.median(iqr_gaps) if iqr_gaps else median_gap
+            GAP_EOS_MS = max(GAP_EOS_MS_BASE, median_gap + iqr_gap)
+        else:
+            GAP_EOS_MS = GAP_EOS_MS_BASE
+        
+        # Discourse closers for conversational EOS
+        discourse_closers = {"right?", "you know?", "that's it.", "that's right.", "all set.", "we're done."}
+        
+        for i, word in enumerate(all_words[:-1]):
+            word_text = word.get('text', '').strip()
+            word_end = word.get('end', 0)
+            next_word = all_words[i + 1]
+            next_start = next_word.get('start', 0)
+            
+            # 1) Punctuation EOS
+            if word_text.endswith(('.', '?', '!', '…')):
+                eos_times.add(word_end)
+            
+            # 2) Gap-based EOS (adaptive threshold)
+            pause_ms = (next_start - word_end) * 1000
+            if pause_ms >= GAP_EOS_MS:
+                eos_times.add(word_end)
+            
+            # 3) Discourse closer EOS
+            if word_text.lower() in discourse_closers:
+                eos_times.add(word_end)
+            
+            word_end_times.append(word_end)
+        
+        # Add last word end
+        if all_words:
+            word_end_times.append(all_words[-1].get('end', 0))
+        
+        # Log EOS density for tuning
+        eos_density = len(eos_times) / max(len(word_end_times), 1)
+        logger.info(f"EOS detection: {len(eos_times)} markers, {len(word_end_times)} words, density={eos_density:.3f}")
+    else:
+        # Method 2: Fallback to segment-level analysis
+        logger.warning(f"EOS_SPARSE: Only {len(all_words)} words available; using fallback EOS (punctuation+VAD)")
+        eos_times, word_end_times = build_eos_fallback(segments)
+    
+    # Convert to sorted lists
+    eos_times = sorted(list(eos_times))
+    word_end_times = sorted(word_end_times)
+    
+    # Check EOS density and warn if too sparse
+    word_count = len(word_end_times)
+    eos_density = len(eos_times) / max(word_count, 1)
+    
+    if word_count < 500:
+        logger.warning(f"EOS_SPARSE: Only {word_count} word boundaries for full episode (expected 1000+)")
+    if eos_density < 0.02:
+        logger.warning(f"EOS_SPARSE: EOS density {eos_density:.3f} too low (expected 0.02+)")
+    
+    logger.info(f"EOS index built: {len(eos_times)} EOS markers, {len(word_end_times)} word boundaries (density: {eos_density:.3f})")
+    return eos_times, word_end_times
+
+def build_eos_fallback(segments: List[Dict], pause_ms: int = 300) -> Tuple[set, List[float]]:
+    """
+    Fallback EOS index using sentence punctuation and segment-level analysis.
+    
+    Args:
+        segments: List of transcript segments
+        pause_ms: Minimum pause duration for prosody EOS
+        
+    Returns:
+        Tuple of (eos_times_set, word_end_times_list)
+    """
+    eos_times = set()
+    word_end_times = []
+    
+    for i, segment in enumerate(segments):
+        text = segment.get('text', '').strip()
+        end_time = segment.get('end', 0)
+        
+        # Punctuation EOS
+        if text.endswith(('.', '?', '!')):
+            eos_times.add(end_time)
+        
+        # Add segment end as word boundary
+        word_end_times.append(end_time)
+        
+        # Prosody EOS (pause between segments)
+        if i < len(segments) - 1:
+            next_segment = segments[i + 1]
+            next_start = next_segment.get('start', 0)
+            pause_duration = (next_start - end_time) * 1000
+            if pause_duration >= pause_ms:
+                eos_times.add(end_time)
+    
+    return eos_times, word_end_times
+
+def next_eos_after(time: float, eos_times: List[float]) -> Optional[float]:
+    """Find next EOS after given time using binary search."""
+    i = bisect_left(eos_times, time)
+    return eos_times[i] if i < len(eos_times) else None
+
+def prev_eos_before(time: float, eos_times: List[float]) -> Optional[float]:
+    """Find previous EOS before given time using binary search."""
+    i = bisect_left(eos_times, time) - 1
+    return eos_times[i] if i >= 0 else None
+
+def near_eos(time: float, eos_times: List[float], tolerance: float = 0.25) -> bool:
+    """Check if time is within tolerance of any EOS."""
+    for eos in eos_times:
+        if abs(time - eos) <= tolerance:
+            return True
+    return False
+
+def snap_to_last_word_end(time: float, word_end_times: List[float]) -> float:
+    """Snap time to the last word end before or at the given time."""
+    i = bisect_left(word_end_times, time)
+    if i > 0:
+        return word_end_times[i - 1]
+    elif i < len(word_end_times):
+        return word_end_times[i]
+    else:
+        return time
+
+def finish_thought_normalize(candidate: Dict, eos_times: List[float], word_end_times: List[float], platform: str = "default", fallback_mode: bool = False) -> Tuple[Dict, str]:
+    """
+    Normalize candidate to end on a finished thought (EOS).
+    
+    Args:
+        candidate: Clip candidate with start/end times
+        eos_times: Sorted list of EOS timestamps
+        word_end_times: Sorted list of word end timestamps
+        platform: Platform for max_extend configuration
+        fallback_mode: Whether to use sparse/fallback configuration
+        
+    Returns:
+        Tuple of (normalized_candidate, result_code)
+    """
+    # Get fallback-aware configuration
+    cfg = cfg_for_finish_thought(fallback_mode, platform)
+    
+    # Create a copy to avoid modifying original
+    c = candidate.copy()
+    
+    # 1) Word-end snap
+    c['end'] = snap_to_last_word_end(c['end'], word_end_times)
+    c['duration'] = c['end'] - c['start']
+    
+    # 2) Check if already near EOS
+    if near_eos(c['end'], eos_times, cfg["near_eos_tol_sec"]):
+        c['finished_thought'] = 1
+        return c, "snap_ok"
+    
+    # 3) Try forward extend
+    next_eos = next_eos_after(c['end'], eos_times)
+    if next_eos and (next_eos - c['end']) <= cfg["max_extend_sec"]:
+        # Check platform cap (if available)
+        platform_cap = c.get('platform_cap', 30.0)  # Default 30s cap
+        if (next_eos - c['start']) <= platform_cap:
+            c['end'] = snap_to_last_word_end(next_eos, word_end_times)
+            c['duration'] = c['end'] - c['start']
+            c['finished_thought'] = 1
+            return c, "extended"
+    
+    # 4) Try backward shrink
+    prev_eos = prev_eos_before(c['end'], eos_times)
+    if prev_eos and (prev_eos - c['start']) >= cfg["min_viable_after_shrink_sec"]:
+        c['end'] = snap_to_last_word_end(prev_eos, word_end_times)
+        c['duration'] = c['end'] - c['start']
+        c['finished_thought'] = 1
+        return c, "shrunk"
+    
+    # 5) Fallback mode punctuation backstop
+    if fallback_mode:
+        try:
+            if likely_finished_text(c.get('text', '')):
+                c['finished_thought'] = 1
+                return c, "text_finished"
+        except Exception as e:
+            logger.exception("LIKELY_FINISHED_TEXT_ERROR: %s", e)
+            # Continue without marking as finished
+    
+    # 6) Ultra-aggressive fallback for very sparse EOS (density < 0.2)
+    if fallback_mode and len(eos_times) < 30 and c.get('duration', 0) >= 12.0:
+        # For very sparse EOS, mark longer clips as finished if they have substantial content
+        text = c.get('text', '').strip()
+        if len(text.split()) >= 20:  # Substantial content
+            c['finished_thought'] = 1
+            return c, "sparse_finished"
+    
+    # 7) Unresolved - mark as unfinished
+    c['finished_thought'] = 0
+    return c, "unresolved"
+
+def prefer_finished_sibling(candidate: Dict, siblings: List[Dict]) -> Dict:
+    """
+    Prefer a longer finished sibling if current candidate is unresolved.
+    
+    Args:
+        candidate: Current candidate that may be unresolved
+        siblings: List of sibling candidates from same seed
+        
+    Returns:
+        Best candidate (current or preferred sibling)
+    """
+    if candidate.get('finished_thought', 0) == 1:
+        return candidate
+    
+    # Check if this looks like a question/conjunction that needs resolution
+    text = candidate.get('text', '').strip()
+    needs_resolution = (
+        text.endswith('?') or 
+        any(text.endswith(conj) for conj in ['and', 'but', 'so', 'because', 'that\'s why']) or
+        candidate.get('resolution_delta', 0) > 0.12
+    )
+    
+    if not needs_resolution:
+        return candidate
+    
+    # Find longer siblings (18-21s) that are finished
+    finished_long_siblings = [
+        s for s in siblings 
+        if (s.get('finished_thought', 0) == 1 and 
+            18.0 <= s.get('duration', 0) <= 21.0 and
+            s.get('end', 0) - s.get('start', 0) >= 18.0)
+    ]
+    
+    if finished_long_siblings:
+        # Pick best by (pl_v2 desc, duration desc, score desc)
+        best = max(finished_long_siblings, key=lambda x: (
+            x.get('platform_length_score_v2', 0),
+            x.get('duration', 0),
+            x.get('final_score', 0)
+        ))
+        logger.info(f"PREFERRED_SIBLING: {candidate.get('id', 'unknown')} -> {best.get('id', 'unknown')} (finished long)")
+        return best
+    
+    return candidate
+
+def pick_finished_sibling(variants: List[Dict], platform: str, platform_budget_end: float) -> Dict:
+    """
+    Pick the longest finished sibling that fits within platform budget.
+    Used in fallback mode to prefer longer clips that finish properly.
+    """
+    if not variants:
+        return None
+    
+    # 1) Keep only variants that likely finish (punctuation/phrase)
+    finished = [v for v in variants if v.get("finished_thought") == 1]
+    if not finished:
+        return None
+    
+    # 2) Prefer the longest that stays within budget and >= MIN_FLOOR
+    MIN_FLOOR = 7.5
+    finished = [v for v in finished 
+                if (v.get("end", 0) - v.get("start", 0)) >= MIN_FLOOR - 0.05
+                and v.get("end", 0) <= platform_budget_end + 1e-3]
+    
+    if not finished:
+        return None
+    
+    # Return the longest finished variant
+    return max(finished, key=lambda v: v.get("end", 0) - v.get("start", 0))
+
+def apply_family_aware_preference(candidates: List[Dict]) -> List[Dict]:
+    """
+    Apply family-aware preference to ensure longer finished siblings are preferred.
+    
+    Args:
+        candidates: List of all candidates with family_id set
+        
+    Returns:
+        List of candidates with family preference applied
+    """
+    from collections import defaultdict
+    
+    # Group by family_id
+    by_family = defaultdict(list)
+    for c in candidates:
+        family_id = c.get("family_id", c.get("id", "unknown"))
+        by_family[family_id].append(c)
+    
+    # Apply preference within each family
+    preferred = []
+    for family_id, group in by_family.items():
+        if len(group) == 1:
+            preferred.append(group[0])
+        else:
+            # Sort by: finished_thought first, then longer length, then score
+            group.sort(key=lambda x: (
+                int(not x.get("finished_thought", 0)),  # 0 if finished (prefer), 1 otherwise
+                -x.get("duration", 0),                   # longer first
+                -x.get("fs", 0)                          # then score
+            ))
+            # Keep only the best from each family
+            preferred.append(group[0])
+    
+    return preferred

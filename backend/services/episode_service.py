@@ -242,6 +242,34 @@ class EpisodeService:
             return False
         else:  # balanced and quality
             return True
+    
+    def _attach_words_to_segments(self, episode_words: List[Dict], segments: List) -> None:
+        """Attach episode-level words to each segment for local EOS detection"""
+        if not episode_words or not segments:
+            return
+            
+        by_idx = 0
+        n = len(episode_words)
+        
+        for segment in segments:
+            s_start = segment.start
+            s_end = segment.end
+            seg_words = []
+            
+            # Advance pointer to find first word in this segment
+            while by_idx < n and episode_words[by_idx].get('end', 0) <= s_start:
+                by_idx += 1
+            
+            # Collect all words that overlap with this segment
+            j = by_idx
+            while j < n and episode_words[j].get('start', 0) < s_end:
+                seg_words.append(episode_words[j])
+                j += 1
+            
+            # Attach words to segment
+            segment.words = seg_words
+            
+        logger.info(f"Attached words to {len(segments)} segments")
 
     def _update_progress(self, episode_id: str, stage: str, percentage: float, message: str = ""):
         """Update progress for an episode using atomic file persistence"""
@@ -549,7 +577,7 @@ class EpisodeService:
                     clip_score_service = ClipScoreService(self)
                     
                     # Generate clips using the scoring service
-                    clips = await clip_score_service.get_candidates(episode_id)
+                    clips, _ = await clip_score_service.get_candidates(episode_id)
                     episode.clips = clips  # Store clips in episode
                     logger.info(f"Generated {len(clips)} clips for episode {episode_id}")
                 
@@ -773,8 +801,6 @@ class EpisodeService:
                         audio_path,
                         language=WHISPER_LANGUAGE,
                         word_timestamps=False,
-                        fp16=False,
-                        verbose=True,
                         beam_size=1,
                         best_of=1,
                         temperature=0.0,
@@ -784,16 +810,32 @@ class EpisodeService:
                 
                 # Convert to our format
                 transcript = []
-                for i, segment in enumerate(result['segments']):
+                # Handle both tuple and dict return formats
+                if isinstance(result, tuple):
+                    segments, info = result
+                else:
+                    segments = result.get('segments', [])
+                
+                for i, segment in enumerate(segments):
                     # No transcript logging - just progress updates
                     
-                    transcript_segment = TranscriptSegment(
-                        start=segment['start'],
-                        end=segment['end'],
-                        text=segment['text'].strip(),
-                        confidence=segment.get('confidence', 0.0),
-                        words=[]
-                    )
+                    # Handle both dict and object segment formats
+                    if isinstance(segment, dict):
+                        transcript_segment = TranscriptSegment(
+                            start=segment['start'],
+                            end=segment['end'],
+                            text=segment['text'].strip(),
+                            confidence=segment.get('confidence', 0.0),
+                            words=[]
+                        )
+                    else:
+                        transcript_segment = TranscriptSegment(
+                            start=getattr(segment, 'start', 0.0),
+                            end=getattr(segment, 'end', 0.0),
+                            text=getattr(segment, 'text', "").strip(),
+                            confidence=getattr(segment, 'confidence', 0.0),
+                            words=[]
+                        )
                     transcript.append(transcript_segment)
                 
                 logger.info(f"Fallback transcription completed: {len(transcript)} segments")
@@ -836,13 +878,11 @@ class EpisodeService:
             
             # Run transcription in thread pool to avoid blocking
             result = await loop.run_in_executor(
-                None, 
+                None,
                 lambda: self.whisper_model.transcribe(
                     audio_path,
                     language=WHISPER_LANGUAGE,
                     word_timestamps=True,
-                    fp16=False,
-                    verbose=False,
                     beam_size=5,
                     best_of=5,
                     temperature=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
@@ -857,9 +897,15 @@ class EpisodeService:
             
             # Convert to our format with progress updates
             transcript = []
-            total_segments = len(result.get("segments", []))
+            # Handle both tuple and dict return formats
+            if isinstance(result, tuple):
+                segments, info = result
+            else:
+                segments = result.get("segments", [])
             
-            for i, segment in enumerate(result.get("segments", [])):
+            total_segments = len(segments)
+            
+            for i, segment in enumerate(segments):
                 # Update progress based on segment processing
                 segment_progress = 60 + (i / max(1, total_segments)) * 35  # 60-95%
                 tracker.update_stage("transcription", segment_progress, 
@@ -867,11 +913,19 @@ class EpisodeService:
                 write_progress(episode_id, "transcribing", int(segment_progress), 
                              f"Processing segments... {i+1}/{total_segments}")
                 
-                transcript_segment = TranscriptSegment(
-                    start=segment.get("start", 0.0),
-                    end=segment.get("end", 0.0),
-                    text=segment.get("text", "").strip()
-                )
+                # Handle both dict and object segment formats
+                if isinstance(segment, dict):
+                    transcript_segment = TranscriptSegment(
+                        start=segment.get("start", 0.0),
+                        end=segment.get("end", 0.0),
+                        text=segment.get("text", "").strip()
+                    )
+                else:
+                    transcript_segment = TranscriptSegment(
+                        start=getattr(segment, 'start', 0.0),
+                        end=getattr(segment, 'end', 0.0),
+                        text=getattr(segment, 'text', "").strip()
+                    )
                 transcript.append(transcript_segment)
             
             logger.info(f"Enhanced transcription completed: {len(transcript)} segments")
@@ -909,20 +963,30 @@ class EpisodeService:
             segments, info = self.fw_model.transcribe(
                 audio_path, 
                 language="en",
-                vad_filter=True,
+                word_timestamps=True,          # REQUIRED for EOS index
+                vad_filter=True,               # better prosody gaps
+                vad_parameters={"min_silence_duration_ms": 200},
                 beam_size=self._get_whisper_beam_size(),
                 best_of=self._get_whisper_best_of(),
                 temperature=self._get_whisper_temperature(),
-                condition_on_previous_text=self._get_whisper_condition_previous(),
-                word_timestamps=True
+                condition_on_previous_text=self._get_whisper_condition_previous()
             )
             
+            # Collect all words for episode-level storage
+            all_words = []
             last_pct = 10
             for seg in segments:
+                # Store word-level timestamps if available
+                words = []
+                if hasattr(seg, 'words') and seg.words:
+                    words = [{"text": w.word, "start": w.start, "end": w.end, "prob": getattr(w, 'probability', 0.0)} for w in seg.words]
+                    all_words.extend(words)
+                
                 segments_list.append(TranscriptSegment(
                     start=seg.start,
                     end=seg.end,
-                    text=seg.text.strip()
+                    text=seg.text.strip(),
+                    words=words  # Store word-level data
                 ))
                 
                 # Calculate progress based on audio position
@@ -935,9 +999,25 @@ class EpisodeService:
                     last_pct = pct
                     await asyncio.sleep(0)  # Yield control
                     
+            # Validate word count and store episode-level data
+            word_count = len(all_words)
+            if word_count < 500:  # short ep threshold; use 1500–3000 for long eps
+                logger.warning(f"EOS_SPARSE: word_count={word_count} too low; enabling fallback mode")
+            
+            # Store word data in episode for EOS index building
+            episode = await self.get_episode(episode_id)
+            if episode:
+                episode.words = all_words
+                episode.word_count = word_count
+                
+                # Attach words to segments for local EOS detection
+                self._attach_words_to_segments(all_words, segments_list)
+                
+                self._save_episode(episode)
+            
             tracker.update_stage("transcription", 100, "Faster-Whisper transcription complete")
             write_progress(episode_id, "transcribing", 95, "Transcription complete")
-            logger.info(f"Faster-Whisper transcription completed: {len(segments_list)} segments")
+            logger.info(f"Faster-Whisper transcription completed: {len(segments_list)} segments, {word_count} words")
             return segments_list
             
         except Exception as e:

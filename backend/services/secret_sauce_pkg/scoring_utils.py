@@ -3,8 +3,56 @@ Advanced scoring utilities for Phase 1 improvements.
 """
 
 import numpy as np
+import re
 from typing import Dict, List, Tuple
 from .types import _c01, quantize
+# blend_weights will be defined locally to avoid circular import
+
+def blend_weights(
+    genre_conf: Dict[str, float],
+    weights_by_genre: Dict[str, Dict[str, float]],
+    *,
+    top_k: int = 2,
+    min_conf: float = 0.20,
+    default_genre: str = "general",
+) -> Dict[str, float]:
+    """
+    Blend per-genre weight vectors by confidence. Falls back to `default_genre`.
+    - genre_conf: {"business": 0.55, "comedy": 0.25, ...}
+    - weights_by_genre: {"business": {...}, "comedy": {...}, "general": {...}}
+    Returns a normalized weight dict over paths.
+    """
+    if not genre_conf:
+        return dict(weights_by_genre.get(default_genre, {}))
+
+    # take top_k genres above threshold
+    items = [(g, c) for g, c in genre_conf.items() if c >= min_conf and g in weights_by_genre]
+    if not items:
+        return dict(weights_by_genre.get(default_genre, {}))
+
+    items.sort(key=lambda x: x[1], reverse=True)
+    items = items[:top_k]
+
+    total_conf = sum(c for _, c in items)
+    if total_conf <= 0:
+        return dict(weights_by_genre.get(default_genre, {}))
+
+    # normalized confidences as blend coefficients
+    coeffs = {g: (c / total_conf) for g, c in items}
+
+    # union of all paths present in the selected genres
+    all_keys = set().union(*[weights_by_genre[g].keys() for g, _ in items])
+    blended = {k: 0.0 for k in all_keys}
+
+    for g, a in coeffs.items():
+        for k, w in weights_by_genre[g].items():
+            blended[k] += a * w
+
+    # renormalize to sum~=1 for safety
+    s = sum(blended.values())
+    if s > 0:
+        blended = {k: v / s for k, v in blended.items()}
+    return blended
 
 # Path constants
 PATHS = ("hook", "arousal", "emotion", "payoff", "info_density", "q_list", "loopability", "platform_length")
@@ -213,20 +261,108 @@ def apply_genre_blending(base_weights: dict, genre_scorer, segments: list) -> tu
     if not primary_profile or not secondary_profile:
         return base_weights.copy(), debug_info
     
-    # Blend weights
-    blended_weights = blend_weights(
-        base_weights,
-        primary_profile.weights,
-        primary_conf,
-        secondary_profile.weights,
-        debug_info["secondary_confidence"]
-    )
+    # Blend weights using genre confidence
+    genre_conf = {
+        primary_genre: primary_conf,
+        debug_info["secondary_genre"]: debug_info["secondary_confidence"]
+    }
+    weights_by_genre = {
+        primary_genre: primary_profile.weights,
+        debug_info["secondary_genre"]: secondary_profile.weights
+    }
+    
+    try:
+        blended_weights = blend_weights(genre_conf, weights_by_genre, top_k=2, min_conf=0.20)
+    except Exception as e:
+        logger.warning(f"Genre blending failed: {e}; falling back to primary genre weights")
+        blended_weights = primary_profile.weights.copy()
     
     debug_info["primary_weights"] = primary_profile.weights
     debug_info["secondary_weights"] = secondary_profile.weights
     debug_info["final_weights"] = blended_weights
     
     return blended_weights, debug_info
+
+def grow_to_bins(seg: dict, audio_file: str, targets: list = [12, 18, 24, 30], max_jitter: float = 1.0, max_score_drop: float = 0.02) -> dict:
+    """
+    Grow segment to target platform bins by extending to natural cuts.
+    Returns the best variant by platform_length_score_v2.
+    """
+    variants = [seg]
+    current_dur = seg.get("end", 0) - seg.get("start", 0)
+    
+    for target in targets:
+        if current_dur >= target - 0.5:  # already long enough
+            continue
+            
+        # Try to extend to target duration
+        extended = try_extend_to(seg, audio_file, target, max_jitter)
+        if extended and (seg.get("final_score", 0) - extended.get("final_score", 0)) <= max_score_drop:
+            variants.append(extended)
+    
+    # Return best variant by platform_length_score_v2
+    return max(variants, key=lambda x: x.get("platform_length_score_v2", 0))
+
+def try_extend_to(seg: dict, audio_file: str, target_duration: float, max_jitter: float = 1.0) -> dict:
+    """
+    Try to extend segment to target duration by finding natural cuts.
+    """
+    start = seg.get("start", 0)
+    end = seg.get("end", 0)
+    current_dur = end - start
+    target_end = start + target_duration
+    
+    # Look for natural cuts within jitter range
+    snap_points = find_natural_cuts(audio_file, end, target_end, max_jitter)
+    
+    if not snap_points:
+        return None
+        
+    # Try each snap point
+    best_variant = None
+    best_score = -1
+    
+    for snap_end in snap_points:
+        variant = seg.copy()
+        variant["end"] = snap_end
+        variant["text"] = get_text_for_segment(audio_file, start, snap_end)
+        
+        # Re-score the variant
+        variant_score = score_variant(variant)
+        if variant_score > best_score:
+            best_score = variant_score
+            best_variant = variant
+    
+    return best_variant
+
+def find_natural_cuts(audio_file: str, start_time: float, end_time: float, max_jitter: float) -> list:
+    """
+    Find natural cut points (punctuation, silence) within the time range.
+    """
+    # This is a simplified version - in practice you'd use audio analysis
+    # For now, return evenly spaced points as placeholders
+    cuts = []
+    step = 0.5  # 0.5 second steps
+    current = start_time + step
+    while current <= end_time:
+        cuts.append(current)
+        current += step
+    return cuts
+
+def get_text_for_segment(audio_file: str, start: float, end: float) -> str:
+    """
+    Extract text for the given time segment.
+    """
+    # This would integrate with your transcription service
+    # For now, return placeholder
+    return f"Extended segment {start:.1f}-{end:.1f}"
+
+def score_variant(variant: dict) -> float:
+    """
+    Score a variant segment.
+    """
+    # This would call your scoring function
+    return variant.get("final_score", 0)
 
 def find_optimal_boundaries(segments: list, audio_file: str, min_delta: float = 0.03) -> list:
     """
@@ -399,7 +535,131 @@ def apply_calibration(score: float, calibration_version: str = "2025.09.1") -> f
     elif calibration_version == "2025.09.3":
         return calibrate_mild(score)
     else:
-        return score  # No calibration for unknown versions
+        return score
+
+def looks_like_question(t: str) -> bool:
+    """Robust question detector that handles clipped punctuation and ASR cases"""
+    if not t: 
+        return False
+    t = t.strip().lower()
+    if t.endswith("?"): 
+        return True
+    # Handle clipped punctuation / ASR cases
+    return bool(re.match(
+        r"^(what|why|how|when|where|who|whom|whose|which|do|does|did|can|could|should|would|is|are|was|were|will|won't|isn't|aren't|didn't)\b",
+        t
+    ))
+
+def apply_anti_bait_cap(features: dict) -> float:
+    """
+    Apply anti-bait cap to prevent micro-clips from hitting max scores.
+    HARD CAPS must be applied AFTER all boosts and BEFORE calibration.
+    """
+    final_score = features.get("final_score", 0.0)
+    hook_score = features.get("hook_score", 0.0)
+    payoff_score = features.get("payoff_score", 0.0)
+    words = features.get("words", 0)
+    ad_penalty = features.get("ad_penalty", 0.0)
+    text = features.get("text", "").strip()
+    
+    # Track applied caps for debugging
+    applied = []
+    
+    # Check for ad-like content
+    looks_ad = ad_penalty >= 0.3 or any(phrase in text.lower() for phrase in [
+        "chase sapphire", "amex platinum", "credit card", "points per dollar"
+    ])
+    
+    # HARD CAPS (must be AFTER boosts, BEFORE calibration)
+    is_q = looks_like_question(text)
+    is_micro = words < 12
+    
+    # Micro anti-bait cap
+    if is_micro and payoff_score < 0.20 and (is_q or looks_ad):
+        final_score = min(final_score, 0.55)
+        applied.append("anti_bait_micro")
+    
+    # Long super-hook but no payoff
+    if words >= 18 and hook_score >= 0.90 and payoff_score < 0.12:
+        final_score = min(final_score, 0.72)
+        applied.append("no_payoff_ceiling")
+    
+    # Question-only cap (if no answer stitched)
+    if is_q and is_micro and payoff_score < 0.20 and not features.get("_has_answer", False):
+        final_score = min(final_score, 0.55)
+        applied.append("question_cap")
+    
+    # Record applied caps for debugging
+    if applied:
+        features.setdefault("flags", {})["caps_applied"] = applied
+    
+    # Sanity check: if we capped, we should still see it
+    if "question_cap" in features.get("flags", {}).get("caps_applied", []):
+        assert final_score <= 0.55 + 1e-6, f"Question cap leaked: {final_score}"
+    
+    # Small payoff evidence bonus (keeps balance)
+    if payoff_score >= 0.30:
+        final_score += 0.02   # tiny +2%
+    
+    # Calibration ceiling: never show 100/100
+    final_score = min(final_score, 0.98)
+    final_score = round(final_score, 2)  # stabilize ordering
+    
+    return final_score
+
+def try_stitch_answer(seg: dict, next_seg: dict) -> dict:
+    """Try to stitch a question with its answer for better context"""
+    if not seg.get("text", "").strip().endswith("?"):
+        return None
+    if next_seg is None: 
+        return None
+    
+    t = (next_seg.get("text") or "").lower()
+    # Simple payoff cues
+    if (next_seg.get("payoff_score", 0.0) >= 0.25 or
+        re.search(r"\b(so|that means|here('s)? (how|why)|the (answer|takeaway) is|because)\b", t)):
+        # Merge segments with max 8 second extension
+        merged = {
+            "text": seg.get("text", "") + " " + next_seg.get("text", ""),
+            "start": seg.get("start", 0),
+            "end": min(seg.get("end", 0) + 8.0, next_seg.get("end", seg.get("end", 0) + 8.0)),
+            "words": seg.get("words", 0) + next_seg.get("words", 0),
+            "_has_answer": True
+        }
+        # Copy other fields from the question segment
+        for key, value in seg.items():
+            if key not in merged:
+                merged[key] = value
+        return merged
+    return None
+
+def collapse_question_runs(candidates: list, iou_thresh: float = 0.35) -> list:
+    """
+    Collapse consecutive question segments, keeping only the strongest one.
+    Treats adjacency by time, not IoU; keeps best of local question-only run.
+    """
+    def is_q(c):
+        return (c.get("text", "").strip().endswith("?")) and c.get("payoff_score", 0.0) < 0.20
+    
+    out, run = [], []
+    
+    # Sort candidates by start time
+    for c in sorted(candidates, key=lambda x: x.get("start", 0.0)):
+        if is_q(c):
+            run.append(c)
+        else:
+            if run:
+                # Keep the best question from the run
+                best = max(run, key=lambda r: r.get("final_score", 0.0))
+                out.append(best)
+                run.clear()
+            out.append(c)
+    
+    # Handle any remaining run
+    if run:
+        out.append(max(run, key=lambda r: r.get("final_score", 0.0)))
+    
+    return out
 
 def piecewise_calibrate_v2(score: float) -> float:
     """

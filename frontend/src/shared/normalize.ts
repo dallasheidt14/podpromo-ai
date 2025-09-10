@@ -114,6 +114,8 @@ export function normalizeClip(raw: any): Clip {
     score: Math.max(0, Math.min(1, normalizedScore)), // Ensure score is between 0-1
     title: String(raw.title || ''),
     text: String(raw.text || raw.transcript || raw.content || ''),
+    raw_text: String(raw.raw_text || raw.text || raw.transcript || raw.content || ''),
+    full_transcript: String(raw.full_transcript || raw.text || raw.transcript || raw.content || ''),
     status: (raw.status || 'completed') as 'generating' | 'completed' | 'failed',
     features: normalizedFeatures,
     downloadUrl: raw.download_url || raw.downloadUrl || null,

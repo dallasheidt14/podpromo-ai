@@ -9,7 +9,7 @@ import re
 import random
 import math
 import os
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Any, Optional
 from models import AudioFeatures, TranscriptSegment, MomentScore
 from config.settings import (
     UPLOAD_DIR, OUTPUT_DIR, MAX_FILE_SIZE, ALLOWED_EXTENSIONS,
@@ -24,12 +24,153 @@ from services.progress_writer import write_progress
 from services.prerank import pre_rank_candidates, get_safety_candidates, pick_stratified
 from services.quality_filters import fails_quality, filter_overlapping_candidates, filter_low_quality
 from services.candidate_formatter import format_candidates
+
+# Enhanced compute function with all Phase 1-3 features
+from services.secret_sauce_pkg.features import compute_features_v4_enhanced as _compute_features
+
+# Feature coverage logging
+REQUIRED_FEATURE_KEYS = [
+    "hook_score", "arousal_score", "payoff_score", "info_density",
+    "loopability", "insight_score", "platform_len_match"
+]
+OPTIONAL_FEATURE_KEYS = [
+    "insight_conf", "q_list_score", "prosody_arousal", "platform_length_score_v2", "emotion_score"
+]
+
+def _log_feature_coverage(logger, feats: dict):
+    missing = [k for k in REQUIRED_FEATURE_KEYS if k not in feats]
+    if missing:
+        logger.warning(f"[features] Missing required: {missing}")
+    soft_missing = [k for k in OPTIONAL_FEATURE_KEYS if k not in feats]
+    if soft_missing:
+        logger.info(f"[features] Optional not present: {soft_missing}")
 from config_loader import get_config
 
 # ensure v2 is ON everywhere
 def is_on(_): return True  # temporary until flags are unified
 
 logger = logging.getLogger(__name__)
+
+def choose_default_clip(clips: List[Dict[str, Any]]) -> Optional[str]:
+    """Choose the default clip for UI display"""
+    if not clips:
+        return None
+    
+    longs = [c for c in clips if c.get("protected_long")]
+    if longs:
+        longs.sort(key=lambda c: (-c.get("pl_v2", 0), -c.get("duration", 0), -c.get("final_score", 0)))
+        return longs[0]["id"]
+    
+    rest = sorted(clips, key=lambda c: (-c.get("final_score", 0), -c.get("finished_thought", 0), -c.get("pl_v2", 0)))
+    if rest:
+        return rest[0]["id"]
+    
+    return None
+
+def rank_clips(clips: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Rank clips with protected_long clips first"""
+    longs = sorted([c for c in clips if c.get("protected_long")],
+                   key=lambda c: (-c.get("pl_v2", 0), -c.get("duration", 0), -c.get("final_score", 0)))
+    rest = sorted([c for c in clips if not c.get("protected_long")],
+                  key=lambda c: (-c.get("final_score", 0), -c.get("finished_thought", 0), -c.get("pl_v2", 0)))
+    ordered = longs + rest
+    for i, c in enumerate(ordered): 
+        c["rank_primary"] = i
+    return ordered
+
+def final_safety_pass(clips: List[Dict[str, Any]], eos_times: List[float], word_end_times: List[float], platform: str) -> List[Dict[str, Any]]:
+    """
+    Final safety pass to ensure all clips end on finished thoughts.
+    This catches any clips that might have slipped through without proper EOS normalization.
+    Always runs, even with sparse EOS data using fallback mode.
+    """
+    if not eos_times or not word_end_times:
+        logger.warning("SAFETY_FALLBACK: No EOS data available, using relaxed mode")
+        # In fallback mode, just mark all clips as finished to avoid drops
+        for clip in clips:
+            clip['finished_thought'] = 1
+        return clips
+    
+    from services.secret_sauce_pkg.features import finish_thought_normalize, near_eos
+    
+    safety_updated = 0
+    safety_dropped = 0
+    safety_protected = 0
+    
+    # Check EOS density
+    word_count = len(word_end_times)
+    eos_density = len(eos_times) / max(word_count, 1)
+    is_sparse = eos_density < 0.02 or word_count < 500
+    
+    if is_sparse:
+        logger.warning(f"EOS_SPARSE: Using relaxed safety mode (density: {eos_density:.3f}, words: {word_count})")
+    
+    for clip in clips:
+        # Check if clip already ends on a finished thought
+        if clip.get("finished_thought", 0) == 1:
+            continue
+        
+        # Try to normalize this clip
+        # Determine fallback mode based on EOS density
+        fallback_mode = len(eos_times) < 50 or len(word_end_times) < 500
+        normalized_clip, result = finish_thought_normalize(clip, eos_times, word_end_times, platform, fallback_mode)
+        
+        if result == "unresolved":
+            # Special handling for protected long clips
+            if clip.get("protected_long", False):
+                # Try last-resort extension with wider window
+                dur = clip.get('end', 0) - clip.get('start', 0)
+                if dur >= 18.0:  # Only for long clips
+                    logger.warning(f"SAFETY_PROTECTED: keeping unresolved long clip {clip.get('id', 'unknown')} dur={dur:.1f}s")
+                    clip['finished_thought'] = 0
+                    clip['needs_review'] = True
+                    safety_protected += 1
+                    continue
+            
+            # For non-protected clips or sparse EOS, be more lenient
+            if is_sparse:
+                logger.warning(f"SAFETY_KEEP_SPARSE: keeping unresolved clip {clip.get('id', 'unknown')} due to sparse EOS")
+                clip['finished_thought'] = 0
+                clip['needs_review'] = True  # Mark for sparse EOS mode
+                safety_protected += 1
+                continue
+            else:
+                safety_dropped += 1
+                logger.warning(f"SAFETY_DROP: clip {clip.get('id', 'unknown')} unresolved after safety pass")
+                continue
+        elif result != "snap_ok":
+            # Clip was modified - update it
+            clip.update(normalized_clip)
+            safety_updated += 1
+            logger.info(f"SAFETY_UPDATE: clip {clip.get('id', 'unknown')} -> {result}")
+    
+    # Calculate telemetry
+    word_count = len(word_end_times)
+    eos_count = len(eos_times)
+    eos_density = eos_count / max(word_count, 1)
+    fallback_mode = word_count < 500 or eos_count == 0
+    
+    # Count finish thought results
+    finished_count = sum(1 for c in clips if c.get("finished_thought", 0) == 1)
+    finished_ratio = finished_count / max(len(clips), 1)
+    
+    # Log episode-level telemetry
+    logger.info(f"TELEMETRY: word_count={word_count}, eos_count={eos_count}, eos_density={eos_density:.3f}")
+    logger.info(f"TELEMETRY: fallback_mode={fallback_mode}, finished_ratio={finished_ratio:.2f}")
+    logger.info(f"SAFETY_PASS: updated {safety_updated}, dropped {safety_dropped}, protected {safety_protected} clips")
+    
+    # Episode-level thresholds
+    if word_count < 500 or eos_count == 0:
+        logger.warning("EOS_SPARSE: word_count < 500 or eos_count == 0")
+    if finished_ratio < 0.95:
+        logger.warning(f"FINISH_RATIO_LOW: {finished_ratio:.2f}")
+    
+    # Remove any clips that were marked for dropping (but keep protected ones)
+    # In sparse EOS mode, be more lenient with finished_thought requirements
+    if fallback_mode:
+        return [c for c in clips if c.get("finished_thought", 0) == 1 or c.get("needs_review", False) or c.get("protected", False)]
+    else:
+        return [c for c in clips if c.get("finished_thought", 0) == 1 or c.get("needs_review", False) or near_eos(c.get("end", 0), eos_times, 0.5)]
 
 class ClipScoreService:
     """Service for analyzing podcast episodes and scoring potential clip moments"""
@@ -225,16 +366,38 @@ class ClipScoreService:
                 progress_pct = 20 + int((i / len(segments_to_score)) * 70)  # 20-90%
                 write_progress(episode_id or "unknown", "scoring:full", progress_pct, f"Scoring candidate {i+1}/{len(segments_to_score)}...")
             
-            # Use V4 feature computation with enhanced detectors and genre awareness
-            feats = compute_features_v4(seg, audio_file, y_sr=y_sr, platform=platform, genre=genre)
-            seg["features"] = feats
-            
-            # Debug: log what features we got
-            logger.info(f"V4 Features computed: {list(feats.keys())}")
-            logger.info(f"Feature values: hook={feats.get('hook_score', 0):.3f}, arousal={feats.get('arousal_score', 0):.3f}, payoff={feats.get('payoff_score', 0):.3f}")
-            logger.info(f"Hook reasons: {feats.get('hook_reasons', 'none')}")
-            logger.info(f"Payoff type: {feats.get('payoff_type', 'none')}")
-            logger.info(f"Moment type: {feats.get('type', 'general')}")
+            # Use enhanced V4 feature computation with all Phase 1-3 features
+            try:
+                feats = _compute_features(
+                    segment=seg,
+                    audio_file=audio_file,
+                    y_sr=y_sr,
+                    platform=platform,
+                    genre=genre,
+                    segments=segments_to_score,  # give enhanced fn episode context
+                )
+                _log_feature_coverage(logger, feats)
+                seg["features"] = feats
+                
+                # Debug: log what features we got
+                logger.info(f"Enhanced V4 Features computed: {list(feats.keys())}")
+                logger.info(f"Feature values: hook={feats.get('hook_score', 0):.3f}, arousal={feats.get('arousal_score', 0):.3f}, payoff={feats.get('payoff_score', 0):.3f}")
+                logger.info(f"Hook reasons: {feats.get('hook_reasons', 'none')}")
+                logger.info(f"Payoff type: {feats.get('payoff_type', 'none')}")
+                logger.info(f"Moment type: {feats.get('type', 'general')}")
+            except Exception as e:
+                logger.warning(f"Enhanced features failed for segment {seg.get('id', i)}: {e}; falling back to v4")
+                try:
+                    feats = compute_features_v4(seg, audio_file, y_sr=y_sr, platform=platform, genre=genre)
+                    _log_feature_coverage(logger, feats)
+                    seg["features"] = feats
+                    
+                    # Debug: log what features we got
+                    logger.info(f"Fallback V4 Features computed: {list(feats.keys())}")
+                    logger.info(f"Feature values: hook={feats.get('hook_score', 0):.3f}, arousal={feats.get('arousal_score', 0):.3f}, payoff={feats.get('payoff_score', 0):.3f}")
+                except Exception as e2:
+                    logger.exception(f"Both enhanced and fallback feature compute failed for segment {seg.get('id', i)}: {e2}")
+                    continue
             
             # Get raw score using V4 multi-path scoring with genre awareness
             current_weights = get_clip_weights()
@@ -879,9 +1042,19 @@ class ClipScoreService:
             # Convert transcript to segments using intelligent moment detection
             segments = self._transcript_to_segments(episode.transcript, genre=final_genre, platform=platform)
 
+            # Build EOS index early to determine fallback mode
+            from services.secret_sauce_pkg.features import build_eos_index
+            episode_words = getattr(episode, 'words', None) if episode else None
+            eos_times, word_end_times = build_eos_index(segments, episode_words)
+            
+            # One-time fallback mode decision per episode (freeze this value)
+            eos_density = len(eos_times) / max(len(word_end_times), 1)
+            episode_fallback_mode = eos_density < 0.020
+            logger.info(f"Episode fallback mode: {episode_fallback_mode} (density={eos_density:.3f})")
+
             # Use the enhanced viral clips pipeline with all Phase 1-3 improvements
             logger.info(f"Using enhanced viral clips pipeline with {len(segments)} segments")
-            viral_result = find_viral_clips_enhanced(segments, episode.audio_path, genre=final_genre, platform=backend_platform)
+            viral_result = find_viral_clips_enhanced(segments, episode.audio_path, genre=final_genre, platform=backend_platform, fallback_mode=episode_fallback_mode)
             
             if "error" in viral_result:
                 logger.error(f"Enhanced viral clips pipeline failed: {viral_result['error']}")
@@ -890,13 +1063,78 @@ class ClipScoreService:
             clips = viral_result.get('clips', [])
             logger.info(f"Found {len(clips)} viral clips using enhanced pipeline")
             
+            # Convert episode transcript to full text for display
+            full_episode_transcript = ""
+            if episode.transcript:
+                full_episode_transcript = " ".join([seg.text for seg in episode.transcript if hasattr(seg, 'text') and seg.text])
+            
+            # EOS index already built above for fallback mode determination
+            
+            # Sanity assertions
+            assert eos_times is not None, "EOS times should never be None"
+            if len(eos_times) == 0:
+                logger.warning("EOS_FALLBACK_ONLY: No EOS markers found, using fallback mode")
+            
             # Convert to candidate format with title generation and grades
-            candidates = format_candidates(clips, final_genre, backend_platform, episode_id)
+            candidates = format_candidates(clips, final_genre, backend_platform, episode_id, full_episode_transcript)
             logger.info(f"Formatted {len(candidates)} candidates")
+            
+            # PRE-NMS: Log top 10 before NMS with proper tie-breaking
+            def sort_key(c):
+                return (
+                    round(c.get('final_score', 0), 3),
+                    round(c.get('platform_length_score_v2', 0.0), 3),
+                    round(c.get('end', 0) - c.get('start', 0), 2)
+                )
+            
+            for c in sorted(candidates, key=sort_key, reverse=True)[:10]:
+                logger.info("PRE-NMS: fs=%.2f dur=%.1f pl_v2=%.2f text='%s'",
+                    c.get("final_score", 0), c.get("end", 0) - c.get("start", 0), 
+                    c.get("platform_length_score_v2", 0.0),
+                    (c.get("text", "")[:50]).replace("\n", " ")
+                )
+            
+            # A) Prove what each top clip scored (one-line instrumentation)
+            for i, c in enumerate(sorted(candidates, key=sort_key, reverse=True)[:10]):
+                # Enhanced diagnostics
+                text = c.get("text", "")
+                is_q = text.strip().endswith("?")
+                has_payoff = c.get("payoff_score", 0.0) >= 0.20
+                looks_ad = c.get("ad_penalty", 0.0) >= 0.3
+                words = c.get("text_length", 0)
+                final_score = c.get("final_score", 0)
+                
+                # Verification asserts
+                if is_q and words < 12 and c.get("payoff_score", 0) < 0.20 and not c.get("_has_answer", False):
+                    assert final_score <= 0.55 + 1e-6, f"Question cap failed: {final_score} '{text[:60]}'"
+                
+                logger.info(
+                    "Top #%d: score=%.2f w=%s hook=%.2f arous=%.2f payoff=%.2f info=%.2f ql=%.2f pl_v2=%.2f ad_pen=%.2f q=%s payoff_ok=%s ad=%s caps=%s text='%s'",
+                    i+1,
+                    final_score,
+                    words,
+                    c.get("hook_score", 0),
+                    c.get("arousal_score", 0),
+                    c.get("payoff_score", 0),
+                    c.get("info_density", 0),
+                    c.get("q_list_score", 0),
+                    c.get("platform_length_score_v2", 0),
+                    c.get("ad_penalty", 0),
+                    is_q,
+                    has_payoff,
+                    looks_ad,
+                    c.get("flags", {}).get("caps_applied", []),
+                    (text[:80]).replace("\n", " ")
+                )
             
             # Debug: Log candidate scores
             for i, candidate in enumerate(candidates[:3]):  # Log first 3 candidates
                 logger.info(f"Candidate {i}: display_score={candidate.get('display_score', 'MISSING')}, text_length={len(candidate.get('text', '').split())}")
+            
+            # Collapse consecutive question runs (keep only the strongest)
+            from services.secret_sauce_pkg.scoring_utils import collapse_question_runs
+            candidates = collapse_question_runs(candidates)
+            logger.info(f"After question collapse: {len(candidates)} candidates")
             
             # Filter overlapping candidates
             filtered_candidates = filter_overlapping_candidates(candidates)
@@ -906,8 +1144,94 @@ class ClipScoreService:
             quality_filtered = filter_low_quality(filtered_candidates, min_score=15)
             logger.info(f"After quality filtering: {len(quality_filtered)} candidates")
             
-            return quality_filtered[:10]  # Return top 10
+            # POST-NMS: Log final durations
+            logger.info("POST-NMS: durs=%s",
+                [round(c.get("end", 0) - c.get("start", 0), 1) for c in quality_filtered]
+            )
+            
+            # Diversity check: warn if all candidates have same duration
+            durs = [round(c.get("end", 0) - c.get("start", 0), 1) for c in quality_filtered]
+            if len(quality_filtered) >= 6 and len(set(durs)) < 2:
+                logger.warning("DIVERSITY: all candidates have same duration=%s; favoring longer pl_v2 ties", durs[0] if durs else "unknown")
+            
+            # Final diversity guard: ensure at least one long platform-fit clip
+            finals = quality_filtered[:10]
+            if len(finals) >= 4 and max(c.get('end', 0) - c.get('start', 0) for c in finals) < 16.0:
+                def sort_key(c):
+                    return (round(c.get('final_score', 0), 3),
+                            round(c.get('platform_length_score_v2', 0.0), 3),
+                            round(c.get('end', 0) - c.get('start', 0), 2))
+                
+                # Find best long candidate from all candidates
+                long_best = next((c for c in sorted(candidates, key=sort_key, reverse=True)
+                                if (c.get('end', 0) - c.get('start', 0)) >= 18.0 
+                                and c.get('platform_length_score_v2', 0) >= 0.80), None)
+                if long_best and long_best not in finals:
+                    long_best["protected"] = True  # Mark as protected
+                    finals[-1] = long_best  # Replace last slot
+                    finals.sort(key=sort_key, reverse=True)  # Re-sort
+                    logger.info(f"DIVERSITY GUARD: promoted long clip dur={long_best.get('end', 0) - long_best.get('start', 0):.1f}s pl_v2={long_best.get('platform_length_score_v2', 0):.2f}")
+            
+            # Mark all selected clips with protected status
+            for c in finals:
+                c["protected"] = c.get("protected", False)
+            
+            # Stable final ordering: protected clips first, then by score
+            finals.sort(key=lambda c: (c.get("protected", False), c.get("final_score", 0)), reverse=True)
+            
+            # Debug: Log final saved set with durations and protected flags
+            final_info = []
+            for c in finals:
+                dur = round(c.get('end', 0) - c.get('start', 0), 1)
+                prot = "prot=True" if c.get("protected", False) else ""
+                final_info.append(f"{dur}s {prot}".strip())
+            logger.info(f"FINAL_SAVE: n={len(finals)} :: [{', '.join(final_info)}]")
+            
+            # Final safety pass: ensure all clips end on finished thoughts
+            candidates_before = len(finals)
+            finals = final_safety_pass(finals, eos_times, word_end_times, backend_platform)
+            candidates_after = len(finals)
+            
+            # Hard guardrails for safety pass
+            logger.info(f"SAFETY_COUNTS: total_before={candidates_before} after={candidates_after}")
+            
+            # Pre-save assert
+            logger.info(f"PRE_SAVE: final_count={candidates_after} ids={[c.get('id', 'unknown') for c in finals]}")
+            assert candidates_after > 0, f"Safety pass removed all clips (was {candidates_before})"
+            
+            # Add ranking and default clip selection
+            ranked_clips = rank_clips(finals)
+            default_clip_id = choose_default_clip(ranked_clips)
+            
+            # Add metadata to each clip
+            for clip in ranked_clips:
+                clip["protected_long"] = clip.get("protected", False)
+                clip["duration"] = round(clip.get('end', 0) - clip.get('start', 0), 2)
+                clip["pl_v2"] = clip.get("platform_length_score_v2", 0.0)
+                clip["finished_thought"] = clip.get("text", "").strip().endswith(('.', '!', '?'))
+            
+            # Final sanity check before save
+            assert len(ranked_clips) > 0, "Should have at least one clip"
+            finished_ratio = sum(c.get("finished_thought", 0) for c in ranked_clips) / len(ranked_clips)
+            
+            # Comprehensive telemetry with consistent fallback mode
+            finished_count = sum(c.get('finished_thought', 0) for c in ranked_clips)
+            sparse_finished_count = sum(1 for c in ranked_clips if c.get('sparse_finished', False))
+            finished_ratio = finished_count / max(len(ranked_clips), 1)
+            sparse_ratio = sparse_finished_count / max(len(ranked_clips), 1)
+            
+            # Calculate longest clip duration
+            longest_dur = max((c.get("end", 0) - c.get("start", 0)) for c in ranked_clips) if ranked_clips else 0.0
+            
+            logger.info(f"TELEMETRY: word_count={len(word_end_times)} eos_count={len(eos_times)} eos_density={len(eos_times)/max(len(word_end_times), 1):.3f} fallback_mode={episode_fallback_mode}")
+            logger.info(f"FT_SUMMARY: fallback={episode_fallback_mode} finished={finished_count}/{len(ranked_clips)} ratio={finished_ratio:.2f} sparse_ok={sparse_ratio:.2f} longest={longest_dur:.1f}s")
+            logger.info(f"POST_SAFETY: kept={len(ranked_clips)} ids={[c.get('id', 'unknown') for c in ranked_clips]}")
+            
+            if finished_ratio < 0.6:
+                logger.warning(f"FINISH_RATIO_LOW: {finished_ratio:.2f}")
+            
+            return ranked_clips, default_clip_id
             
         except Exception as e:
             logger.error(f"Failed to get candidates: {e}", exc_info=True)
-            return []
+            return [], None

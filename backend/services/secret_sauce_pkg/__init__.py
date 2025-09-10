@@ -24,6 +24,7 @@ from .scoring_utils import whiten_paths, synergy_bonus, platform_length_score_v2
 from .features import (
     # Main feature computation functions
     compute_features_v4,
+    compute_features_v4_enhanced,
     compute_features_v4_batch,
     compute_features,
     compute_features_cached,

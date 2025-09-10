@@ -148,6 +148,8 @@ class Episode(BaseModel):
     audio_path: Optional[str] = None
     transcript: Optional[List[TranscriptSegment]] = None
     clips: Optional[List[Dict[str, Any]]] = None  # Store generated clips
+    words: Optional[List[Dict[str, Any]]] = None  # Store word-level timestamps
+    word_count: Optional[int] = None  # Store word count for EOS index
     error: Optional[str] = None
     uploaded_at: Optional[datetime] = None
     processed_at: Optional[datetime] = None

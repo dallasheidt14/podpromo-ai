@@ -725,7 +725,7 @@ async def get_candidates(
         frontend_platform = platform_mapping.get(recommended_platform, "tiktok_reels")
         
         # Get candidates using the auto-recommended platform
-        candidates = await clip_score_service.get_candidates(
+        candidates, _ = await clip_score_service.get_candidates(
             target_episode.id, 
             platform=frontend_platform, 
             genre=genre
@@ -1067,11 +1067,27 @@ async def get_episode_clips(episode_id: str, regenerate: bool = False, backgroun
             if hasattr(episode, 'clips') and episode.clips:
                 # Use already generated clips from episode processing
                 clips = episode.clips
+                # For cached clips, we need to add the new metadata
+                for clip in clips:
+                    if "protected_long" not in clip:
+                        clip["protected_long"] = clip.get("protected", False)
+                    if "duration" not in clip:
+                        clip["duration"] = round(clip.get('end', 0) - clip.get('start', 0), 2)
+                    if "pl_v2" not in clip:
+                        clip["pl_v2"] = clip.get("platform_length_score_v2", 0.0)
+                    if "finished_thought" not in clip:
+                        clip["finished_thought"] = clip.get("text", "").strip().endswith(('.', '!', '?'))
+                    if "rank_primary" not in clip:
+                        clip["rank_primary"] = clips.index(clip)
+                
+                # Choose default clip for cached clips
+                from services.clip_score import choose_default_clip
+                default_clip_id = choose_default_clip(clips)
                 logger.info(f"Using cached clips for episode {episode_id}: {len(clips)} clips")
             else:
                 # Fallback: generate clips if not available (shouldn't happen)
                 logger.warning(f"No cached clips found for episode {episode_id}, generating now...")
-                clips = await clip_score_service.get_candidates(episode_id)
+                clips, default_clip_id = await clip_score_service.get_candidates(episode_id)
             
             # Import preview service
             from services.preview_service import ensure_preview, get_episode_media_path
@@ -1109,7 +1125,8 @@ async def get_episode_clips(episode_id: str, regenerate: bool = False, backgroun
                                 start_sec=start_sec,
                                 end_sec=end_sec,
                                 max_preview_sec=min(30.0, end_sec - start_sec or 20.0),
-                                pad_start_sec=0.0,
+                                pad_start_sec=-0.08,  # Fix E: -80ms start padding
+                                pad_end_sec=0.24,     # Fix E: +240ms end padding
                             )
                             if generated_url:
                                 preview_url = generated_url
@@ -1120,6 +1137,24 @@ async def get_episode_clips(episode_id: str, regenerate: bool = False, backgroun
                             logger.error(f"Preview generation failed for clip {clip_id}: {e}")
                             # Continue without preview
                 
+                # Calculate duration and add debug fields
+                duration_s = round(end_sec - start_sec, 1)
+                preview_duration_s = None
+                slice_src = "variant_cut" if duration_s > 12.0 else "default"
+                
+                # Try to get actual preview duration if preview exists
+                if preview_url and preview_path.exists():
+                    try:
+                        import subprocess
+                        result = subprocess.run([
+                            "ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+                            "-of", "csv=p=0", str(preview_path)
+                        ], capture_output=True, text=True, timeout=5)
+                        if result.returncode == 0:
+                            preview_duration_s = round(float(result.stdout.strip()), 1)
+                    except:
+                        pass
+                
                 formatted_clips.append({
                     "id": clip_id,
                     "title": clip.get("title", f"Clip {i+1}"),
@@ -1127,19 +1162,38 @@ async def get_episode_clips(episode_id: str, regenerate: bool = False, backgroun
                     "score": clip.get("score", 0),
                     "start_time": start_sec,
                     "end_time": end_sec,
-                    "duration": end_sec - start_sec,
+                    "duration": duration_s,
+                    "duration_s": duration_s,  # Explicit field for frontend
+                    "preview_duration_s": preview_duration_s,  # Server-measured duration
+                    "slice_src": slice_src,  # "variant_cut" vs "default"
+                    "protected": clip.get("protected", False),  # Protected flag
+                    "protected_long": clip.get("protected_long", False),  # Fix A: protected_long flag
+                    "rank_primary": clip.get("rank_primary", i),  # Fix A: explicit ranking
                     "reason": clip.get("reason", ""),
                     "features": clip.get("features", {}),
                     "is_advertisement": clip.get("is_advertisement", False),
-                    "previewUrl": preview_url  # Add preview URL
+                    "previewUrl": preview_url
                 })
+            
+            # Server-side assertions (don't regress checks)
+            previews_generated = [c for c in formatted_clips if c.get("previewUrl")]
+            logger.info(f"PREVIEW_ASSERT: generated {len(previews_generated)}/{len(formatted_clips)} previews")
+            
+            # Check for duration drift warnings
+            for clip in formatted_clips:
+                if clip.get("preview_duration_s") and clip.get("duration_s"):
+                    intended = clip["duration_s"]
+                    actual = clip["preview_duration_s"]
+                    drift = abs(actual - intended)
+                    if drift > 0.4:  # Warn if drift > 400ms
+                        logger.warning(f"PREVIEW_DRIFT: clip {clip['id']} intended={intended:.3f}s actual={actual:.3f}s drift={drift:.3f}s")
             
             # Add ETag and caching for immutable clips
             import json
             import hashlib
             from fastapi.responses import JSONResponse
             
-            payload = {"ok": True, "ready": True, "clips": formatted_clips}
+            payload = {"ok": True, "ready": True, "clips": formatted_clips, "default_clip_id": default_clip_id}
             body = json.dumps(formatted_clips, sort_keys=True, separators=(",",":")).encode()
             etag = hashlib.md5(body).hexdigest()
             
@@ -1193,7 +1247,7 @@ async def force_generate_candidates():
             return {"ok": False, "error": "No transcript available for latest episode"}
         
         # Generate candidates
-        candidates = await clip_score_service.get_candidates(
+        candidates, _ = await clip_score_service.get_candidates(
             latest_episode.id, 
             platform="tiktok_reels"
         )

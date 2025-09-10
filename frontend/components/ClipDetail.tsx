@@ -62,10 +62,18 @@ export default function ClipDetail({ clip, open, onClose }: Props) {
 
         <div className="grid gap-4 sm:grid-cols-2">
           <div className="rounded-xl border border-neutral-200 p-4">
-            <h3 className="mb-2 text-sm font-medium text-neutral-600">Transcript</h3>
-            <div className="max-h-44 overflow-auto whitespace-pre-wrap text-sm leading-relaxed text-neutral-800">
-              {clip.text || "No transcript available."}
+            <h3 className="mb-2 text-sm font-medium text-neutral-600">Full Transcript</h3>
+            <div className="max-h-64 overflow-auto whitespace-pre-wrap text-sm leading-relaxed text-neutral-800 bg-neutral-50 p-3 rounded-lg">
+              {clip.full_transcript || clip.text || "No transcript available."}
             </div>
+            {clip.raw_text && clip.raw_text !== clip.text && (
+              <div className="mt-2">
+                <h4 className="text-xs font-medium text-neutral-500 mb-1">Raw Text (for audio matching)</h4>
+                <div className="text-xs text-neutral-600 bg-neutral-100 p-2 rounded">
+                  {clip.raw_text}
+                </div>
+              </div>
+            )}
           </div>
 
           <div className="rounded-xl border border-neutral-200 p-4 space-y-3">
