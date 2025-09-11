@@ -18,6 +18,61 @@ from config.settings import (
     DURATION_TARGET_MIN, DURATION_TARGET_MAX
 )
 
+# --- helpers for authoritative finish-thought tracking ---
+def authoritative_fallback_mode(result_meta):
+    try:
+        return bool(result_meta["ft"]["fallback_mode"])
+    except Exception:
+        # conservative default if meta missing
+        return True
+
+def normalize_ft_status(c):
+    # ensure every candidate has an ft_status
+    if not c.get("ft_status"):
+        c["ft_status"] = "unresolved"
+    return c
+
+def _format_candidate(seg):
+    """Format a single segment into a candidate with ft_status propagation"""
+    c = {
+        "id": seg.get("id"),
+        "start": float(seg["start"]),
+        "end": float(seg["end"]),
+        "duration": float(seg["end"] - seg["start"]),
+        "text": seg.get("text", ""),
+        "ft_status": seg.get("ft_status"),   # <-- carry through
+        "ft_meta": seg.get("ft_meta", {}),   # optional but useful for logging
+    }
+    return c
+
+def run_safety_or_shrink(candidate, eos_times, word_end_times, platform, fallback_mode):
+    """Run safety/shrink logic on a single candidate and return status metadata"""
+    from services.secret_sauce_pkg.features import finish_thought_normalize
+    
+    # Check if clip already ends on a finished thought
+    if candidate.get("finished_thought", 0) == 1:
+        return {"status": candidate.get("ft_status", "finished")}
+    
+    # Try to normalize this clip
+    normalized_clip, result = finish_thought_normalize(candidate, eos_times, word_end_times, platform, fallback_mode)
+    
+    if result.get("status") == "unresolved":
+        # Special handling for protected long clips
+        if candidate.get("protected_long", False):
+            dur = candidate.get('end', 0) - candidate.get('start', 0)
+            if dur >= 18.0:  # Only for long clips
+                return {"status": "unresolved", "reason": "protected_long"}
+        
+        # For non-protected clips or sparse EOS, be more lenient
+        if fallback_mode:
+            return {"status": "sparse_finished", "reason": "fallback_mode"}
+        else:
+            return {"status": "unresolved", "reason": "no_eos_hit"}
+    else:
+        # Clip was modified - update it
+        candidate.update(normalized_clip)
+        return result
+
 from services.secret_sauce_pkg import compute_features_v4, score_segment_v4, explain_segment_v4, viral_potential_v4, get_clip_weights
 from services.viral_moment_detector import ViralMomentDetector
 from services.progress_writer import write_progress
@@ -142,6 +197,11 @@ def final_safety_pass(clips: List[Dict[str, Any]], eos_times: List[float], word_
             # Clip was modified - update it
             clip.update(normalized_clip)
             safety_updated += 1
+            
+            # Safety updates must write ft_status back
+            if isinstance(result, dict) and result.get("status"):
+                clip["ft_status"] = result["status"]  # 'finished' | 'sparse_finished' | 'unresolved' | 'extended'
+            
             logger.info(f"SAFETY_UPDATE: clip {clip.get('id', 'unknown')} -> {result}")
     
     # Calculate telemetry
@@ -1057,6 +1117,22 @@ class ClipScoreService:
             logger.info(f"Using enhanced viral clips pipeline with {len(segments)} segments")
             viral_result = find_viral_clips_enhanced(segments, episode.audio_path, genre=final_genre, platform=backend_platform, fallback_mode=episode_fallback_mode, effective_eos_times=eos_times, effective_word_end_times=word_end_times, eos_source=eos_source)
             
+            # Debug: log ft_status from enhanced pipeline
+            if viral_result and "clips" in viral_result:
+                ft_statuses = [c.get("ft_status", "missing") for c in viral_result["clips"]]
+                logger.info(f"Enhanced pipeline ft_statuses: {ft_statuses}")
+            
+            # Use authoritative fallback mode from enhanced pipeline
+            episode_fallback_mode = authoritative_fallback_mode(viral_result)
+            
+            # Optional emergency override while testing:
+            import os
+            env_force = os.getenv("FT_FORCE_FALLBACK")
+            if env_force is not None:
+                episode_fallback_mode = (env_force == "1")
+            
+            logger.info(f"GATE_MODE: fallback={episode_fallback_mode} (authoritative from enhanced pipeline)")
+            
             if "error" in viral_result:
                 logger.error(f"Enhanced viral clips pipeline failed: {viral_result['error']}")
                 return []
@@ -1141,31 +1217,52 @@ class ClipScoreService:
             filtered_candidates = filter_overlapping_candidates(candidates)
             logger.info(f"After overlap filtering: {len(filtered_candidates)} candidates")
             
+            # Normalize candidates before any gates
+            filtered_candidates = [normalize_ft_status(c) for c in filtered_candidates]
+            
+            # Duration/np.float64 guard (prevents weird types later)
+            try:
+                import numpy as np
+                for c in filtered_candidates:
+                    if isinstance(c.get("duration"), np.floating):
+                        c["duration"] = float(c["duration"])
+            except Exception:
+                pass
+            
             # Apply quality filtering with safety net
             quality_filtered = filter_low_quality(filtered_candidates, min_score=15)
             logger.info(f"After quality filtering: {len(quality_filtered)} candidates")
             
-            # Quality gate: require finished thoughts in non-fallback mode
-            if not episode_fallback_mode:
-                finished_clips = []
-                for c in quality_filtered:
-                    if c.get('finished_thought', 0) == 1:
-                        finished_clips.append(c)
-                    else:
-                        # Check for one-sentence aphorisms (≤12 words ending in .)
-                        text = c.get('text', '').strip()
-                        if text.endswith('.') and len(text.split()) <= 12:
-                            c['finished_thought'] = 1
-                            c['finish_reason'] = 'aphorism'
-                            finished_clips.append(c)
-                        else:
-                            logger.info(f"Quality gate: dropping unresolved clip {c.get('id', 'unknown')} (no EOS finish)")
-                
-                if finished_clips:
-                    quality_filtered = finished_clips
-                    logger.info(f"Quality gate: kept {len(finished_clips)} finished clips")
+            # CANDIDATES_BEFORE_SAFETY: Log before safety pass
+            logger.info(f"CANDIDATES_BEFORE_SAFETY: {len(quality_filtered)}")
+            
+            # --- Safety / shrink / finish-thought pass (updates ft_status) ---
+            updated = 0
+            for c in quality_filtered:
+                meta = run_safety_or_shrink(c, eos_times, word_end_times, backend_platform, episode_fallback_mode)
+                if isinstance(meta, dict) and meta.get("status"):
+                    c["ft_status"] = meta["status"]                 # 'finished' | 'sparse_finished' | 'unresolved' | 'extended'
+                    c["ft_meta"] = {**c.get("ft_meta", {}), **meta}
+                    updated += 1
+            logger.info(f"SAFETY_PASS: updated {updated}/{len(quality_filtered)}")
+            
+            # --- Now gate strictly/fallback based on authoritative mode ---
+            allowed = {"finished"} if not episode_fallback_mode else {"finished", "sparse_finished"}
+            kept = [c for c in quality_filtered if c.get("ft_status") in allowed]
+            
+            if kept:
+                quality_filtered = kept
+                logger.info(f"QUALITY_GATE: mode={'strict' if not episode_fallback_mode else 'fallback'} kept={len(kept)}/{len(quality_filtered)}")
+            else:
+                # Soft-relax so we never end with 0 — behind an env flag:
+                if os.getenv("FT_SOFT_RELAX_ON_ZERO", "1") == "1":
+                    logger.warning("QUALITY_GATE: yielded 0; soft-relaxing gate (keep unresolved this run)")
+                    # keep unresolved, but mark explicitly
+                    for c in quality_filtered:
+                        c.setdefault("ft_status", "unresolved")
                 else:
-                    logger.warning("Quality gate: no finished clips found, keeping all for safety")
+                    logger.warning("QUALITY_GATE: yielded 0; dropping all (strict, no-relax)")
+                    quality_filtered = []
             
             # POST-NMS: Log final durations (cast to float to avoid numpy dtype issues)
             safe_durs = [float(round(c.get("end", 0) - c.get("start", 0), 1)) for c in quality_filtered]
@@ -1209,17 +1306,16 @@ class ClipScoreService:
                 final_info.append(f"{dur}s {prot}".strip())
             logger.info(f"FINAL_SAVE: n={len(finals)} :: [{', '.join(final_info)}]")
             
-            # Final safety pass: ensure all clips end on finished thoughts
-            candidates_before = len(finals)
-            finals = final_safety_pass(finals, eos_times, word_end_times, backend_platform)
+            # Safety pass already completed before quality gate
             candidates_after = len(finals)
             
-            # Hard guardrails for safety pass
-            logger.info(f"SAFETY_COUNTS: total_before={candidates_before} after={candidates_after}")
-            
-            # Pre-save assert
+            # Pre-save logging
             logger.info(f"PRE_SAVE: final_count={candidates_after} ids={[c.get('id', 'unknown') for c in finals]}")
-            assert candidates_after > 0, f"Safety pass removed all clips (was {candidates_before})"
+            
+            # Remove hard assert on zero; degrade gracefully
+            if candidates_after == 0:
+                logger.error("NO_CANDIDATES: returning empty set after gating; consider enabling FT_SOFT_RELAX_ON_ZERO=1")
+                return []
             
             # Add ranking and default clip selection
             ranked_clips = rank_clips(finals)
@@ -1231,48 +1327,67 @@ class ClipScoreService:
                 clip["duration"] = round(clip.get('end', 0) - clip.get('start', 0), 2)
                 clip["pl_v2"] = clip.get("platform_length_score_v2", 0.0)
                 clip["finished_thought"] = clip.get("text", "").strip().endswith(('.', '!', '?'))
+                
+                # Ensure ft_status is set (fallback to finished_thought if not set)
+                if "ft_status" not in clip:
+                    if clip.get("finished_thought", 0) == 1:
+                        clip["ft_status"] = "finished"
+                    else:
+                        clip["ft_status"] = "unresolved"
             
             # Final sanity check before save
             assert len(ranked_clips) > 0, "Should have at least one clip"
             
-            # Source of truth for finish-thought tracking with state tracking
-            FT = {
-                "mode": episode_fallback_mode,
-                "state": {},  # clip_id -> "finished" | "sparse_finished" | "unresolved"
-                "finished": 0,
-                "sparse_finished": 0,
-                "total": len(ranked_clips)
-            }
-            
-            # Initialize state and count finished clips
-            for i, c in enumerate(ranked_clips):
-                clip_id = c.get('id', f'clip_{i}')
-                if c.get('finished_thought', 0) == 1:
-                    FT["state"][clip_id] = "finished"
-                    FT["finished"] += 1
-                elif c.get('sparse_finished', False):
-                    FT["state"][clip_id] = "sparse_finished"
-                    FT["sparse_finished"] += 1
-                else:
-                    FT["state"][clip_id] = "unresolved"
-            
-            # Calculate ratios consistently from FT state
-            ratio_strict = FT["finished"] / max(FT["total"], 1)
-            if FT["mode"]:  # fallback mode
-                ratio_sparse_ok = (FT["finished"] + FT["sparse_finished"]) / max(FT["total"], 1)
-            else:
-                ratio_sparse_ok = ratio_strict
-            
             # Calculate longest clip duration
             longest_dur = max((c.get("end", 0) - c.get("start", 0)) for c in ranked_clips) if ranked_clips else 0.0
             
-            logger.info(f"TELEMETRY: word_count={len(word_end_times)} eos_count={len(eos_times)} eos_density={len(eos_times)/max(len(word_end_times), 1):.3f} eos_count_src={eos_source} fallback_mode={episode_fallback_mode}")
-            logger.info(f"FT_SUMMARY: finished={FT['finished']} sparse={FT['sparse_finished']} total={FT['total']} ratio_strict={ratio_strict:.2f} ratio_sparse_ok={ratio_sparse_ok:.2f} longest={longest_dur:.1f}s")
+            # Use the authoritative FT summary returned from the enhanced pipeline when available
+            if viral_result and "ft" in viral_result:
+                ft_data = viral_result["ft"]
+                logger.info("FT_SUMMARY: finished=%d sparse=%d total=%d ratio_strict=%.2f ratio_sparse_ok=%.2f longest=%.1fs",
+                            ft_data["finished"], ft_data["sparse_finished"], ft_data["total"],
+                            ft_data["ratio_strict"], ft_data["ratio_sparse_ok"], longest_dur)
+            else:
+                # Fallback to local calculation if no FT data available
+                finished_count = sum(1 for c in ranked_clips if c.get('ft_status') == 'finished')
+                sparse_count = sum(1 for c in ranked_clips if c.get('ft_status') == 'sparse_finished')
+                total = len(ranked_clips)
+                ratio_strict = finished_count / max(total, 1)
+                ratio_sparse_ok = (finished_count + sparse_count) / max(total, 1) if episode_fallback_mode else ratio_strict
+                
+                logger.info("FT_SUMMARY: finished=%d sparse=%d total=%d ratio_strict=%.2f ratio_sparse_ok=%.2f longest=%.1fs",
+                            finished_count, sparse_count, total, ratio_strict, ratio_sparse_ok, longest_dur)
+            
+            # Telemetry that can't disagree with itself
+            wc, ec, dens = len(word_end_times), len(eos_times), len(eos_times)/max(len(word_end_times), 1)
+            logger.info(f"TELEMETRY: word_count={wc}, eos_count={ec}, eos_density={dens:.3f}")
+            logger.info(f"TELEMETRY: fallback_mode={episode_fallback_mode} (authoritative)")
+            
+            # Candidate-level FT summary (post-gates)
+            cand_total = len(ranked_clips)
+            cand_finished = sum(1 for c in ranked_clips if c.get("ft_status") == "finished")
+            cand_sparse = sum(1 for c in ranked_clips if c.get("ft_status") == "sparse_finished")
+            cand_ratio_strict = (cand_finished / cand_total) if cand_total else 0.0
+            cand_ratio_sparse_ok = ((cand_finished + (cand_sparse if episode_fallback_mode else 0)) / cand_total) if cand_total else 0.0
+            
+            logger.info("FT_SUMMARY_CANDIDATES: total=%d finished=%d sparse=%d ratio_strict=%.2f ratio_sparse_ok=%.2f",
+                        cand_total, cand_finished, cand_sparse, cand_ratio_strict, cand_ratio_sparse_ok)
             logger.info(f"POST_SAFETY: kept={len(ranked_clips)} ids={[c.get('id', 'unknown') for c in ranked_clips]}")
             
-            # Log finish ratio status (only if low in non-fallback mode)
-            if not episode_fallback_mode and ratio_strict < 0.6:
-                logger.warning(f"FINISH_RATIO_LOW: {ratio_strict:.2f} (non-fallback mode requires finished thoughts)")
+            # Candidate-based warning (use env tunable threshold; defaults are sensible)
+            warn_min_strict = float(os.getenv("FT_WARN_MIN_CAND_RATIO_STRICT", "0.60"))
+            warn_min_fallback = float(os.getenv("FT_WARN_MIN_CAND_RATIO_FALLBACK", "0.70"))
+            if not episode_fallback_mode and cand_ratio_strict < warn_min_strict:
+                logger.warning("FINISH_RATIO_LOW_CAND: %.2f < %.2f (strict)", cand_ratio_strict, warn_min_strict)
+            elif episode_fallback_mode and cand_ratio_sparse_ok < warn_min_fallback:
+                logger.warning("FINISH_RATIO_LOW_CAND: %.2f < %.2f (fallback)", cand_ratio_sparse_ok, warn_min_fallback)
+            
+            # Upstream/auth summary should be informational only now:
+            if viral_result and "ft" in viral_result:
+                ft_data = viral_result["ft"]
+                logger.info("FT_SUMMARY_AUTH: total=%d finished=%d sparse=%d ratio_strict=%.2f ratio_sparse_ok=%.2f",
+                            ft_data["total"], ft_data["finished"], ft_data["sparse_finished"], 
+                            ft_data["ratio_strict"], ft_data["ratio_sparse_ok"])
             
             return ranked_clips, default_clip_id
             

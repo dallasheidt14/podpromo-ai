@@ -158,6 +158,10 @@ def format_candidates(
             # Enhanced features from the new formatter
             **enhanced_candidate,
             
+            # Carry through ft_status from enhanced pipeline
+            "ft_status": seg.get("ft_status"),   # <-- carry through
+            "ft_meta": seg.get("ft_meta", {}),   # optional but useful for logging
+            
             # Legacy display fields for backward compatibility
             "Viral Potential": seg.get("display_score", 0),
             "Hook Power": enhanced_candidate.get("hook_score", 0.0) * 100,

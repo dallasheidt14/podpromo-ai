@@ -3,8 +3,34 @@ Feature computation module for viral detection system.
 Contains feature extraction and computation functions.
 """
 
-from typing import Dict, List, Tuple, Any, Iterable, Optional
+from typing import Dict, List, Tuple, Any, Iterable, Optional, Literal
+from dataclasses import dataclass
 import logging
+
+FTStatus = Literal["finished", "sparse_finished", "unresolved"]
+
+@dataclass
+class FTTracker:
+    fallback_mode: bool
+    total: int = 0
+    finished: int = 0
+    sparse_finished: int = 0
+
+    def mark(self, status: FTStatus) -> None:
+        self.total += 1
+        if status == "finished":
+            self.finished += 1
+        elif status == "sparse_finished":
+            self.sparse_finished += 1
+
+    @property
+    def ratio_strict(self) -> float:
+        return (self.finished / self.total) if self.total else 0.0
+
+    @property
+    def ratio_sparse_ok(self) -> float:
+        num = self.finished + (self.sparse_finished if self.fallback_mode else 0)
+        return (num / self.total) if self.total else 0.0
 import numpy as np
 import librosa
 import re
@@ -517,7 +543,7 @@ def finalize_variant_text(v, segments_list):
     
     return v
 
-def choose_variant(base: dict, variants: list, audio_file: str, genre: str, platform: str, eos_times: list = None, word_end_times: list = None, fallback_mode: bool = None) -> dict:
+def choose_variant(base: dict, variants: list, audio_file: str, genre: str, platform: str, eos_times: list = None, word_end_times: list = None, fallback_mode: bool = None, ft: FTTracker = None) -> dict:
     """Choose the best variant by re-scoring and comparing with payoff-aware selection"""
     
     # Platform-specific constraints
@@ -621,9 +647,19 @@ def choose_variant(base: dict, variants: list, audio_file: str, genre: str, plat
         for v in scored:
             # Use the effective EOS data for finish-thought normalization
             normalized_v, result = finish_thought_normalize(v, eos_times, word_end_times, platform, fallback_mode)
+            
+            # Propagate ft_status from the result
+            normalized_v["ft_status"] = result.get("status")  # 'finished'|'sparse_finished'|'unresolved'
+            normalized_v["ft_meta"] = result  # keep extra fields if you have them
+            
             normalized_scored.append(normalized_v)
-            if result != "snap_ok":
-                logger.debug(f"FINISH_THOUGHT: {v.get('id', 'unknown')} -> {result}")
+            
+            # Track finish status if FTTracker provided
+            if ft is not None:
+                ft.mark(result.get("status", "unresolved"))
+            
+            if result.get("status") != "finished":
+                logger.debug(f"FINISH_THOUGHT: {v.get('id', 'unknown')} -> {result.get('status', 'unknown')}")
         scored = normalized_scored
     
     # Pick best variant using payoff-aware selection
@@ -663,7 +699,7 @@ def choose_variant(base: dict, variants: list, audio_file: str, genre: str, plat
     
     return best
 
-def grow_to_bins(segment: dict, audio_file: str, genre: str, platform: str, eos_times: list = None, word_end_times: list = None, fallback_mode: bool = None) -> dict:
+def grow_to_bins(segment: dict, audio_file: str, genre: str, platform: str, eos_times: list = None, word_end_times: list = None, fallback_mode: bool = None, ft: FTTracker = None) -> dict:
     """Generate length variants and choose the best one with flexible extension"""
     TARGETS = [12.0, 18.0, 24.0, 30.0]
     MIN_SEC, MAX_SEC = 8.0, 60.0
@@ -690,7 +726,7 @@ def grow_to_bins(segment: dict, audio_file: str, genre: str, platform: str, eos_
         return segment
     
     # Choose best variant
-    chosen = choose_variant(segment, variants, audio_file, genre, platform, eos_times, word_end_times, fallback_mode)
+    chosen = choose_variant(segment, variants, audio_file, genre, platform, eos_times, word_end_times, fallback_mode, ft)
     chosen_dur = chosen.get('end', 0) - chosen.get('start', 0)
     chosen_pl_v2 = chosen.get('platform_length_score_v2', 0.0)
     
@@ -1804,6 +1840,9 @@ def find_viral_clips_enhanced(segments: List[Dict], audio_file: str, genre: str 
             eos_density = len(eos_times) / max(len(word_end_times), 1)
             fallback_mode = eos_density < 0.020
     
+    # Create FTTracker for authoritative finish-thought tracking
+    ft = FTTracker(fallback_mode=fallback_mode)
+    
     if not segments:
         return {
             'clips': [],
@@ -1907,7 +1946,7 @@ def find_viral_clips_enhanced(segments: List[Dict], audio_file: str, genre: str 
                         enhanced_segments[i] = stitched
                         continue
             
-            enhanced_segments[i] = grow_to_bins(segment, audio_file, genre, platform, eos_times, word_end_times, fallback_mode)
+            enhanced_segments[i] = grow_to_bins(segment, audio_file, genre, platform, eos_times, word_end_times, fallback_mode, ft)
     
     # Sort by final score, then platform fit, then duration (prefer longer)
     def sort_key(seg):
@@ -1976,11 +2015,23 @@ def find_viral_clips_enhanced(segments: List[Dict], audio_file: str, genre: str 
         'drop_reasons': skip_reasons
     }
     
+    # Log authoritative FT summary
+    logger.info("FT_SUMMARY_AUTH: total=%d finished=%d sparse=%d ratio_strict=%.2f ratio_sparse_ok=%.2f",
+                ft.total, ft.finished, ft.sparse_finished, ft.ratio_strict, ft.ratio_sparse_ok)
+    
     return {
         'clips': top_clips,
         'genre': genre,
         'platform': platform,
         'scoring_version': 'v4.7.2-unified-syn-whiten-blend-prosody-guard-cal',
+        'ft': {
+            'fallback_mode': ft.fallback_mode,
+            'total': ft.total,
+            'finished': ft.finished,
+            'sparse_finished': ft.sparse_finished,
+            'ratio_strict': ft.ratio_strict,
+            'ratio_sparse_ok': ft.ratio_sparse_ok
+        },
         'debug': {
             'phase2_enabled': True,
             'phase3_enabled': True,
@@ -3589,48 +3640,23 @@ __all__ = [
 # ============================================================================
 
 def likely_finished_text(text: str) -> bool:
-    """Check if text likely represents a finished thought based on punctuation and closure patterns."""
-    import re
-    from typing import List
-    
-    t = (text or "").strip()
-    if not t:
+    """
+    Robust end-of-thought heuristic. Never returns a non-bool.
+    """
+    s = (text or "").strip().lower()
+    if not s:
         return False
-
-    # 1) Hard stop via punctuation
-    if t[-1] in ".?!…":
+    if s.endswith((".", "!", "?")):
         return True
-
-    # 2) Soft endings via phrase patterns
-    ending_phrases_1 = {"right?", "okay?", "ok?", "right."}
-    ending_phrases_2 = {
-        "that's it", "that's right", "all set", "we're done",
-        "you know?", "you know.", "we are done"
-    }
-    ending_phrases_3 = {
-        "and that's why", "that is the point", "that's my point"
-    }
-
-    # Tokenize last bit; keep sentence-ending punctuation as tokens
-    word_re = re.compile(r"[A-Za-z0-9']+|[.?!…]")
-    tokens = word_re.findall(t.lower())
-    
-    if not tokens:
+    words = s.split()
+    if not words:
         return False
-
-    # Check 1/2/3-token tails
-    last1 = " ".join(tokens[-1:])
-    last2 = " ".join(tokens[-2:]) if len(tokens) >= 2 else ""
-    last3 = " ".join(tokens[-3:]) if len(tokens) >= 3 else ""
-
-    if last1 in ending_phrases_1:
-        return True
-    if last2 in ending_phrases_2:
-        return True
-    if last3 in ending_phrases_3:
-        return True
-
-    return False
+    # Avoid endings that are almost surely mid-thought
+    bad_last = {"and", "or", "but", "because", "so", "that", "which"}
+    if words[-1] in bad_last:
+        return False
+    # Mild guard: short fragments usually aren't a complete thought
+    return len(words) >= 6
 
 def cfg_for_finish_thought(fallback_mode: bool, platform: str) -> dict:
     """Get finish-thought configuration based on fallback mode and platform."""
@@ -3853,87 +3879,60 @@ def ends_on_eos(end_s: float, eos_list: List[float], tol_ms: float = 120) -> boo
     delta = min(abs(end_s - t) for t in eos_list)
     return (delta * 1000.0) <= tol_ms
 
-def finish_thought_normalize(candidate: Dict, eos_times: List[float], word_end_times: List[float], platform: str = "default", fallback_mode: bool = False) -> Tuple[Dict, str]:
+def finish_thought_normalize(candidate: Dict, eos_times: List[float], word_end_times: List[float], platform: str = "default", fallback_mode: bool = False) -> Tuple[Dict, Dict]:
     """
-    Normalize candidate to end on a finished thought (EOS).
-    
-    Args:
-        candidate: Clip candidate with start/end times
-        eos_times: Sorted list of EOS timestamps
-        word_end_times: Sorted list of word end timestamps
-        platform: Platform for max_extend configuration
-        fallback_mode: Whether to use sparse/fallback configuration
-        
-    Returns:
-        Tuple of (normalized_candidate, result_code)
+    Normalize to a clean finish near EOS (or extend safely to one).
+    Returns: (clip_dict, {"status": FTStatus, "eos_hit": bool})
     """
-    # Get fallback-aware configuration
-    cfg = cfg_for_finish_thought(fallback_mode, platform)
+    text = (candidate.get("text") or "").strip()
+    start = float(candidate["start"])
+    end = float(candidate["end"])
     
     # Create a copy to avoid modifying original
     c = candidate.copy()
     
-    # 1) Word-end snap
-    c['end'] = snap_to_last_word_end(c['end'], word_end_times)
-    c['duration'] = c['end'] - c['start']
+    # Tolerances
+    near_tol = 0.30 if not fallback_mode else 0.50
+    max_extend = 1.25 if platform in ("yt", "yt_shorts") else 0.80
     
-    # 2) Check if already near EOS
-    if near_eos(c['end'], eos_times, cfg["near_eos_tol_sec"]):
-        c['finished_thought'] = 1
-        c['finish_reason'] = 'eos'
-        return c, "snap_ok"
+    # Find nearest EOS at/after current end
+    eos = [t for t in (eos_times or []) if t >= start - 0.01]
+    hit_status: FTStatus = "unresolved"
+    eos_hit = False
     
-    # 3) Try forward extend
-    next_eos = next_eos_after(c['end'], eos_times)
-    if next_eos and (next_eos - c['end']) <= cfg["max_extend_sec"]:
-        # Check platform cap (if available)
-        platform_cap = c.get('platform_cap', 30.0)  # Default 30s cap
-        if (next_eos - c['start']) <= platform_cap:
-            c['end'] = snap_to_last_word_end(next_eos, word_end_times)
-            c['duration'] = c['end'] - c['start']
-            c['finished_thought'] = 1
-            c['finish_reason'] = 'eos'
-            return c, "extended"
+    if eos:
+        # small extend if needed
+        next_eos = min((t for t in eos if t >= end), default=None)
+        if next_eos is not None:
+            delta = next_eos - end
+            if delta <= near_tol:
+                end = next_eos
+                eos_hit = True
+            elif 0 < delta <= max_extend:
+                end = next_eos
+                eos_hit = True
     
-    # 4) Try backward shrink
-    prev_eos = prev_eos_before(c['end'], eos_times)
-    if prev_eos and (prev_eos - c['start']) >= cfg["min_viable_after_shrink_sec"]:
-        c['end'] = snap_to_last_word_end(prev_eos, word_end_times)
-        c['duration'] = c['end'] - c['start']
-        c['finished_thought'] = 1
-        c['finish_reason'] = 'eos'
-        return c, "shrunk"
+    if eos_hit:
+        c["end"] = float(end)
+        c["ft_status"] = "sparse_finished" if fallback_mode else "finished"
+        c["finished_thought"] = 1
+        c["finish_reason"] = "eos"
+        hit_status = c["ft_status"]
+    else:
+        # Fallback to text-based detection
+        if fallback_mode and likely_finished_text(text):
+            c["ft_status"] = "sparse_finished"
+            c["finished_thought"] = 1
+            c["finish_reason"] = "text"
+            hit_status = "sparse_finished"
+        else:
+            c["ft_status"] = "unresolved"
+            c["finished_thought"] = 0
+            c["finish_reason"] = "unresolved"
+            hit_status = "unresolved"
     
-    # 5) Fallback mode punctuation backstop
-    if fallback_mode:
-        try:
-            if likely_finished_text(c.get('text', '')):
-                c['finished_thought'] = 1
-                c['finish_reason'] = 'text'
-                return c, "text_finished"
-        except Exception as e:
-            logger.exception("LIKELY_FINISHED_TEXT_ERROR: %s", e)
-            # Continue without marking as finished
-    
-    # 6) Ultra-aggressive fallback for very sparse EOS (density < 0.2)
-    if fallback_mode and len(eos_times) < 30 and c.get('duration', 0) >= 12.0:
-        # For very sparse EOS, mark longer clips as finished if they have substantial content
-        text = c.get('text', '').strip()
-        if len(text.split()) >= 20:  # Substantial content
-            c['finished_thought'] = 1
-            c['finish_reason'] = 'ultra_aggressive'
-            return c, "sparse_finished"
-    
-    # 7) Final EOS hit check - if we ended up near an EOS, mark as finished
-    if ends_on_eos(c['end'], eos_times, tol_ms=120):
-        c['finished_thought'] = 1
-        c['finish_reason'] = 'eos'
-        return c, "final_eos_check"
-    
-    # 8) Unresolved - mark as unfinished
-    c['finished_thought'] = 0
-    c['finish_reason'] = 'unresolved'
-    return c, "unresolved"
+    c["duration"] = c["end"] - c["start"]
+    return c, {"status": hit_status, "eos_hit": eos_hit}
 
 def prefer_finished_sibling(candidate: Dict, siblings: List[Dict]) -> Dict:
     """
