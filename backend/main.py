@@ -8,7 +8,7 @@ import uuid
 import logging
 import mimetypes
 from datetime import datetime
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 from concurrent.futures import ProcessPoolExecutor
 
 # Ensure correct MIME type for .m4a files
@@ -641,6 +641,136 @@ async def upload_episode(file: UploadFile = File(...), background_tasks: Backgro
             except Exception as monitoring_error:
                 logger.warning(f"Failed to record monitoring error: {monitoring_error}")
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+
+@app.post("/api/upload-youtube")
+async def upload_youtube_episode(url: str = Form(...), background_tasks: BackgroundTasks = None, request: Request = None):
+    """Upload and process a YouTube video as a podcast episode"""
+    try:
+        # Import required services
+        from services.progress_writer import write_progress
+        from services.youtube_service import youtube_service
+        
+        # Check if services are initialized
+        if not episode_service:
+            logger.error("EpisodeService not initialized")
+            raise HTTPException(status_code=503, detail="Service not ready. Please try again.")
+        
+        # Rate limiting for uploads
+        client_ip = request.client.host if request else "default"
+        check_rate_limit("upload", client_ip)
+        
+        if not url or not isinstance(url, str):
+            raise HTTPException(status_code=400, detail="No YouTube URL provided")
+        
+        # Validate YouTube URL
+        validation_result = youtube_service.validate_youtube_url(url)
+        if not validation_result["valid"]:
+            raise HTTPException(status_code=400, detail=validation_result["error"])
+        
+        video_id = validation_result["video_id"]
+        video_info = validation_result["video_info"]
+        
+        logger.info(f"YouTube upload attempt: {video_id} - {video_info['title']}")
+        
+        # Create episode ID
+        episode_id = str(uuid.uuid4())
+        
+        # Write initial progress
+        write_progress(episode_id, "downloading", 5, f"Downloading video: {video_info['title']}")
+        
+        # Download video in background
+        if background_tasks:
+            background_tasks.add_task(process_youtube_episode, episode_id, video_id, video_info)
+            logger.info(f"YouTube episode {episode_id} queued for background processing")
+        else:
+            # Fallback: process directly if no background tasks
+            logger.warning("No background tasks available, processing YouTube episode directly")
+            await process_youtube_episode(episode_id, video_id, video_info)
+        
+        # Log success to monitoring (if available)
+        if monitoring_service:
+            try:
+                monitoring_service.record_metric("youtube_upload_success", 1)
+            except Exception as e:
+                logger.warning(f"Failed to record monitoring metric: {e}")
+        
+        return {
+            "ok": True, 
+            "episodeId": episode_id, 
+            "videoInfo": {
+                "title": video_info["title"],
+                "duration": video_info["duration"],
+                "uploader": video_info["uploader"],
+                "thumbnail": video_info["thumbnail"]
+            },
+            "message": "YouTube video download started"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"YouTube upload failed: {str(e)}", exc_info=True)
+        # Log error to monitoring service (if available)
+        if monitoring_service:
+            try:
+                monitoring_service.record_error("youtube_upload_failed", str(e))
+            except Exception as monitoring_error:
+                logger.warning(f"Failed to record monitoring error: {monitoring_error}")
+        raise HTTPException(status_code=500, detail=f"YouTube upload failed: {str(e)}")
+
+async def process_youtube_episode(episode_id: str, video_id: str, video_info: Dict[str, Any]):
+    """Process a YouTube video episode (download + transcribe + score)"""
+    try:
+        from services.progress_writer import write_progress
+        from services.youtube_service import youtube_service
+        from services.episode_service import EpisodeService
+        
+        # Update progress
+        write_progress(episode_id, "downloading", 10, "Downloading audio from YouTube...")
+        
+        # Download the video
+        download_result = await youtube_service.download_video(video_id, episode_id)
+        if not download_result:
+            write_progress(episode_id, "error", 0, "Failed to download video")
+            return
+        
+        # Update progress
+        write_progress(episode_id, "downloading", 25, "Video downloaded successfully")
+        
+        # Create a mock UploadFile object for the downloaded file
+        from fastapi import UploadFile
+        from io import BytesIO
+        
+        # Read the downloaded file
+        with open(download_result["file_path"], "rb") as f:
+            file_content = f.read()
+        
+        # Create UploadFile-like object
+        file_obj = UploadFile(
+            file=BytesIO(file_content),
+            filename=download_result["filename"],
+            size=download_result["file_size"]
+        )
+        
+        # Create episode using the downloaded file
+        episode_service = EpisodeService()
+        episode = await episode_service.create_episode(episode_id, file_obj, download_result["filename"])
+        
+        # Update episode with YouTube metadata
+        episode.title = video_info["title"]
+        episode.raw_text = f"YouTube Video: {video_info['title']}\n\n{video_info.get('description', '')}"
+        
+        # Update progress
+        write_progress(episode_id, "uploaded", 30, "Processing YouTube video...")
+        
+        # Process the episode (transcribe + score)
+        await episode_service.process_episode(episode.id)
+        
+        logger.info(f"YouTube episode {episode_id} processed successfully")
+        
+    except Exception as e:
+        logger.error(f"Failed to process YouTube episode {episode_id}: {e}")
+        write_progress(episode_id, "error", 0, f"Processing failed: {str(e)}")
 
 @app.get("/api/episodes")
 async def list_episodes():

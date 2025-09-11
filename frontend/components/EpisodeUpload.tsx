@@ -3,10 +3,10 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
 import { useDropzone } from 'react-dropzone';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Upload, FileAudio, FileVideo, X, CheckCircle, AlertCircle, Clock, Loader2 } from 'lucide-react';
+import { Upload, FileAudio, FileVideo, X, CheckCircle, AlertCircle, Clock, Loader2, Youtube, Link } from 'lucide-react';
 import { Episode, Clip, ProgressInfo } from '@shared/types';
 import { normalizeClip, normalizeProgressInfo, normalizeProgress } from '@shared/normalize';
-import { getClips, uploadFile, handleApiResult } from '@shared/api';
+import { getClips, uploadFile, uploadYouTube, handleApiResult } from '@shared/api';
 import { createProgressPoller, PollingOptions, Poller } from '@shared/polling';
 
 
@@ -25,7 +25,9 @@ export default function EpisodeUpload({
   initialEpisodeId,
   initialUploadStatus = 'idle',
 }: Props) {
+  const [uploadMode, setUploadMode] = useState<'file' | 'youtube'>('file');
   const [uploadedFile, setUploadedFile] = useState<File | null>(null);
+  const [youtubeUrl, setYoutubeUrl] = useState<string>('');
   const [uploadStatus, setUploadStatus] = useState(initialUploadStatus);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
@@ -91,6 +93,96 @@ export default function EpisodeUpload({
         });
     }
   }, [progressData, episodeId, onCompleted]);
+
+  const onYouTubeUpload = useCallback(async (url: string) => {
+    if (uploadStatus === 'uploading') return;
+    if (!url.trim()) return;
+
+    // Reset state
+    if (pollerRef.current) {
+      pollerRef.current.stop();
+      pollerRef.current = null;
+    }
+    
+    setEpisodeId(null);
+    setProgressData(null);
+    setError(null);
+    setUploadStatus('uploading');
+    setUploadProgress(0);
+    didFetchRef.current = false;
+
+    try {
+      // Upload YouTube URL using API
+      const result = await uploadYouTube(url);
+      
+      handleApiResult(
+        result,
+        (data) => {
+          if (process.env.NODE_ENV === 'development') {
+            console.log('[YOUTUBE_UPLOAD] Upload successful, episode ID:', data.episodeId);
+          }
+          const episodeId = data.episodeId;
+
+          setEpisodeId(episodeId);
+          setUploadProgress(25); // Initial progress after upload
+          setUploadStatus('processing');
+          
+          // Start polling for progress
+          const pollingOptions: PollingOptions = {
+            onSuccess: (data) => {
+              const progressInfo = normalizeProgressInfo(data);
+              setProgressData(progressInfo);
+              if (process.env.NODE_ENV === 'development') {
+                console.log(`[POLLING] Updated progress: ${progressInfo?.stage} ${progressInfo?.percentage}%`);
+              }
+            },
+            onError: (error, retryCount) => {
+              if (process.env.NODE_ENV === 'development') {
+                console.error(`[POLLING] Error (attempt ${retryCount}):`, error);
+              }
+              // Don't show error for scoring - it can take 30+ minutes
+              if (retryCount >= 50 && !error.includes('signal timed out')) {
+                setError(`Processing failed: ${error}`);
+              }
+            },
+            on404: () => {
+              if (process.env.NODE_ENV === 'development') {
+                console.log('[POLLING] Episode not found, stopping');
+              }
+              setError('Episode not found');
+              return false;
+            },
+            onComplete: () => {
+              if (process.env.NODE_ENV === 'development') {
+                console.log('[POLLING] Processing completed!');
+              }
+              setUploadStatus('completed');
+              onCompleted?.();
+            }
+          };
+          
+          const poller = createProgressPoller(`http://localhost:8000/api/progress/${episodeId}`, pollingOptions);
+          pollerRef.current = poller;
+          poller.start();
+          
+          onEpisodeUploaded(episodeId);
+        },
+        (error) => {
+          if (process.env.NODE_ENV === 'development') {
+            console.error('[YOUTUBE_UPLOAD] Upload failed:', error);
+          }
+          setError(error);
+          setUploadStatus('error');
+        }
+      );
+    } catch (err: any) {
+      if (process.env.NODE_ENV === 'development') {
+        console.error('[YOUTUBE_UPLOAD] Upload error:', err);
+      }
+      setError(err.message || 'YouTube upload failed');
+      setUploadStatus('error');
+    }
+  }, [uploadStatus, onEpisodeUploaded]);
 
   const onDrop = useCallback(async (acceptedFiles: File[]) => {
     if (uploadStatus === 'uploading') return;
@@ -240,30 +332,100 @@ export default function EpisodeUpload({
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -20 }}
-            className="group relative rounded-2xl border border-neutral-200 bg-white shadow-card p-6 text-center hover:border-blue-400 hover:bg-gradient-to-br hover:from-blue-50 hover:to-purple-50 transition-all duration-500 cursor-pointer hover:shadow-card-hover"
-            {...(getRootProps() as any)}
+            className="rounded-2xl border border-neutral-200 bg-white shadow-card p-6"
           >
-            <input {...getInputProps()} />
-            <div className="relative">
-              <div className="w-24 h-24 bg-gradient-to-br from-blue-100 to-purple-100 rounded-3xl flex items-center justify-center mx-auto mb-8 group-hover:scale-110 transition-transform duration-500 shadow-lg">
-                <Upload className="w-12 h-12 text-blue-600" />
-              </div>
-              <div className="absolute -top-2 -right-2 w-8 h-8 bg-gradient-to-r from-green-500 to-blue-500 rounded-full flex items-center justify-center shadow-lg">
-                <div className="w-3 h-3 bg-white rounded-full"></div>
-              </div>
+            {/* Mode Toggle */}
+            <div className="flex mb-6 bg-gray-100 rounded-xl p-1">
+              <button
+                onClick={() => setUploadMode('file')}
+                className={`flex-1 flex items-center justify-center gap-2 px-4 py-2 rounded-lg transition-all ${
+                  uploadMode === 'file'
+                    ? 'bg-white shadow-sm text-blue-600'
+                    : 'text-gray-600 hover:text-gray-900'
+                }`}
+              >
+                <Upload className="w-4 h-4" />
+                Upload File
+              </button>
+              <button
+                onClick={() => setUploadMode('youtube')}
+                className={`flex-1 flex items-center justify-center gap-2 px-4 py-2 rounded-lg transition-all ${
+                  uploadMode === 'youtube'
+                    ? 'bg-white shadow-sm text-red-600'
+                    : 'text-gray-600 hover:text-gray-900'
+                }`}
+              >
+                <Youtube className="w-4 h-4" />
+                YouTube Link
+              </button>
             </div>
-            <h3 className="text-3xl font-bold text-gray-900 mb-4">
-              {isDragActive ? 'Drop your file here' : 'Upload Your Podcast Episode'}
-            </h3>
-            <p className="text-lg text-gray-600 mb-8 max-w-lg mx-auto leading-relaxed">
-              Drag and drop your audio or video file, or click to browse
-            </p>
-            <div className="inline-flex items-center gap-3 bg-gradient-to-r from-gray-50 to-gray-100 px-6 py-3 rounded-2xl text-sm font-medium text-gray-700 border border-gray-200">
-              <FileAudio className="w-5 h-5 text-blue-500" />
-              <span>MP3, WAV, M4A, MP4, MOV, AVI</span>
-              <span className="text-gray-400">•</span>
-              <span>Max 500MB</span>
-            </div>
+
+            {/* File Upload Mode */}
+            {uploadMode === 'file' && (
+              <div
+                className="group relative rounded-xl border-2 border-dashed border-gray-300 bg-gray-50 p-8 text-center hover:border-blue-400 hover:bg-blue-50 transition-all duration-300 cursor-pointer"
+                {...(getRootProps() as any)}
+              >
+                <input {...getInputProps()} />
+                <div className="relative">
+                  <div className="w-16 h-16 bg-gradient-to-br from-blue-100 to-purple-100 rounded-2xl flex items-center justify-center mx-auto mb-4 group-hover:scale-110 transition-transform duration-300 shadow-lg">
+                    <Upload className="w-8 h-8 text-blue-600" />
+                  </div>
+                </div>
+                <h3 className="text-xl font-bold text-gray-900 mb-2">
+                  {isDragActive ? 'Drop your file here' : 'Upload Your Podcast Episode'}
+                </h3>
+                <p className="text-gray-600 mb-4">
+                  Drag and drop your audio or video file, or click to browse
+                </p>
+                <div className="inline-flex items-center gap-2 bg-white px-4 py-2 rounded-lg text-sm font-medium text-gray-700 border border-gray-200">
+                  <FileAudio className="w-4 h-4 text-blue-500" />
+                  <span>MP3, WAV, M4A, MP4, MOV, AVI</span>
+                  <span className="text-gray-400">•</span>
+                  <span>Max 500MB</span>
+                </div>
+              </div>
+            )}
+
+            {/* YouTube Upload Mode */}
+            {uploadMode === 'youtube' && (
+              <div className="space-y-4">
+                <div className="text-center">
+                  <div className="w-16 h-16 bg-gradient-to-br from-red-100 to-pink-100 rounded-2xl flex items-center justify-center mx-auto mb-4 shadow-lg">
+                    <Youtube className="w-8 h-8 text-red-600" />
+                  </div>
+                  <h3 className="text-xl font-bold text-gray-900 mb-2">
+                    Paste YouTube Link
+                  </h3>
+                  <p className="text-gray-600 mb-4">
+                    Enter a YouTube video URL to download and process
+                  </p>
+                </div>
+                
+                <div className="space-y-3">
+                  <input
+                    type="url"
+                    value={youtubeUrl}
+                    onChange={(e) => setYoutubeUrl(e.target.value)}
+                    placeholder="https://www.youtube.com/watch?v=..."
+                    className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
+                  />
+                  
+                  <button
+                    onClick={() => onYouTubeUpload(youtubeUrl)}
+                    disabled={!youtubeUrl.trim() || uploadStatus !== 'idle'}
+                    className="w-full bg-red-600 hover:bg-red-700 disabled:bg-gray-400 text-white font-medium py-3 px-4 rounded-lg transition-colors flex items-center justify-center gap-2"
+                  >
+                    <Youtube className="w-4 h-4" />
+                    Process YouTube Video
+                  </button>
+                </div>
+                
+                <div className="text-xs text-gray-500 text-center">
+                  Supports YouTube.com and youtu.be links • Max 4 hours • Min 1 minute
+                </div>
+              </div>
+            )}
           </motion.div>
         )}
 

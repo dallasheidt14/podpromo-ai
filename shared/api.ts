@@ -44,6 +44,17 @@ export async function uploadFile(file: File, onProgress?: (percent: number) => v
   return { ok: res.ok, data, error: res.ok ? undefined : data?.error || res.statusText } as ApiResult<any>;
 }
 
+export async function uploadYouTube(url: string) {
+  const form = new FormData();
+  form.append('url', url);
+  const res = await fetch('/api/upload-youtube', {
+    method: 'POST',
+    body: form
+  });
+  const data = await res.json().catch(() => undefined);
+  return { ok: res.ok, data, error: res.ok ? undefined : data?.error || res.statusText } as ApiResult<any>;
+}
+
 export function handleApiResult<T>(result: ApiResult<T>, onSuccess: (data: T) => void, onError: (error: string) => void) {
   if (result.ok && result.data !== undefined) {
     onSuccess(result.data);

@@ -144,6 +144,7 @@ class Episode(BaseModel):
     original_name: str
     size: int
     status: str
+    title: Optional[str] = None  # Episode title (especially for YouTube videos)
     duration: Optional[float] = None
     audio_path: Optional[str] = None
     transcript: Optional[List[TranscriptSegment]] = None

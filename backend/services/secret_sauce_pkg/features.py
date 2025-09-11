@@ -3017,53 +3017,28 @@ def _score_to_grade(score: float) -> str:
     else:
         return 'F'
 
-def _heuristic_title(text: str, feats: dict, cfg: dict, rank: int | None = None) -> str:
-    """Generate heuristic title based on content and features"""
-    # Extract key phrases
-    words = text.split()
-    
-    # Look for key phrases in first 20 words
-    first_20 = words[:20]
-    key_phrases = []
-    
-    # Look for quoted text
-    quoted = re.findall(r'"([^"]*)"', text)
-    if quoted:
-        key_phrases.extend(quoted[:2])
-    
-    # Look for capitalized phrases
-    caps = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', text)
-    if caps:
-        key_phrases.extend(caps[:2])
-    
-    # Look for numbers and statistics
-    numbers = re.findall(r'\b\d+(?:\.\d+)?%?\b', text)
-    if numbers:
-        key_phrases.extend(numbers[:2])
-    
-    # If no key phrases found, use first meaningful words
-    if not key_phrases:
-        # Skip common words
-        meaningful = [w for w in first_20 if w.lower() not in ['the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by']]
-        key_phrases = meaningful[:3]
-    
-    # Create title
-    if key_phrases:
-        title = ' '.join(key_phrases[:3])
-        # Truncate if too long
-        if len(title) > 60:
-            title = title[:57] + '...'
-    else:
-        # Fallback to first few words
-        title = ' '.join(first_20[:5])
-        if len(title) > 60:
-            title = title[:57] + '...'
-    
-    # Add rank if provided
-    if rank is not None:
-        title = f"#{rank}: {title}"
-    
-    return title
+def _heuristic_title(text: str, feats: dict, cfg: dict, rank: int | None = None, avoid: set[str] | None = None) -> str:
+    """Generate heuristic title based on content and features - delegates to new generator"""
+    try:
+        from ..title_service import generate_titles, normalize_platform
+        
+        # Extract platform from features if available
+        platform = "default"
+        if feats and isinstance(feats, dict):
+            platform = feats.get("platform", "default")
+        
+        plat = normalize_platform(platform)
+        variants = generate_titles(text or "", platform=plat, n=6, avoid_titles=(avoid or set()))
+        title = variants[0]["title"] if variants else "Most Leaders Solve the Wrong Problem"
+        
+        # Add rank if provided (maintain backward compatibility)
+        if rank is not None:
+            title = f"#{rank}: {title}"
+        
+        return title
+    except Exception:
+        # never break the pipeline because of titles
+        return "Most Leaders Solve the Wrong Problem"
 
 # Platform and tone mapping features
 PLATFORM_GENRE_MULTIPLIERS = {

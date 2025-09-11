@@ -48,6 +48,8 @@ export interface Clip {
   score: number;
   title: string;
   text: string;
+  raw_text?: string; // Raw text content
+  full_transcript?: string; // Full stitched transcript
   transcript?: string; // Alias for text for compatibility
   status: 'generating' | 'completed' | 'failed';
   downloadUrl?: string;

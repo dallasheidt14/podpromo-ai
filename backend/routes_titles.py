@@ -1,13 +1,14 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from datetime import datetime
 from models_titles import TitleGenRequest, TitleGenResponse, TitleSetRequest
 from services.titles_service import TitlesService
 from services.title_service import generate_titles as advanced_generate_titles
+from services.title_gen import normalize_platform
 
 router = APIRouter(prefix="/api/clips")
 
 @router.post("/{clip_id}/titles", response_model=TitleGenResponse)
-def generate_titles(clip_id: str, body: TitleGenRequest):
+def generate_titles(clip_id: str, body: TitleGenRequest, request: Request):
     svc = TitlesService()
     clip = svc.get_clip(clip_id)
     if not clip:
@@ -18,30 +19,38 @@ def generate_titles(clip_id: str, body: TitleGenRequest):
     if not transcript:
         raise HTTPException(400, "Clip has no transcript")
     
-    # Extract features for better title generation
-    features = {
-        "hook_score": clip.get("hook_score", 0.0),
-        "arousal_score": clip.get("arousal_score", 0.0),
-        "final_score": clip.get("score", 0.0),
-    }
+    # Check for rich API request
+    rich = request.query_params.get("rich") in {"1", "true", "yes"}
     
-    # Generate titles using the advanced service
-    variants = advanced_generate_titles(
-        transcript=transcript,
-        features=features,
-        max_len=80
-    )
+    # Normalize platform
+    platform = normalize_platform(body.platform)
     
-    if not variants:
+    # Generate titles using the new unified generator
+    titles = advanced_generate_titles(transcript, platform=platform, n=6)
+    
+    if not titles:
         # Fallback to simple heuristic if advanced fails
         variants, chosen, meta = svc.generate_variants(clip, body)
     else:
-        chosen = variants[0]
-        meta = {
-            "generator": "advanced",
-            "version": 2,
-            "generated_at": datetime.utcnow().isoformat() + "Z",
-        }
+        if rich:
+            # Rich response with scores and reasons
+            chosen = titles[0]["title"]
+            variants = [t["title"] for t in titles]
+            meta = {
+                "generator": "unified_v2",
+                "version": 2,
+                "generated_at": datetime.utcnow().isoformat() + "Z",
+                "rich_data": titles  # Include full data with scores
+            }
+        else:
+            # Legacy response format
+            chosen = titles[0]["title"]
+            variants = [t["title"] for t in titles]
+            meta = {
+                "generator": "unified_v2",
+                "version": 2,
+                "generated_at": datetime.utcnow().isoformat() + "Z",
+            }
     
     svc.save_titles(clip_id, body.platform, variants, chosen, meta)
     return TitleGenResponse(platform=body.platform, variants=variants, chosen=chosen, meta=meta)

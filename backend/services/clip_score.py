@@ -32,6 +32,85 @@ def normalize_ft_status(c):
         c["ft_status"] = "unresolved"
     return c
 
+def _interval_iou(a_start, a_end, b_start, b_end):
+    inter = max(0.0, min(a_end, b_end) - max(a_start, b_start))
+    union = max(a_end, b_end) - min(a_start, b_start)
+    return inter / union if union > 0 else 0.0
+
+def _finished_rank(meta):
+    s = (meta or {}).get("ft_status")
+    return 2 if s == "finished" else 1 if s == "sparse_finished" else 0
+
+def _length_fit(start, end, target=18.0):
+    return -abs((end - start) - target)
+
+def _dedup_by_time_iou(cands, iou_thresh=0.85, target_len=18.0):
+    if len(cands) <= 1: 
+        return cands
+    # sort: score desc, finished rank desc, length fit (closer to target) desc
+    ordered = sorted(
+        cands,
+        key=lambda c: (
+            c.get("display_score", 0.0),
+            _finished_rank((c.get("meta") or {})),
+            _length_fit(c["start"], c["end"], target_len),
+        ),
+        reverse=True,
+    )
+    kept = []
+    for c in ordered:
+        s, e = c["start"], c["end"]
+        if any(_interval_iou(s, e, k["start"], k["end"]) >= iou_thresh for k in kept):
+            continue
+        kept.append(c)
+    return kept
+
+def _text_similarity(text1: str, text2: str) -> float:
+    """Calculate text similarity using simple word overlap"""
+    if not text1 or not text2:
+        return 0.0
+    
+    # Normalize text: lowercase, remove punctuation, split into words
+    import re
+    words1 = set(re.findall(r'\b\w+\b', text1.lower()))
+    words2 = set(re.findall(r'\b\w+\b', text2.lower()))
+    
+    if not words1 or not words2:
+        return 0.0
+    
+    # Jaccard similarity
+    intersection = len(words1 & words2)
+    union = len(words1 | words2)
+    return intersection / union if union > 0 else 0.0
+
+def _dedup_by_text(cands, text_thresh=0.90):
+    """Remove candidates with similar text content"""
+    if len(cands) <= 1:
+        return cands
+    
+    # Sort by score (best first)
+    ordered = sorted(cands, key=lambda c: c.get("display_score", 0.0), reverse=True)
+    
+    kept = []
+    for c in ordered:
+        text = c.get("text", "") or c.get("transcript", "")
+        if not text:
+            kept.append(c)
+            continue
+            
+        # Check against all kept candidates
+        is_duplicate = False
+        for k in kept:
+            k_text = k.get("text", "") or k.get("transcript", "")
+            if k_text and _text_similarity(text, k_text) >= text_thresh:
+                is_duplicate = True
+                break
+        
+        if not is_duplicate:
+            kept.append(c)
+    
+    return kept
+
 def _format_candidate(seg):
     """Format a single segment into a candidate with ft_status propagation"""
     c = {
@@ -1152,8 +1231,14 @@ class ClipScoreService:
             if len(eos_times) == 0:
                 logger.warning("EOS_FALLBACK_ONLY: No EOS markers found, using fallback mode")
             
+            # Add fallback flag to each candidate for hook honesty cap
+            for clip in clips:
+                clip_meta = clip.get("meta") or {}
+                clip_meta["is_fallback"] = bool(episode_fallback_mode)
+                clip["meta"] = clip_meta
+            
             # Convert to candidate format with title generation and grades
-            candidates = format_candidates(clips, final_genre, backend_platform, episode_id, full_episode_transcript)
+            candidates = format_candidates(clips, final_genre, backend_platform, episode_id, full_episode_transcript, episode)
             logger.info(f"Formatted {len(candidates)} candidates")
             
             # PRE-NMS: Log top 10 before NMS with proper tie-breaking
@@ -1264,6 +1349,66 @@ class ClipScoreService:
                     logger.warning("QUALITY_GATE: yielded 0; dropping all (strict, no-relax)")
                     quality_filtered = []
             
+            # Adaptive quality gate: if we have too few clips, apply relaxed criteria
+            MIN_CLIPS = 3
+            MAX_CLIPS = 5
+            
+            if len(quality_filtered) < MIN_CLIPS:
+                logger.info(f"ADAPTIVE_GATE: only {len(quality_filtered)} clips, applying relaxed criteria")
+                
+                def passes_relaxed(c):
+                    hook = c.get("hook", 0)
+                    payoff = c.get("payoff", 0)
+                    info = c.get("info", 0)
+                    pl_v2 = c.get("platform_length_score_v2", 0)
+                    has_filler = c.get("has_filler", False)
+                    duration = c.get("end", 0) - c.get("start", 0)
+                    platform_max_sec = PLATFORM_LIMITS.get(backend_platform, 30.0)
+                    
+                    # allow strong Hook/Info to compensate for lower Payoff
+                    return (hook >= 0.90 and info >= 0.60 and pl_v2 >= 0.60 and 
+                            (payoff >= 0.12 or (info >= 0.75)) and not has_filler and 
+                            duration <= platform_max_sec)
+                
+                # Get all candidates before quality filtering for relaxed pass
+                all_candidates = [c for c in clips if c.get("score", 0) > 0]
+                relaxed_kept = [c for c in all_candidates if passes_relaxed(c)]
+                
+                # Combine strict + relaxed, deduplicate
+                combined = quality_filtered + relaxed_kept
+                quality_filtered = _dedup_by_time_iou(combined, iou_thresh=0.3, target_len=18.0)
+                quality_filtered = quality_filtered[:MAX_CLIPS]
+                
+                logger.info(f"ADAPTIVE_GATE: added {len(relaxed_kept)} relaxed clips, final count: {len(quality_filtered)}")
+            
+            # Apply temporal deduplication to remove near-duplicate clips
+            iou = float(os.getenv("DEDUP_IOU_THRESHOLD", "0.85"))
+            target_len = float(os.getenv("DEDUP_TARGET_LEN", "18.0"))
+            before = len(quality_filtered)
+            quality_filtered = _dedup_by_time_iou(quality_filtered, iou_thresh=iou, target_len=target_len)
+            after = len(quality_filtered)
+            logger.info(f"DEDUP_BY_TIME: {before} → {after} kept ({before-after} removed), thresh={iou:.2f}")
+            
+            # Apply text-based deduplication to remove semantic duplicates
+            text_thresh = float(os.getenv("DEDUP_TEXT_THRESHOLD", "0.90"))
+            before_text = len(quality_filtered)
+            quality_filtered = _dedup_by_text(quality_filtered, text_thresh=text_thresh)
+            after_text = len(quality_filtered)
+            logger.info(f"DEDUP_BY_TEXT: {before_text} → {after_text} kept ({before_text-after_text} removed), thresh={text_thresh:.2f}")
+            
+            # Apply duration clamping to prevent overlong clips
+            platform_max_sec = float(os.getenv("PLATFORM_MAX_SEC", "30.0"))
+            clamped_count = 0
+            for c in quality_filtered:
+                old_dur = c.get("end", 0) - c.get("start", 0)
+                if old_dur > platform_max_sec:
+                    c["end"] = c.get("start", 0) + platform_max_sec
+                    new_dur = c["end"] - c.get("start", 0)
+                    logger.info(f"CLIP_DURATION_CLAMP: {c.get('id', 'unknown')} {old_dur:.2f}s → {new_dur:.2f}s")
+                    clamped_count += 1
+            if clamped_count > 0:
+                logger.info(f"CLIP_DURATION_CLAMP: {clamped_count} clips clamped to {platform_max_sec}s max")
+            
             # POST-NMS: Log final durations (cast to float to avoid numpy dtype issues)
             safe_durs = [float(round(c.get("end", 0) - c.get("start", 0), 1)) for c in quality_filtered]
             logger.info("POST-NMS: durs=%s", safe_durs)
@@ -1297,6 +1442,16 @@ class ClipScoreService:
             
             # Stable final ordering: protected clips first, then by score
             finals.sort(key=lambda c: (c.get("protected", False), c.get("final_score", 0)), reverse=True)
+            
+            # Apply temporal deduplication to remove near-duplicate clips
+            if finals:
+                iou_thresh = float(os.getenv("DEDUP_IOU_THRESHOLD", "0.85"))
+                platform_target = 18.0  # Default target duration
+                before_count = len(finals)
+                finals = _dedup_by_time_iou(finals, iou_thresh=iou_thresh, target_len=platform_target)
+                after_count = len(finals)
+                if before_count != after_count:
+                    logger.info(f"DEDUP_BY_TIME: {before_count} → {after_count} kept ({before_count - after_count} removed), thresh={iou_thresh}")
             
             # Debug: Log final saved set with durations and protected flags
             final_info = []
