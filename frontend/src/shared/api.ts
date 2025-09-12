@@ -29,39 +29,51 @@ export interface TitleSetRequest {
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE || 'http://localhost:8000';
 export const apiUrl = (path: string) => `${API_BASE}${path}`;
 
-// Optional: naive exponential backoff for transient failures
-async function sleep(ms: number) { return new Promise(res => setTimeout(res, ms)); }
+// =============================
+// Safe Fetch Utilities (global)
+// =============================
+const ERROR_SLICE = 200; // keep to 200 chars for readable toasts
+const DEBUG_FALLBACKS = false; // flip to true when diagnosing payload shapes
 
-async function getJson<T>(url: string, init?: RequestInit, retries = 0): Promise<ApiResult<T>> {
+export async function getJson<T = any>(input: RequestInfo, init?: RequestInit): Promise<ApiResult<T>> {
   try {
-    const res = await fetch(url, init);
+    const res = await fetch(input, init);
     const ct = res.headers.get("content-type") || "";
-    if (!ct.includes("application/json")) {
-      const msg = `Non-JSON response: ${res.status}`;
-      if (retries > 0 && res.status >= 500) {
-        await sleep(400 * retries);
-        return getJson<T>(url, init, retries - 1);
-      }
-      return { ok: false, error: msg };
+    let parsed: any = undefined;
+    if (ct.includes("application/json")) {
+      parsed = await res.json().catch(() => undefined);
+    } else {
+      // Avoid "Unexpected token 'I'..." crashes on plain text/HTML
+      parsed = await res.text().catch(() => undefined);
     }
-    const json = await res.json();
-    if (!res.ok || json?.ok === false) {
-      const msg = json?.error ?? `HTTP ${res.status}`;
-      if (retries > 0 && res.status >= 500) {
-        await sleep(400 * retries);
-        return getJson<T>(url, init, retries - 1);
-      }
-      return { ok: false, error: msg };
-    }
-    // Success
-    return { ok: true, data: json as T };
-  } catch (err: any) {
-    if (retries > 0) {
-      await sleep(400 * retries);
-      return getJson<T>(url, init, retries - 1);
-    }
-    return { ok: false, error: err?.message ?? "Network error" };
+    const error = !res.ok
+      ? (typeof parsed === "object" && parsed
+          ? (parsed.detail || parsed.error || parsed.message || res.statusText)
+          : (typeof parsed === "string" ? parsed.slice(0, ERROR_SLICE) : res.statusText))
+      : undefined;
+    return {
+      ok: res.ok,
+      data: typeof parsed === "object" ? (parsed as T) : undefined,
+      error,
+      status: res.status,
+      requestId: res.headers.get("x-request-id") || undefined,
+    };
+  } catch (e: any) {
+    return { ok: false, error: e?.message || "network_error" };
   }
+}
+
+function parseClips<T = any>(payload: any): T[] {
+  // Supports: [{...}] OR {clips:[...]} OR {data:{clips:[...]}}
+  if (Array.isArray(payload)) return payload as T[];
+  if (payload?.clips) return payload.clips as T[];
+  const nested = payload?.data?.clips;
+  if (Array.isArray(nested)) return nested as T[];
+  if (DEBUG_FALLBACKS) {
+    // eslint-disable-next-line no-console
+    console.warn("[clips] unknown payload shape", { keys: Object.keys(payload || {}) });
+  }
+  return [];
 }
 
 // --- Public typed wrappers ---
@@ -74,26 +86,42 @@ export async function getEpisodes(): Promise<ApiResult<{ episodes: Episode[] }>>
   return getJson<{ episodes: Episode[] }>(apiUrl("/api/episodes"));
 }
 
-export async function getProgress(episodeId: string): Promise<ApiResult<{ progress: Progress }>> {
-  return getJson<{ progress: Progress }>(apiUrl(`/api/progress/${encodeURIComponent(episodeId)}`));
+export async function getProgress(): Promise<ApiResult<{ progress: any }>> {
+  return getJson<{ progress: any }>(apiUrl("/api/progress"), { cache: "no-store" });
+}
+
+export async function getEpisodeProgress(id: string): Promise<ApiResult<{ progress: any }>> {
+  return getJson<{ progress: any }>(apiUrl(`/api/progress/${encodeURIComponent(id)}`), {
+    cache: "no-store",
+  });
 }
 
 export async function getClips(episodeId: string): Promise<ApiResult<{ clips: Clip[] }>> {
-  return getJson<{ clips: Clip[] }>(apiUrl(`/api/episodes/${encodeURIComponent(episodeId)}/clips?ts=${Date.now()}`), {
-    cache: 'no-store',
-  });
+  const r = await getJson<any>(
+    apiUrl(`/api/episodes/${encodeURIComponent(episodeId)}/clips?ts=${Date.now()}`),
+    { cache: "no-store" }
+  );
+  if (!r.ok) throw new Error(r.error || `clips_http_${r.status ?? "unknown"}`);
+  const clips = parseClips<Clip>(r.data);
+  return { ok: true, data: { clips } };
+}
+
+export async function getClipsSimple(episodeId: string): Promise<Clip[]> {
+  const r = await getJson<any>(
+    apiUrl(`/api/episodes/${encodeURIComponent(episodeId)}/clips?ts=${Date.now()}`),
+    { cache: "no-store" }
+  );
+  if (!r.ok) throw new Error(r.error || `clips_http_${r.status ?? "unknown"}`);
+  return parseClips<Clip>(r.data);
 }
 
 export async function uploadYouTube(url: string): Promise<ApiResult<{ episode_id: string }>> {
   const form = new FormData();
-  form.append('url', url);
-  const res = await fetch(apiUrl('/api/upload-youtube'), {
-    method: 'POST',
-    body: form
+  form.append("url", url);
+  return getJson<{ episode_id: string }>(apiUrl("/api/upload-youtube"), {
+    method: "POST",
+    body: form,
   });
-  const data = await res.json().catch(() => undefined);
-  const err = (!res.ok && (data?.detail || data?.error || res.statusText)) || undefined;
-  return { ok: res.ok, data, error: err } as ApiResult<{ episode_id: string }>;
 }
 
 // New API helpers for the event-driven system
@@ -113,13 +141,13 @@ export type UploadYouTubeError =
 export async function uploadYouTubeSimple(url: string): Promise<{ episode_id: string }> {
   const form = new FormData();
   form.append("url", url);
-  const res = await fetch(apiUrl("/api/upload-youtube"), { method: "POST", body: form });
-  if (!res.ok) {
+  const r = await getJson<{ episode_id: string }>(apiUrl("/api/upload-youtube"), { method: "POST", body: form });
+  if (!r.ok) {
     let code: UploadYouTubeError = "internal_error";
-    try { code = (await res.json()).detail as UploadYouTubeError; } catch {}
+    if (r.data?.detail) code = r.data.detail as UploadYouTubeError;
     throw new Error(code);
   }
-  return res.json();
+  return r.data!;
 }
 
 export type ProgressStage =
@@ -133,11 +161,10 @@ export interface ProgressResponse {
 }
 
 export async function getProgressSimple(episodeId: string): Promise<ProgressResponse> {
-  const res = await fetch(apiUrl(`/api/progress/${episodeId}`), { cache: 'no-store' });
-  if (!res.ok) throw new Error(`progress_http_${res.status}`);
-  const data = await res.json();
+  const r = await getJson<any>(apiUrl(`/api/progress/${episodeId}`), { cache: 'no-store' });
+  if (!r.ok) throw new Error(r.error || `progress_http_${r.status ?? "unknown"}`);
   // normalize both shapes: {ok:true, progress:{...}} or just {...}
-  return (data && (data.progress || data));
+  return (r.data && (r.data.progress || r.data));
 }
 
 // Types are additive; keep your existing Clip type/shape untouched elsewhere.
@@ -153,13 +180,7 @@ export interface ClipSimple {
   full_transcript?: string;
 }
 
-export async function getClipsSimple(episodeId: string): Promise<ClipSimple[]> {
-  const res = await fetch(apiUrl(`/api/episodes/${episodeId}/clips?ts=${Date.now()}`), {
-    cache: 'no-store',
-  });
-  if (!res.ok) throw new Error(`clips_http_${res.status}`);
-  return res.json();
-}
+// This function is already updated above with parseClips
 
 export function isTerminalProgress(p?: { stage?: string; percent?: number } | null) {
   if (!p) return false;
@@ -287,8 +308,8 @@ export async function waitForCompletion(episodeId: string, opts: { intervalMs?: 
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
-    const r = await getProgress(episodeId);
-    if (!r.ok) throw new Error((r as ApiErr).error);
+    const r = await getEpisodeProgress(episodeId);
+    if (!r.ok) throw new Error(r.error || "progress_fetch_failed");
     const st = r.data.progress.stage;
     if (st === "completed") return r.data.progress;
     if (st === "failed") throw new Error("Processing failed");
@@ -307,16 +328,10 @@ export async function generateTitles(clipId: string, request: TitleGenRequest): 
 }
 
 export async function setClipTitle(clipId: string, request: TitleSetRequest): Promise<ApiResult<void>> {
-  const result = await fetch(apiUrl(`/api/clips/${clipId}/title`), {
+  const r = await getJson<void>(apiUrl(`/api/clips/${clipId}/title`), {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(request)
   });
-  
-  if (result.ok) {
-    return { ok: true, data: undefined };
-  } else {
-    const error = await result.text();
-    return { ok: false, error };
-  }
+  return r;
 }

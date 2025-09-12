@@ -80,11 +80,15 @@ async def global_exception_handler(request: Request, exc: Exception):
         detail = "Internal server error"
     else:
         detail = str(exc)[:200]
-    return JSONResponse(status_code=500, content={
-        "error": "internal_server_error",
-        "detail": detail,
-        "request_id": request_id,
-    })
+    return JSONResponse(
+        status_code=500, 
+        headers={"X-Request-ID": request_id}, 
+        content={
+            "error": "internal_server_error",
+            "detail": detail,
+            "request_id": request_id,
+        }
+    )
 
 # ---- CORS (dev-friendly, strict in prod) -------------------------------------
 def _normalize_origins(csv: str):
@@ -1525,70 +1529,59 @@ async def render_variant(request: Dict):
 
 @app.get("/api/progress")
 async def get_progress():
-    """Get processing progress for the latest episode"""
+    """Get processing progress for the latest episode (normalized to { ok, progress: { percent, stage, message } })"""
     try:
         episodes = await episode_service.list_episodes()
         if not episodes:
-            return {"ok": False, "error": "No episodes found"}
-        
-        latest_episode = episodes[-1]
-        
-        # Get actual progress from episode service
-        progress_data = episode_service.get_progress(latest_episode.id)
-        
-        # Debug logging
-        logger.info(f"Episode {latest_episode.id} status: {latest_episode.status}")
-        logger.info(f"Progress data: {progress_data}")
-        
-        if latest_episode.status == "completed":
-            # Force progress to 100% for completed episodes, regardless of stored progress data
-            return {"ok": True, "progress": 100, "status": "completed", "message": "Processing completed"}
-        elif latest_episode.status == "processing" and progress_data:
-            # Use actual progress from episode service
             return {
-                "ok": True, 
-                "progress": progress_data.get("percentage", 50), 
-                "status": "processing",
-                "stage": progress_data.get("stage", "processing"),
-                "message": progress_data.get("message", "Processing...")
+                "ok": False,
+                "error": "No episodes found",
+                "progress": {"percent": 0, "stage": "unknown", "message": "No episodes yet"},
             }
-        elif latest_episode.status == "processing":
-            # Fallback: estimate progress based on time
-            if hasattr(latest_episode, 'uploaded_at') and latest_episode.uploaded_at:
-                elapsed = (datetime.now() - latest_episode.uploaded_at).total_seconds()
-                # Conservative estimate: assume 1-2 minutes for processing
-                estimated_time = 120  # 2 minutes
-                progress = min(90, int((elapsed / estimated_time) * 90))
-                return {"ok": True, "progress": progress, "status": "processing", "message": "Processing audio..."}
-            else:
-                return {"ok": True, "progress": 25, "status": "processing", "message": "Starting processing..."}
-        else:
-            return {"ok": True, "progress": 0, "status": latest_episode.status, "message": "Ready to process"}
-            
+        latest_episode = episodes[-1]
+        from services.progress_service import progress_service
+        result = progress_service.get_progress(latest_episode.id) or {}
+        progress_data = result.get("progress") or {}
+        # Normalize keys
+        pct = progress_data.get("percent")
+        if pct is None:
+            p = progress_data.get("percentage")
+            progress_data["percent"] = int(p) if p is not None else 0
+        progress_data.setdefault("stage", getattr(latest_episode, "status", None) or "unknown")
+        progress_data.setdefault(
+            "message", "Processing..." if progress_data.get("percent", 0) < 100 else "Completed"
+        )
+        return {"ok": True, "progress": progress_data}
     except Exception as e:
         logger.error(f"Progress check failed: {e}")
-        return {"ok": False, "error": str(e)}
+        return {
+            "ok": False,
+            "error": str(e),
+            "progress": {"percent": 0, "stage": "error", "message": "Progress unavailable"},
+        }
 
 @app.get("/api/progress/{episode_id}")
 async def get_episode_progress(episode_id: str):
-    """Get processing progress for a specific episode - fail-safe implementation"""
+    """Return the same normalized shape as /api/progress"""
     try:
         from services.progress_service import progress_service
-        result = progress_service.get_progress(episode_id)
-        
-        # The progress service now returns a dict directly
-        # Extract the progress data from the service response
-        progress_data = result.get("progress", {}) if result else {}
-        
-        # Normalize: always ensure percent exists and remove percentage
-        perc = progress_data.pop("percentage", None)
+        result = progress_service.get_progress(episode_id) or {}
+        progress_data = result.get("progress") or {}
         if "percent" not in progress_data:
-            progress_data["percent"] = int(perc) if perc is not None else int(progress_data.get("percent", 0) or 0)
-        
+            p = progress_data.get("percentage")
+            progress_data["percent"] = int(p) if p is not None else 0
+        progress_data.setdefault("stage", progress_data.get("stage") or "unknown")
+        progress_data.setdefault(
+            "message", "Processing..." if progress_data.get("percent", 0) < 100 else "Completed"
+        )
         return {"ok": True, "progress": progress_data}
     except Exception as e:
-        logger.error(f"Progress endpoint error: {e}")
-        return {"ok": False, "error": str(e), "progress": {"stage": "error", "percent": 0}}
+        logger.error(f"Episode progress failed for {episode_id}: {e}")
+        return {
+            "ok": False,
+            "error": str(e),
+            "progress": {"percent": 0, "stage": "error", "message": "Progress unavailable"},
+        }
 
 @app.get("/api/candidate/debug")
 async def candidate_debug(
