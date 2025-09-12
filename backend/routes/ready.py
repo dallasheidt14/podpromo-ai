@@ -121,3 +121,90 @@ async def ready():
     # Cache the result
     _LAST.update(ts=now, result=resp)
     return resp
+
+@router.get("/health/deep")
+async def deep_health():
+    """Deep health check with cache metrics and system status"""
+    try:
+        from services.episode_service import episode_service
+        from config.database import check_db_connection
+        
+        checks = {
+            "database": check_db_connection(),
+            "cache": episode_service.get_cache_stats() if hasattr(episode_service, 'get_cache_stats') else {"error": "cache_stats_unavailable"},
+            "ffmpeg": True,  # Will be checked by the ready endpoint
+        }
+        
+        ok = all(checks.values())
+        return JSONResponse({
+            "healthy": ok,
+            "checks": checks,
+            "timestamp": time.time()
+        })
+    except Exception as e:
+        return JSONResponse({
+            "healthy": False,
+            "error": str(e),
+            "timestamp": time.time()
+        }, status_code=503)
+
+@router.get("/health/security")
+async def security_health():
+    """Security health check with configuration validation"""
+    issues = []
+    
+    # Hardcoded secrets check (best-effort)
+    try:
+        cfg = Path("backend/config/database.py").read_text(encoding="utf-8")
+        if "eyJ" in cfg and "os.getenv" not in cfg:
+            issues.append("hardcoded_credentials")
+    except Exception:
+        pass
+    
+    # CORS
+    try:
+        import os
+        cors_origins = os.getenv("CORS_ORIGINS", "").split(",")
+        if "*" in cors_origins and os.getenv("ENVIRONMENT") == "production":
+            issues.append("permissive_cors")
+    except Exception:
+        pass
+    
+    # File perms (best-effort on POSIX)
+    try:
+        from config.settings import UPLOAD_DIR
+        st = Path(UPLOAD_DIR).stat()
+        if hasattr(st, "st_mode") and (st.st_mode & 0o077):
+            issues.append("loose_file_permissions")
+    except Exception:
+        pass
+    
+    # Environment checks
+    try:
+        import os
+        if os.getenv("ENVIRONMENT") == "production":
+            if os.getenv("USE_LOCAL_DB", "").lower() in {"1", "true", "yes"}:
+                issues.append("local_db_in_production")
+            
+            if not os.getenv("MAX_FILE_SIZE"):
+                issues.append("missing_max_file_size")
+            
+            if not os.getenv("CORS_ORIGINS"):
+                issues.append("missing_cors_origins")
+    except Exception:
+        pass
+    
+    # FFmpeg availability
+    try:
+        import subprocess
+        result = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, timeout=2)
+        if result.returncode != 0:
+            issues.append("ffmpeg_not_found")
+    except Exception:
+        issues.append("ffmpeg_not_found")
+    
+    return JSONResponse({
+        "secure": len(issues) == 0,
+        "issues": issues,
+        "timestamp": time.time()
+    })

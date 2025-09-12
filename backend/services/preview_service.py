@@ -22,8 +22,25 @@ logger = logging.getLogger(__name__)
 DEFAULT_PAD_START_SEC = 0.08   # -80ms
 DEFAULT_PAD_END_SEC   = 0.24   # +240ms
 
+# Valid spectrum settings
+SPECTRUM_FILTER = (
+    "showspectrum="
+    "s=640x360:"
+    "mode=combined:"          # valid mode for showspectrum
+    "color=intensity:"        # intensity|channel|rainbow|more
+    "scale=cbrt"              # lin|log|sqrt|cbrt
+)
+
+# Nice looking, widely compatible waveform (line)
+WAVES_FILTER = (
+    "aformat=channel_layouts=stereo,"
+    "showwaves=s=640x360:mode=line:rate=25,"
+    "format=yuv420p"
+)
+
 def run(cmd):
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    timeout_sec = int(os.getenv("FFMPEG_TIMEOUT_SEC", "900"))
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout_sec)
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg/ffprobe failed: {proc.stderr.strip()}")
     return proc.stdout
@@ -43,6 +60,20 @@ def _hash(*parts: str) -> str:
     for p in parts:
         h.update(p.encode("utf-8"))
     return h.hexdigest()[:16]
+
+def _ffmpeg_preview_args(in_wav: str, out_mp4: str, ss: float, dur: float, filter_expr: str):
+    """Build FFmpeg arguments for preview generation"""
+    return [
+        "ffmpeg", "-hide_banner", "-nostats", "-loglevel", "error", "-y",
+        "-ss", f"{ss}", "-t", f"{dur}",
+        "-i", in_wav,
+        "-filter_complex", f"[0:a]{filter_expr}[v]",
+        "-map", "[v]", "-map", "0:a?",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "28",
+        "-c:a", "aac", "-b:a", "96k",
+        "-shortest",
+        out_mp4,
+    ]
 
 def build_preview_filename(episode_id: str, clip_id: str) -> str:
     """Generate a stable filename for caching and re-use."""
@@ -167,7 +198,17 @@ def _hash_name(episode_id: str, clip_id: str, start: float, end: float) -> str:
 
 def _run_ffmpeg(argv: list[str]) -> None:
     """Run ffmpeg command with error handling."""
-    proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    # Validate that any "-i <path>" inputs actually exist (skip filters/flags)
+    for i, arg in enumerate(argv):
+        if arg == "-i" and i + 1 < len(argv):
+            in_path = argv[i + 1]
+            # If it's a real filesystem path (not a lavfi spec), ensure it exists
+            if (":" in in_path or "/" in in_path or "\\" in in_path) and not in_path.startswith("color="):
+                if not os.path.exists(in_path):
+                    raise ValueError(f"Input file not found: {in_path}")
+    
+    timeout_sec = int(os.getenv("FFMPEG_TIMEOUT_SEC", "900"))  # default 15 min
+    proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout_sec)
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.decode("utf-8", errors="ignore")[:400])
 
@@ -211,19 +252,22 @@ def ensure_preview(
                 "-movflags", "+faststart", dst,
             ]
         else:
-            # Audio-only → audiogram on black canvas
-            argv = [
-                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                "-ss", f"{start_sec:.3f}", "-i", src, "-t", f"{duration:.3f}",
-                "-f", "lavfi", "-i", f"color=c=black:s=1280x720:d={duration:.3f}",
-                "-lavfi", "showspectrum=mode=lines:color=intensity:slide=scroll:scale=log",
-                "-shortest",
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
-                "-c:a", "aac", "-b:a", audio_bitrate, "-ar", str(sample_rate),
-                "-movflags", "+faststart", dst,
-            ]
-        _run_ffmpeg(argv)
-        return f"/clips/previews/{out_path.name}"
+            # Audio-only → audiogram with fallback system
+            # 1) Try waveform lines (most compatible)
+            try:
+                _run_ffmpeg(_ffmpeg_preview_args(src, dst, start_sec, duration, WAVES_FILTER))
+                return f"/clips/previews/{out_path.name}"
+            except Exception as e1:
+                logger.warning("Waveform preview failed, trying spectrum. Reason: %s", e1)
+
+            # 2) Try spectrum (valid params)
+            try:
+                spec = SPECTRUM_FILTER + ",format=yuv420p"  # ensure 420p for H.264 players
+                _run_ffmpeg(_ffmpeg_preview_args(src, dst, start_sec, duration, spec))
+                return f"/clips/previews/{out_path.name}"
+            except Exception as e2:
+                logger.error("Spectrum preview failed: %s", e2)
+                return None
     except Exception as e:
         logger.error(f"Preview generation failed for {episode_id}/{clip_id}: {e}", exc_info=True)
         return None

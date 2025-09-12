@@ -9,6 +9,8 @@ import json
 import time
 from typing import List, Optional, Dict
 from datetime import datetime
+from cachetools import TTLCache
+import psutil
 try:
     import faster_whisper
     WHISPER_AVAILABLE = True
@@ -70,14 +72,17 @@ class EnhancedProgressTracker:
 class EpisodeService:
     """Service for managing podcast episodes"""
     
-    def __init__(self):
-        self.episodes: dict = {}  # In-memory storage for MVP
+    def __init__(self, maxsize: int = 200, ttl: int = 3600):
+        # Auto-evict after 1h; cap memory
+        self.episodes = TTLCache(maxsize=maxsize, ttl=ttl)
         self.progress: Dict[str, Dict] = {}  # Progress tracking for each episode
         self.enhanced_trackers: Dict[str, tuple] = {}  # Enhanced progress tracking with TTL: (tracker, expires_at)
         self.whisper_model = None
         self._init_whisper()
         self._processing_episodes: set[str] = set() # Track episodes currently being processed
         self._episodes_loaded = False  # Flag to track if episodes have been loaded
+        self._hits = 0
+        self._misses = 0
         
         # Create storage directory for transcripts
         self.storage_dir = os.path.join(UPLOAD_DIR, "transcripts")
@@ -485,7 +490,11 @@ class EpisodeService:
     async def get_episode(self, episode_id: str) -> Optional[Episode]:
         """Get episode by ID"""
         self._ensure_episodes_loaded()
-        return self.episodes.get(episode_id)
+        if episode_id in self.episodes:
+            self._hits += 1
+            return self.episodes[episode_id]
+        self._misses += 1
+        return None
     
     async def get_all_episodes(self) -> List[Episode]:
         """Get all episodes"""
@@ -655,7 +664,9 @@ class EpisodeService:
             episode.processed_at = datetime.now()
             tracker.update_stage("finalizing", 100, "Episode processing completed successfully!")
             write_progress(episode_id, "processing", 96, "Finalizing clips...")
-            write_progress(episode_id, "completed", 100, "Done")
+            
+            # ✅ NEW: mark as fully completed so frontend stops polling and fetches clips
+            self._finalize_episode_processing(episode_id, len(clips))
             
             # Extend TTL for completed episodes so they remain accessible
             new_expires_at = time.time() + PROGRESS_TRACKER_TTL
@@ -686,6 +697,26 @@ class EpisodeService:
         finally:
             # Remove from processing guard
             self._processing_episodes.discard(episode_id)
+
+    def _finalize_episode_processing(self, episode_id: str, clip_count: int) -> None:
+        """
+        Idempotently mark an episode as finished. Safe to call multiple times.
+        """
+        try:
+            from services.progress_writer import get_progress, write_progress
+            cur = get_progress(episode_id) or {}
+            progress_data = cur.get("progress", {})
+            # already terminal?
+            if progress_data.get("stage") == "completed":
+                return
+            # allow advancing scoring->completed even if percent is already 100
+            write_progress(episode_id, "completed", 100, f"Ready: {clip_count} clips")
+        except Exception as e:
+            # don't fail the whole job on progress write
+            logger.warning(
+                "Finalize progress failed for %s: %s",
+                episode_id, e,
+            )
     
     async def _ensure_audio_format(self, file_path: str) -> str:
         """Convert file to audio format if needed"""
@@ -699,6 +730,11 @@ class EpisodeService:
             # Convert video to audio
             if file_ext in ['.mp4', '.mov', '.avi']:
                 audio_path = file_path.rsplit('.', 1)[0] + '.wav'
+                
+                # Skip conversion if WAV already exists
+                if os.path.exists(audio_path):
+                    logger.info(f"Audio file already exists, skipping conversion: {audio_path}")
+                    return audio_path
                 
                 logger.info(f"Converting {file_path} to audio format")
                 
@@ -1120,3 +1156,19 @@ class EpisodeService:
                 
         except Exception as e:
             logger.error(f"Cleanup failed: {e}")
+
+    def mark_completed(self, episode_id: str) -> None:
+        """Optionally drop as soon as results are persisted"""
+        self.episodes.pop(episode_id, None)
+
+
+    def get_cache_stats(self) -> Dict[str, float]:
+        total = self._hits + self._misses
+        return {
+            "size": float(len(self.episodes)),
+            "maxsize": float(self.episodes.maxsize),
+            "hits": float(self._hits),
+            "misses": float(self._misses),
+            "hit_rate": (self._hits / total) if total else 0.0,
+            "memory_mb": psutil.Process().memory_info().rss / 1024 / 1024,
+        }

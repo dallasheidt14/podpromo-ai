@@ -2,9 +2,8 @@
 Database configuration and connection management using Supabase with local SQLite fallback
 """
 
-import os
-from supabase import create_client, Client
-import logging
+import os, re, logging
+from typing import Optional
 from .local_database import (
     init_local_tables, save_episode, save_clips, get_episodes, get_clips,
     check_local_db_connection
@@ -12,25 +11,34 @@ from .local_database import (
 
 logger = logging.getLogger(__name__)
 
-# Supabase configuration
-SUPABASE_URL = "https://jozohgxvdzosbcrdppkk.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Impvem9oZ3h2ZHpvc2JjcmRwcGtrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTY2ODAxNDUsImV4cCI6MjA3MjI1NjE0NX0.XUW5YIRUaYFyk1EYEYNBi-Y5HrgTm7S8ciUcN5aJtgE"
+# Supabase configuration from environment
+SUPABASE_URL: Optional[str] = os.getenv("SUPABASE_URL")
+SUPABASE_KEY: Optional[str] = os.getenv("SUPABASE_KEY")
 
-# Try to initialize Supabase client
-supabase: Client = None
-USE_LOCAL_DB = False
+# Early format checks to catch typos in CI/CD
+if SUPABASE_URL and not re.match(r"^https://[a-zA-Z0-9-]+\.supabase\.co$", SUPABASE_URL):
+    raise ValueError("Invalid SUPABASE_URL format")
+if SUPABASE_KEY and not SUPABASE_KEY.startswith("eyJ"):
+    raise ValueError("Invalid SUPABASE_KEY format (expected JWT-like)")
 
-try:
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-    logger.info("Supabase client initialized")
-except Exception as e:
-    logger.warning(f"Failed to initialize Supabase: {e}")
-    logger.info("Falling back to local SQLite database")
-    USE_LOCAL_DB = True
-    init_local_tables()
+if not SUPABASE_URL or not SUPABASE_KEY:
+    if os.getenv("ALLOW_LOCAL_DB_FALLBACK", "true").lower() in {"1","true","yes"}:
+        logging.getLogger(__name__).warning("Using local SQLite fallback — NOT for production.")
+        from .local_database import LocalDB as DB
+        db = DB()
+        USE_LOCAL_DB = True
+    else:
+        raise RuntimeError("Missing SUPABASE_URL/SUPABASE_KEY and local fallback disabled")
+else:
+    from supabase import create_client, Client
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    db = supabase
+    USE_LOCAL_DB = False
 
 def get_supabase():
     """Get Supabase client instance"""
+    if USE_LOCAL_DB:
+        return None
     return supabase
 
 def check_db_connection():

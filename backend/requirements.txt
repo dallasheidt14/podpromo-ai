@@ -26,7 +26,14 @@ aiofiles==24.1.0
 
 # YouTube support
 yt-dlp==2023.12.30
+browser-cookie3>=0.19  # optional; used only if YT_COOKIES_FROM_BROWSER is set
+pycryptodomex>=3.19.0  # required for yt-dlp cookie handling
+brotli>=1.1.0  # required for yt-dlp compression
 sentry-sdk
+
+# Caching and rate limiting
+cachetools>=5.3
+slowapi>=0.1.9
 
 # Optional: For development
 python-dotenv==1.0.0

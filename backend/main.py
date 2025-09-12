@@ -19,6 +19,12 @@ from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
+from urllib.parse import urlparse
+
+# Rate limiting
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 from models import (
     Episode, TranscriptSegment, MomentScore, UploadResponse, 
@@ -45,22 +51,79 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Add CORS middleware with environment-based configuration
-import os
-CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",")
-if os.getenv("ENVIRONMENT") == "production":
-    # In production, only allow specific domains
-    CORS_ORIGINS = [origin.strip() for origin in CORS_ORIGINS if origin.strip() and not origin.startswith("http://localhost")]
-    if not CORS_ORIGINS:
-        CORS_ORIGINS = ["https://highlightly.ai"]  # Default production domain
+# --- Rate limiting (SlowAPI) ---
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+_EMERG = os.getenv("EMERGENCY_RATE_LIMIT", "")
+_YT_LIMIT = os.getenv("YOUTUBE_UPLOAD_RATE", "10/hour")
+_FILE_LIMIT = os.getenv("FILE_UPLOAD_RATE", "5/minute")
+if _EMERG:
+    _YT_LIMIT = _EMERG
+    _FILE_LIMIT = _EMERG
+
+# Global exception handler with context (no leakage in prod)
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    request_id = str(uuid.uuid4())
+    ctx = {
+        "method": request.method,
+        "path": request.url.path,
+        "query": str(request.query_params),
+        "user_agent": request.headers.get("user-agent", "unknown"),
+        "content_length": request.headers.get("content-length", "0"),
+    }
+    logger.error("Unhandled [%s]: %s | Context: %s",
+                 request_id, exc, ctx, exc_info=True)
+    if os.getenv("ENVIRONMENT") == "production":
+        detail = "Internal server error"
+    else:
+        detail = str(exc)[:200]
+    return JSONResponse(status_code=500, content={
+        "error": "internal_server_error",
+        "detail": detail,
+        "request_id": request_id,
+    })
+
+# ---- CORS (dev-friendly, strict in prod) -------------------------------------
+def _normalize_origins(csv: str):
+    raw = [o.strip() for o in (csv or "").split(",") if o.strip()]
+    ok = []
+    for o in raw:
+        if o.startswith(("http://", "https://")) and urlparse(o).netloc:
+            ok.append(o.rstrip("/"))
+    return ok
+
+ENV = os.getenv("ENVIRONMENT", "development").lower()
+cors = _normalize_origins(os.getenv("CORS_ORIGINS", ""))
+if ENV != "production":
+    # sensible defaults for local dev if nothing provided
+    if not cors:
+        cors = [
+            "http://localhost:3000", "http://127.0.0.1:3000",
+            "http://localhost:5173", "http://127.0.0.1:5173",
+        ]
+elif not cors:
+    cors = ["https://yourdomain.com"]  # TODO: set your real prod origin(s)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["GET","POST","HEAD","OPTIONS"],  # Minimal for least privilege
-    allow_headers=["*"],
+    allow_origins=cors,
+    allow_credentials=False,  # set True only if you actually use cookies
+    allow_methods=["GET", "POST", "OPTIONS", "HEAD"],
+    allow_headers=["content-type", "authorization"],
 )
+
+# Add content-type validation middleware (scoped to /api/upload only)
+@app.middleware("http")
+async def validate_content_type(request: Request, call_next):
+    # Only enforce multipart on the binary file upload endpoint
+    if request.method == "POST" and request.url.path == "/api/upload":
+        ctype = request.headers.get("content-type", "")
+        if not ctype.startswith("multipart/form-data"):
+            return JSONResponse(status_code=400, content={"error": "invalid_content_type"})
+    return await call_next(request)
 
 # Add timing middleware for progress endpoints
 @app.middleware("http")
@@ -553,6 +616,7 @@ async def log_choice(choice_data: Dict):
 
 # Main API endpoints
 @app.post("/api/upload")
+@limiter.limit(_FILE_LIMIT)
 async def upload_episode(file: UploadFile = File(...), background_tasks: BackgroundTasks = None, request: Request = None):
     """Upload and process a podcast episode"""
     try:
@@ -650,6 +714,7 @@ class UploadYouTubeResponse(BaseModel):
     episode_id: str
 
 @app.post("/api/upload-youtube", response_model=UploadYouTubeResponse)
+@limiter.limit(_YT_LIMIT)
 async def upload_youtube_episode(
     url: str = Form(...),
     background_tasks: BackgroundTasks = None,
@@ -685,7 +750,20 @@ async def upload_youtube_episode(
                 from pathlib import Path
 
                 # 1) Download + prep
-                info = download_and_prepare(url, episode_id)
+                try:
+                    info = download_and_prepare(url, episode_id)
+                except Exception as e:
+                    # Surface YouTube download failures immediately
+                    from services.youtube_service import map_error
+                    _, key = map_error(e)
+                    msg = (
+                        "This video needs login/age verification. "
+                        "Try a different link or contact support to enable advanced access."
+                        if key in {"download_requires_login", "download_failed_requires_cookies"}
+                        else "YouTube download failed. Please try again or upload the file directly."
+                    )
+                    write_progress(episode_id, "error", 0, msg)
+                    raise
 
                 # 2) Create episode record and process
                 write_progress(episode_id, "transcribing", 20, "Transcribing audio")
@@ -753,10 +831,26 @@ async def upload_youtube_episode(
                 
                 write_progress(episode_id, "completed", 100, "Completed")
             except Exception as e:
+                # Map error for a nicer message
+                from services.youtube_service import map_error
+                _, err_code = map_error(e)
+                # surface a user-actionable hint for cookie-gated videos
+                msg = "YouTube download failed"
+                if err_code == "download_requires_login":
+                    msg = "This video requires login or has age restrictions. Try a different video or contact support for advanced setup."
+                elif err_code == "invalid_url":
+                    msg = "Invalid YouTube URL format"
+                elif err_code == "too_short":
+                    msg = "Video is too short (minimum 60 seconds)"
+                elif err_code == "too_long":
+                    msg = "Video is too long (maximum 4 hours)"
+                elif err_code == "live_stream_not_supported":
+                    msg = "Live streams are not supported"
+                
                 # surface the error to clients polling progress
                 try:
                     from services.progress_writer import write_progress
-                    write_progress(episode_id, "error", 0, f"{type(e).__name__}: {e}")
+                    write_progress(episode_id, "error", 0, msg)
                 finally:
                     # log full traceback to server logs
                     import logging, traceback
@@ -1346,7 +1440,7 @@ async def get_episode_clips(episode_id: str, regenerate: bool = False, backgroun
                 payload,
                 headers={
                     "ETag": etag,
-                    "Cache-Control": "public, max-age=3600, stale-while-revalidate=120"
+                    "Cache-Control": "no-store, max-age=0"
                 }
             )
             

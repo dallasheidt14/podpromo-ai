@@ -1,86 +1,168 @@
 """
-Progress Writer - Helper for writing progress with monotonic percent and normalized stages
+Progress Writer - Monotonic progress with throttling and terminal freeze
 """
 
 import logging
-from typing import Optional
+import time
+from typing import Optional, Dict, Any
 from services.progress_service import progress_service
 
 logger = logging.getLogger(__name__)
 
-def clamp_percent(episode_id: str, new_percent: int) -> int:
-    """Ensure percent never goes backwards (monotonic)"""
-    try:
-        # Load current progress to get last percent
-        current = progress_service._load_progress(episode_id)
-        if current:
-            old_percent = int(current.get("percent", current.get("percentage", 0)))
-            return max(old_percent, min(100, int(new_percent)))
-        return max(0, min(100, int(new_percent)))
-    except Exception as e:
-        logger.warning(f"Failed to clamp percent for {episode_id}: {e}")
-        return max(0, min(100, int(new_percent)))
+# Stage progression order (monotonic)
+STAGE_ORDER = [
+    "queued", "uploading", "converting", "transcribing", 
+    "scoring", "processing", "completed", "error"
+]
+
+# Terminal stages that freeze progress
+TERMINAL_STAGES = {"completed", "error"}
+
+# Throttle configuration
+THROTTLE_DELTA_PERCENT = 5  # Minimum percent change to log
+THROTTLE_DELTA_SEC = 2.0    # Minimum time between updates
+
+class ProgressWriter:
+    def __init__(self):
+        self._last_updates: Dict[str, Dict[str, Any]] = {}
+    
+    def _get_stage_index(self, stage: str) -> int:
+        """Get stage position in progression order"""
+        try:
+            return STAGE_ORDER.index(stage.lower().strip())
+        except ValueError:
+            return len(STAGE_ORDER) - 1  # Default to last stage
+    
+    def _is_stage_progression_valid(self, episode_id: str, new_stage: str) -> bool:
+        """Check if stage progression is monotonic"""
+        if episode_id not in self._last_updates:
+            return True
+        
+        last_stage = self._last_updates[episode_id].get("stage", "queued")
+        last_index = self._get_stage_index(last_stage)
+        new_index = self._get_stage_index(new_stage)
+        
+        logger.debug(f"Stage progression check: {episode_id} {last_stage}({last_index}) -> {new_stage}({new_index}) = {new_index >= last_index}")
+        return new_index >= last_index
+    
+    def _is_percent_increase_valid(self, episode_id: str, new_percent: int) -> bool:
+        """Check if percent increase is valid (monotonic)"""
+        if episode_id not in self._last_updates:
+            return True
+        
+        last_percent = self._last_updates[episode_id].get("percent", 0)
+        return new_percent >= last_percent
+    
+    def _should_throttle(self, episode_id: str, new_percent: int) -> bool:
+        """Check if update should be throttled"""
+        if episode_id not in self._last_updates:
+            return False
+        
+        last_update = self._last_updates[episode_id]
+        last_percent = last_update.get("percent", 0)
+        last_time = last_update.get("timestamp", 0)
+        
+        # Check percent delta
+        percent_delta = abs(new_percent - last_percent)
+        if percent_delta < THROTTLE_DELTA_PERCENT:
+            return True
+        
+        # Check time delta
+        time_delta = time.time() - last_time
+        if time_delta < THROTTLE_DELTA_SEC:
+            return True
+        
+        return False
+    
+    def _is_terminal_frozen(self, episode_id: str) -> bool:
+        """Check if episode is in terminal state and frozen"""
+        if episode_id not in self._last_updates:
+            return False
+        
+        last_stage = self._last_updates[episode_id].get("stage", "")
+        return last_stage in TERMINAL_STAGES
+    
+    def write_progress(
+        self,
+        episode_id: str,
+        stage: str,
+        percent: Optional[int] = None,
+        message: Optional[str] = None
+    ) -> None:
+        """Write progress with monotonic enforcement, throttling, and terminal freeze"""
+        try:
+            # Check if terminal frozen
+            if self._is_terminal_frozen(episode_id):
+                logger.debug(f"Progress frozen for terminal episode {episode_id}")
+                return
+            
+            # Normalize stage
+            normalized_stage = stage.lower().strip()
+            if normalized_stage not in STAGE_ORDER:
+                normalized_stage = "processing"
+            
+            # Check stage progression
+            if not self._is_stage_progression_valid(episode_id, normalized_stage):
+                logger.debug(f"Stage regression ignored for {episode_id}: {stage}")
+                return
+            
+            # Prepare progress data
+            progress_data = {
+                "stage": normalized_stage,
+                "message": message or f"Processing {normalized_stage}...",
+            }
+            # Handle percent with monotonic enforcement
+            if percent is not None:
+                if not self._is_percent_increase_valid(episode_id, percent):
+                    logger.debug(f"Percent regression ignored for {episode_id}: {percent}%")
+                    return
+                
+            # ✨ KEY FIX: if the stage is changing (e.g., scoring→completed), don't throttle
+            if normalized_stage != self._last_updates.get(episode_id, {}).get("stage", ""):
+                # Stage change - always allow, don't throttle
+                if percent is not None:
+                    progress_data["percent"] = min(100, max(0, percent))
+            else:
+                # Same stage -> apply throttling
+                if self._should_throttle(episode_id, percent):
+                    logger.debug(f"Progress throttled for {episode_id}: {percent}%")
+                    return
+                if percent is not None:
+                    progress_data["percent"] = min(100, max(0, percent))
+            # Write to progress service
+            progress_service._save_progress_atomic(episode_id, progress_data)
+            
+            # Update internal state
+            self._last_updates[episode_id] = {
+                "stage": normalized_stage,
+                "percent": progress_data.get("percent", 0),
+                "timestamp": time.time()
+            }
+            
+            # Extra breadcrumb for debugging stage transitions
+            try:
+                prev_stage = self._last_updates.get(episode_id, {}).get("stage", "")
+                if prev_stage != normalized_stage:
+                    logger.info("Progress stage change: %s %s%% -> %s %s%%", episode_id, self._last_updates.get(episode_id, {}).get("percent", ""), normalized_stage, progress_data.get('percent', ''))
+            except Exception:
+                pass
+            
+            logger.info("Progress updated: %s -> %s %s%%", episode_id, normalized_stage, progress_data.get('percent', ''))
+            
+        except Exception as e:
+            logger.error(f"Failed to write progress for {episode_id}: {e}")
+
+# Global instance
+_writer = ProgressWriter()
 
 def write_progress(
-    episode_id: str, 
-    stage: str, 
-    percent: Optional[int] = None, 
+    episode_id: str,
+    stage: str,
+    percent: Optional[int] = None,
     message: Optional[str] = None
 ) -> None:
-    """Write progress with monotonic percent and normalized stage"""
-    try:
-        # Normalize stage names to match frontend expectations
-        stage_map = {
-            "queue": "queued",
-            "queued": "queued", 
-            "waiting": "queued",
-            "preparing": "queued",
-            "upload": "uploading",
-            "uploading": "uploading",
-            "convert": "converting",
-            "converting": "converting",
-            "muxing": "converting",
-            "transcribe": "transcribing",
-            "transcribing": "transcribing",
-            "asr": "transcribing",
-            "scoring": "scoring",
-            "scoring:prerank": "scoring",
-            "scoring:full": "scoring", 
-            "scoring:completed": "scoring",
-            "analyze": "processing",
-            "analysing": "processing",
-            "processing": "processing",
-            "process": "processing",
-            "generate": "processing",
-            "generating": "processing",
-            "completed": "completed",
-            "complete": "completed",
-            "done": "completed",
-            "success": "completed",
-            "failed": "error",
-            "fail": "error",
-            "error": "error",
-        }
-        
-        normalized_stage = stage_map.get(stage.lower().strip(), "processing")
-        
-        # Prepare progress data
-        progress_data = {
-            "stage": normalized_stage,
-            "message": message or f"Processing {normalized_stage}...",
-        }
-        
-        # Add percent if provided, ensuring monotonic behavior
-        if percent is not None:
-            progress_data["percent"] = clamp_percent(episode_id, percent)
-        
-        # Write to progress service
-        progress_service._save_progress_atomic(episode_id, progress_data)
-        
-        logger.info(f"Progress updated: {episode_id} -> {normalized_stage} {percent}%")
-        
-    except Exception as e:
-        logger.error(f"Failed to write progress for {episode_id}: {e}")
+    """Write progress with monotonic enforcement, throttling, and terminal freeze"""
+    _writer.write_progress(episode_id, stage, percent, message)
 
 def write_stage(episode_id: str, stage: str, message: Optional[str] = None) -> None:
     """Write stage without changing percent"""
@@ -89,3 +171,7 @@ def write_stage(episode_id: str, stage: str, message: Optional[str] = None) -> N
 def write_percent(episode_id: str, percent: int, message: Optional[str] = None) -> None:
     """Write percent without changing stage"""
     write_progress(episode_id, "processing", percent, message)
+
+def get_progress(episode_id: str) -> Optional[Dict[str, Any]]:
+    """Get current progress for episode"""
+    return progress_service.get_progress(episode_id)
