@@ -79,7 +79,9 @@ export async function getProgress(episodeId: string): Promise<ApiResult<{ progre
 }
 
 export async function getClips(episodeId: string): Promise<ApiResult<{ clips: Clip[] }>> {
-  return getJson<{ clips: Clip[] }>(apiUrl(`/api/episodes/${encodeURIComponent(episodeId)}/clips`));
+  return getJson<{ clips: Clip[] }>(apiUrl(`/api/episodes/${encodeURIComponent(episodeId)}/clips?ts=${Date.now()}`), {
+    cache: 'no-store',
+  });
 }
 
 export async function uploadYouTube(url: string): Promise<ApiResult<{ episode_id: string }>> {
@@ -92,6 +94,76 @@ export async function uploadYouTube(url: string): Promise<ApiResult<{ episode_id
   const data = await res.json().catch(() => undefined);
   const err = (!res.ok && (data?.detail || data?.error || res.statusText)) || undefined;
   return { ok: res.ok, data, error: err } as ApiResult<{ episode_id: string }>;
+}
+
+// New API helpers for the event-driven system
+export type UploadYouTubeError =
+  | "invalid_url"
+  | "too_short"
+  | "too_long"
+  | "live_stream_not_supported"
+  | "bot_detection"
+  | "video_unavailable"
+  | "private_video"
+  | "download_failed"
+  | "audio_conversion_failed"
+  | "youtube_disabled"
+  | "internal_error";
+
+export async function uploadYouTubeSimple(url: string): Promise<{ episode_id: string }> {
+  const form = new FormData();
+  form.append("url", url);
+  const res = await fetch(apiUrl("/api/upload-youtube"), { method: "POST", body: form });
+  if (!res.ok) {
+    let code: UploadYouTubeError = "internal_error";
+    try { code = (await res.json()).detail as UploadYouTubeError; } catch {}
+    throw new Error(code);
+  }
+  return res.json();
+}
+
+export type ProgressStage =
+  | "queued" | "fetching_metadata" | "downloading" | "extracting_audio"
+  | "transcribing" | "scoring" | "processing" | "completed" | "error";
+
+export interface ProgressResponse {
+  stage: ProgressStage;
+  percent?: number;
+  message?: string;
+}
+
+export async function getProgressSimple(episodeId: string): Promise<ProgressResponse> {
+  const res = await fetch(apiUrl(`/api/progress/${episodeId}`), { cache: 'no-store' });
+  if (!res.ok) throw new Error(`progress_http_${res.status}`);
+  const data = await res.json();
+  // normalize both shapes: {ok:true, progress:{...}} or just {...}
+  return (data && (data.progress || data));
+}
+
+// Types are additive; keep your existing Clip type/shape untouched elsewhere.
+export interface ClipSimple {
+  id: string;
+  start: number;
+  end: number;
+  title?: string;
+  previewUrl?: string;   // some backends
+  preview_url?: string;  // others
+  video_url?: string;    // fallback
+  raw_text?: string;
+  full_transcript?: string;
+}
+
+export async function getClipsSimple(episodeId: string): Promise<ClipSimple[]> {
+  const res = await fetch(apiUrl(`/api/episodes/${episodeId}/clips?ts=${Date.now()}`), {
+    cache: 'no-store',
+  });
+  if (!res.ok) throw new Error(`clips_http_${res.status}`);
+  return res.json();
+}
+
+export function isTerminalProgress(p?: { stage?: string; percent?: number } | null) {
+  if (!p) return false;
+  return p.stage === "completed" || (p.stage === "scoring" && (p.percent ?? 0) >= 100);
 }
 
 export async function uploadFile(

@@ -6,8 +6,9 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { Upload, FileAudio, FileVideo, X, CheckCircle, AlertCircle, Clock, Loader2, Youtube, Link } from 'lucide-react';
 import { Episode, Clip, ProgressInfo } from '@shared/types';
 import { normalizeClip, normalizeProgressInfo, normalizeProgress } from '@shared/normalize';
-import { getClips, uploadFile, uploadYouTube, handleApiResult } from '@shared/api';
+import { getClips, uploadFile, uploadYouTube, handleApiResult, uploadYouTubeSimple, type ProgressResponse, isTerminalProgress } from '../src/shared/api';
 import { createProgressPoller, PollingOptions, Poller } from '@shared/polling';
+import { useProgressPoller } from '../src/hooks/useProgress';
 
 
 type Props = {
@@ -42,6 +43,28 @@ export default function EpisodeUpload({
   const didFetchRef = useRef(false);
   const pollerRef = useRef<Poller | null>(null);
 
+  // New progress poller hook for YouTube uploads
+  useProgressPoller(episodeId || undefined, {
+    onUpdate: (p: ProgressResponse) => {
+      const progressInfo = normalizeProgressInfo({
+        stage: p.stage,
+        percentage: p.percent || 0,
+        message: p.message || ''
+      });
+      setProgressData(progressInfo);
+      if (process.env.NODE_ENV === 'development') {
+        console.log(`[PROGRESS_POLLER] Updated progress: ${p.stage} ${p.percent}%`);
+      }
+    },
+    onDone: () => {
+      if (process.env.NODE_ENV === 'development') {
+        console.log('[PROGRESS_POLLER] Processing completed!');
+      }
+      setUploadStatus('completed');
+      onCompleted?.();
+    }
+  });
+
   // 🔁 If parent passes an id+status, pick up polling
   useEffect(() => {
     if (initialEpisodeId) setEpisodeId(initialEpisodeId);
@@ -59,8 +82,22 @@ export default function EpisodeUpload({
     }
     
     // Check for completed state with more flexible conditions
-    const isCompleted = progressData?.stage === 'completed' || 
-                       (progressData?.percentage && progressData.percentage >= 100 && progressData?.stage !== 'error');
+    const isCompleted = isTerminalProgress(progressData);
+    
+    // Handle hard errors so UI doesn't hang forever
+    if (progressData?.stage === "error") {
+      console.warn("[PROGRESS] Error:", progressData.message || "processing failed");
+      let errorMessage = progressData.message || "Processing failed";
+      
+      // Add helpful context for YouTube errors
+      if (errorMessage.includes("requires login") || errorMessage.includes("age restrictions")) {
+        errorMessage += " Most videos work fine - try a different video or contact support if this persists.";
+      }
+      
+      setError(errorMessage);
+      setUploadStatus('error');
+      return;
+    }
     
     if (isCompleted && !didFetchRef.current && episodeId) {
       if (process.env.NODE_ENV === 'development') {
@@ -114,6 +151,9 @@ export default function EpisodeUpload({
       'too_short': 'Video is too short (minimum 60 seconds)',
       'too_long': 'Video is too long (maximum 4 hours)',
       'live_stream_not_supported': 'Live streams are not supported',
+      'bot_detection': 'YouTube is blocking automated requests. Please try again in a few minutes or use a different video.',
+      'video_unavailable': 'This video is not available for download.',
+      'private_video': 'This video is private and cannot be processed.',
       'download_failed': 'Failed to download video. Please try again.',
       'audio_conversion_failed': 'Failed to process audio. Please try again.',
       'youtube_disabled': 'YouTube upload is currently disabled',
@@ -148,69 +188,22 @@ export default function EpisodeUpload({
     didFetchRef.current = false;
 
     try {
-      // Upload YouTube URL using API
-      const result = await uploadYouTube(url);
+      // Upload YouTube URL using the new simple API
+      const data = await uploadYouTubeSimple(url);
       
-      handleApiResult(
-        result,
-        (data) => {
-          if (process.env.NODE_ENV === 'development') {
-            console.log('[YOUTUBE_UPLOAD] Upload successful, episode ID:', data.episode_id);
-          }
-          const episodeId = data.episode_id;
+      if (process.env.NODE_ENV === 'development') {
+        console.log('[YOUTUBE_UPLOAD] Upload successful, episode ID:', data.episode_id);
+      }
+      const episodeId = data.episode_id;
 
-          setEpisodeId(episodeId);
-          setUploadProgress(25); // Initial progress after upload
-          setUploadStatus('processing');
-          
-          // Start polling for progress
-          const pollingOptions: PollingOptions = {
-            onSuccess: (data) => {
-              const progressInfo = normalizeProgressInfo(data);
-              setProgressData(progressInfo);
-              if (process.env.NODE_ENV === 'development') {
-                console.log(`[POLLING] Updated progress: ${progressInfo?.stage} ${progressInfo?.percentage}%`);
-              }
-            },
-            onError: (error, retryCount) => {
-              if (process.env.NODE_ENV === 'development') {
-                console.error(`[POLLING] Error (attempt ${retryCount}):`, error);
-              }
-              // Don't show error for scoring - it can take 30+ minutes
-              if (retryCount >= 50 && !error.includes('signal timed out')) {
-                setError(`Processing failed: ${error}`);
-              }
-            },
-            on404: () => {
-              if (process.env.NODE_ENV === 'development') {
-                console.log('[POLLING] Episode not found, stopping');
-              }
-              setError('Episode not found');
-              return false;
-            },
-            onComplete: () => {
-              if (process.env.NODE_ENV === 'development') {
-                console.log('[POLLING] Processing completed!');
-              }
-              setUploadStatus('completed');
-              onCompleted?.();
-            }
-          };
-          
-          const poller = createProgressPoller(`http://localhost:8000/api/progress/${episodeId}`, pollingOptions);
-          pollerRef.current = poller;
-          poller.start();
-          
-          onEpisodeUploaded(episodeId);
-        },
-        (error) => {
-          if (process.env.NODE_ENV === 'development') {
-            console.error('[YOUTUBE_UPLOAD] Upload failed:', error);
-          }
-          setError(mapYouTubeError(error));
-          setUploadStatus('error');
-        }
-      );
+      setEpisodeId(episodeId);
+      setUploadProgress(25); // Initial progress after upload
+      setUploadStatus('processing');
+      
+      // The useProgressPoller hook will automatically start polling
+      // and handle progress updates and completion
+      onEpisodeUploaded(episodeId);
+      
     } catch (err: any) {
       if (process.env.NODE_ENV === 'development') {
         console.error('[YOUTUBE_UPLOAD] Upload error:', err);

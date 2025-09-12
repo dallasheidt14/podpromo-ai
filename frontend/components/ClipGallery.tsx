@@ -1,17 +1,82 @@
 // components/ClipGallery.tsx
 "use client";
-import React, { useMemo, useState, useEffect } from "react";
+import React, { useMemo, useState, useEffect, useCallback } from "react";
 import Modal from "./Modal";
 import { Clip } from "@shared/types";
+import { getClipsSimple, type ClipSimple } from "../src/shared/api";
+import { onClipsReady } from "../src/shared/events";
+
+// Robust video preview component with error handling and remounting
+function VideoPreview({ src, isVideo, isAudio, clipId }: { 
+  src: string; 
+  isVideo: boolean; 
+  isAudio: boolean; 
+  clipId: string; 
+}) {
+  const [error, setError] = useState(false);
+  
+  if (!src) {
+    return (
+      <div className="h-full w-full flex items-center justify-center bg-gradient-to-br from-gray-100 to-gray-200">
+        <div className="text-center">
+          <div className="w-16 h-16 mx-auto mb-2 bg-gray-400 rounded-full flex items-center justify-center">
+            <span className="text-white text-2xl">📄</span>
+          </div>
+          <p className="text-sm text-gray-600 font-medium">No Preview</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (isVideo && !error) {
+    return (
+      <video
+        key={src} // Force remount when src changes
+        src={src}
+        className="h-full w-full object-cover"
+        muted
+        playsInline
+        preload="metadata"
+        onError={() => setError(true)}
+        style={{ background: "#000" }}
+      />
+    );
+  }
+
+  if (isAudio && !error) {
+    return (
+      <div className="h-full w-full flex items-center justify-center bg-gradient-to-br from-blue-100 to-purple-100">
+        <div className="text-center">
+          <div className="w-16 h-16 mx-auto mb-2 bg-blue-500 rounded-full flex items-center justify-center">
+            <span className="text-white text-2xl">🎵</span>
+          </div>
+          <p className="text-sm text-gray-600 font-medium">Audio Preview</p>
+        </div>
+      </div>
+    );
+  }
+
+  // Fallback to audio if video fails or if it's not clearly video/audio
+  return (
+    <audio
+      key={src + ":audio"}
+      src={src}
+      controls
+      className="h-full w-full"
+      onError={() => setError(true)}
+    />
+  );
+}
 
 type Props = {
-  clips: Clip[];
+  clips?: Clip[]; // Make optional since we can fetch them ourselves
   emptyMessage?: string;
   onClipUpdate?: (clipId: string, updates: Partial<Clip>) => void;
   episodeId?: string;
+  onClipsFetched?: (clips: Clip[]) => void; // Callback to notify parent of fetched clips
 };
 
-export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onClipUpdate, episodeId }: Props) {
+export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onClipUpdate, episodeId, onClipsFetched }: Props) {
   const [open, setOpen] = useState(false);
   const [selected, setSelected] = useState<Clip | null>(null);
   const [playingClipId, setPlayingClipId] = useState<string | null>(null);
@@ -20,6 +85,77 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
   const [currentTitle, setCurrentTitle] = useState<string>("");
   const [processedClips, setProcessedClips] = useState<Set<string>>(new Set());
   const [generatingClips, setGeneratingClips] = useState<Set<string>>(new Set());
+  
+  // Internal clips state for when we fetch them ourselves
+  const [internalClips, setInternalClips] = useState<Clip[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string>("");
+
+  // Use clips from props if provided, otherwise use internal state
+  const displayClips = clips || internalClips;
+
+  // Normalize preview URL from various possible field names
+  const normalizeSrc = (clip: Clip | ClipSimple) => {
+    return (clip as any).previewUrl || (clip as any).preview_url || (clip as any).video_url || "";
+  };
+
+  // Convert ClipSimple to Clip format
+  const convertToClip = (simpleClip: ClipSimple): Clip => {
+    return {
+      id: simpleClip.id,
+      startTime: simpleClip.start,
+      endTime: simpleClip.end,
+      start: simpleClip.start, // Alias for compatibility
+      end: simpleClip.end,     // Alias for compatibility
+      duration: simpleClip.end - simpleClip.start,
+      score: 0, // Default score
+      title: simpleClip.title || '',
+      text: simpleClip.raw_text || simpleClip.full_transcript || '',
+      raw_text: simpleClip.raw_text || '',
+      full_transcript: simpleClip.full_transcript || '',
+      status: 'completed' as const,
+      features: {},
+      downloadUrl: null,
+      previewUrl: normalizeSrc(simpleClip),
+      error: null,
+    };
+  };
+
+  // Fetch clips function
+  const fetchClips = useCallback(async (id: string) => {
+    if (!id) return;
+    
+    setLoading(true);
+    setError("");
+    try {
+      const simpleClips = await getClipsSimple(id);
+      const convertedClips = simpleClips.map(convertToClip);
+      setInternalClips(convertedClips);
+      onClipsFetched?.(convertedClips);
+    } catch (e: any) {
+      setError(e?.message || "Failed to load clips");
+    } finally {
+      setLoading(false);
+    }
+  }, [onClipsFetched]);
+
+  // Fetch clips when episodeId changes
+  useEffect(() => {
+    if (episodeId && !clips) {
+      fetchClips(episodeId);
+    }
+  }, [episodeId, clips, fetchClips]);
+
+  // Listen for clips-ready events
+  useEffect(() => {
+    if (!episodeId) return;
+    
+    return onClipsReady((completedEpisodeId) => {
+      if (completedEpisodeId === episodeId) {
+        fetchClips(completedEpisodeId);
+      }
+    });
+  }, [episodeId, fetchClips]);
 
   // Reset UI state when episode changes to prevent title bleed
   useEffect(() => {
@@ -32,9 +168,9 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
   }, [episodeId]);
 
   useEffect(() => {
-    if (clips && clips.length > 0) {
+    if (displayClips && displayClips.length > 0) {
       // Auto-generate titles for clips that need them (only once per clip)
-      clips.forEach((clip, index) => {
+      displayClips.forEach((clip, index) => {
         if (processedClips.has(clip.id) || generatingClips.has(clip.id)) return; // Skip if already processed or generating
         
         const transcript = clip.text;
@@ -210,10 +346,29 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
 
   return (
     <>
-      <div className="grid gap-4 sm:gap-6 grid-cols-1 sm:grid-cols-2 lg:grid-cols-3">
-        {sorted.map((clip) => {
-          const isVideo = clip.previewUrl?.match(/\.(mp4|mov|webm|avi)$/i);
-          const isAudio = clip.previewUrl?.match(/\.(mp3|m4a|aac|ogg|wav)$/i);
+      {loading && (
+        <div className="text-center py-8">
+          <div className="w-8 h-8 border-4 border-blue-500/20 border-t-blue-500 rounded-full animate-spin mx-auto mb-4"></div>
+          <p className="text-gray-600">Loading clips...</p>
+        </div>
+      )}
+      {error && (
+        <div className="text-center py-8">
+          <div className="text-red-500 mb-2">⚠️ Error loading clips</div>
+          <p className="text-gray-600">{error}</p>
+        </div>
+      )}
+      {!loading && !error && displayClips.length === 0 && (
+        <div className="text-center py-8">
+          <p className="text-gray-600">{emptyMessage}</p>
+        </div>
+      )}
+      {!loading && !error && displayClips.length > 0 && (
+        <div className="grid gap-4 sm:gap-6 grid-cols-1 sm:grid-cols-2 lg:grid-cols-3">
+        {displayClips.map((clip) => {
+          const src = normalizeSrc(clip);
+          const isVideo = src && src.match(/\.(mp4|mov|webm|avi)$/i);
+          const isAudio = src && src.match(/\.(mp3|m4a|aac|ogg|wav)$/i);
           return (
             <div
               key={clip.id}
@@ -222,61 +377,12 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
               {/* Decorative accent */}
               <div className="absolute top-0 right-0 w-16 h-16 bg-yellow-200 rounded-full -translate-y-8 translate-x-8 opacity-30 group-hover:opacity-50 transition-opacity"></div>
               <div className="aspect-video w-full overflow-hidden rounded-t-2xl bg-neutral-100">
-                {isVideo ? (
-                  <video
-                    src={clip.previewUrl}
-                    className="h-full w-full object-cover"
-                    muted
-                    playsInline
-                    preload="metadata"
-                  />
-                ) : isAudio ? (
-                  <div 
-                    className="flex h-full w-full items-center justify-center bg-gradient-to-br from-blue-50 to-purple-50 relative cursor-pointer hover:from-blue-100 hover:to-purple-100 transition-colors"
-                    onClick={() => handlePlayPause(clip)}
-                  >
-                    {/* Waveform Visualization */}
-                    <div className="absolute inset-0 flex items-center justify-center px-4">
-                      <div className="flex items-end space-x-1 h-16">
-                        {Array.from({ length: 20 }, (_, i) => {
-                          const height = Math.random() * 0.8 + 0.2; // Random height between 20% and 100%
-                          const isActive = playingClipId === clip.id;
-                          return (
-                            <div
-                              key={i}
-                              className={`w-1 rounded-full transition-all duration-150 ${
-                                isActive 
-                                  ? 'bg-blue-500 animate-pulse' 
-                                  : 'bg-blue-300'
-                              }`}
-                              style={{ height: `${height * 100}%` }}
-                            />
-                          );
-                        })}
-                      </div>
-                    </div>
-                    
-                    {/* Play/Pause Button Overlay */}
-                    <div className="relative z-10">
-                      <div className="w-16 h-16 bg-white rounded-full flex items-center justify-center shadow-lg hover:shadow-xl transition-shadow">
-                        {playingClipId === clip.id ? (
-                          <svg width="24" height="24" viewBox="0 0 24 24" className="text-blue-600">
-                            <rect x="6" y="4" width="4" height="16" fill="currentColor"/>
-                            <rect x="14" y="4" width="4" height="16" fill="currentColor"/>
-                          </svg>
-                        ) : (
-                          <svg width="24" height="24" viewBox="0 0 24 24" className="text-blue-600">
-                            <path d="M8 5v14l11-7z" fill="currentColor"/>
-                          </svg>
-                        )}
-                      </div>
-                    </div>
-                  </div>
-                ) : (
-                  <div className="flex h-full w-full items-center justify-center text-neutral-400">
-                    No preview
-                  </div>
-                )}
+                <VideoPreview 
+                  src={normalizeSrc(clip)}
+                  isVideo={isVideo}
+                  isAudio={isAudio}
+                  clipId={clip.id}
+                />
               </div>
 
               <div className="p-4 space-y-3">
@@ -323,8 +429,8 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
                     {playingClipId === clip.id ? '⏸️ Pause Audio' : '🎵 Preview Audio'}
                   </button>
 
-                  {clip.previewUrl && isVideo && (
-                    <a className="btn" href={clip.previewUrl} target="_blank" rel="noreferrer">
+                  {src && isVideo && (
+                    <a className="btn" href={src} target="_blank" rel="noreferrer">
                       Preview
                     </a>
                   )}
@@ -339,14 +445,13 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
             </div>
           );
         })}
-      </div>
+        </div>
+      )}
 
       {/* Hidden audio element for playback */}
       {playingClipId && (() => {
-        const clip = clips.find(c => c.id === playingClipId);
-        const audioUrl = clip?.previewUrl ? 
-          (clip.previewUrl.startsWith('http') ? clip.previewUrl : `http://localhost:8000${clip.previewUrl}`) : 
-          null;
+        const clip = displayClips.find(c => c.id === playingClipId);
+        const audioUrl = clip ? normalizeSrc(clip) : null;
         return audioUrl ? (
           <audio
             key={playingClipId}
@@ -438,12 +543,12 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
               <p className="text-sm text-gray-600">{selected.text}</p>
             </div>
           )}
-          {selected?.previewUrl && (
+          {selected && normalizeSrc(selected) && (
             <div className="mb-4">
               <h5 className="font-medium mb-2">Preview:</h5>
               <audio 
-                src={selected.previewUrl.startsWith('http') ? selected.previewUrl : `http://localhost:8000${selected.previewUrl}`} 
-                controls 
+                src={normalizeSrc(selected)} 
+                controls
                 className="w-full" 
               />
             </div>
