@@ -77,13 +77,14 @@ class EpisodeService:
         self.whisper_model = None
         self._init_whisper()
         self._processing_episodes: set[str] = set() # Track episodes currently being processed
+        self._episodes_loaded = False  # Flag to track if episodes have been loaded
         
         # Create storage directory for transcripts
         self.storage_dir = os.path.join(UPLOAD_DIR, "transcripts")
         os.makedirs(self.storage_dir, exist_ok=True)
         
-        # Load existing episodes on startup
-        self._load_episodes()
+        # Don't load episodes on startup - load them lazily when needed
+        logger.info("EpisodeService initialized - episodes will be loaded on demand")
     
     def _cleanup_expired_trackers(self):
         """Remove expired progress trackers"""
@@ -109,21 +110,27 @@ class EpisodeService:
         except ImportError:
             return False
     
-    def _load_episodes(self):
-        """Load episodes from storage on startup"""
+    def _ensure_episodes_loaded(self):
+        """Lazy load episodes only when needed"""
+        if self._episodes_loaded:
+            return
+            
         try:
             if not os.path.exists(self.storage_dir):
                 logger.warning(f"Storage directory {self.storage_dir} does not exist")
+                self._episodes_loaded = True
                 return
                 
             files = os.listdir(self.storage_dir)
-            logger.info(f"Found {len(files)} files in storage directory")
+            logger.info(f"Lazy loading {len(files)} episode files from storage")
             
-            for filename in files:
+            # Only load recent episodes (last 10) to avoid startup delay
+            recent_files = sorted(files, key=lambda f: os.path.getmtime(os.path.join(self.storage_dir, f)), reverse=True)[:10]
+            
+            for filename in recent_files:
                 if filename.endswith('.json'):
                     episode_id = filename[:-5]  # Remove .json extension
                     filepath = os.path.join(self.storage_dir, filename)
-                    logger.info(f"Loading episode {episode_id} from {filepath}")
                     
                     try:
                         with open(filepath, 'r', encoding='utf-8') as f:
@@ -133,15 +140,30 @@ class EpisodeService:
                                 data['uploaded_at'] = datetime.fromisoformat(data['uploaded_at'])
                             if data.get('processed_at'):
                                 data['processed_at'] = datetime.fromisoformat(data['processed_at'])
+                            
+                            # Clean up clips data if it exists and is corrupted
+                            if 'clips' in data and data['clips'] is not None:
+                                if not isinstance(data['clips'], list):
+                                    logger.warning(f"Corrupted clips data for episode {episode_id}, setting to None")
+                                    data['clips'] = None
+                                else:
+                                    # Filter out non-dict items from clips
+                                    cleaned_clips = []
+                                    for item in data['clips']:
+                                        if isinstance(item, dict):
+                                            cleaned_clips.append(item)
+                                    data['clips'] = cleaned_clips
+                            
                             episode = Episode(**data)
                             self.episodes[episode_id] = episode
-                            logger.info(f"Successfully loaded episode {episode_id}")
                     except Exception as e:
                         logger.error(f"Failed to load episode {episode_id}: {e}")
                         
-            logger.info(f"Loaded {len(self.episodes)} episodes from storage")
+            self._episodes_loaded = True
+            logger.info(f"Lazy loaded {len(self.episodes)} recent episodes from storage")
         except Exception as e:
-            logger.error(f"Failed to load episodes: {e}")
+            logger.error(f"Failed to lazy load episodes: {e}")
+            self._episodes_loaded = True  # Mark as loaded to avoid retrying
     
     def _save_episode(self, episode: Episode):
         """Save episode to storage"""
@@ -462,10 +484,12 @@ class EpisodeService:
     
     async def get_episode(self, episode_id: str) -> Optional[Episode]:
         """Get episode by ID"""
+        self._ensure_episodes_loaded()
         return self.episodes.get(episode_id)
     
     async def get_all_episodes(self) -> List[Episode]:
         """Get all episodes"""
+        self._ensure_episodes_loaded()
         return list(self.episodes.values())
 
     async def list_episodes(self) -> List[Episode]:
@@ -477,6 +501,11 @@ class EpisodeService:
         try:
             # Import progress writer
             from services.progress_writer import write_progress
+            
+            # Check if already processing to prevent rescoring loops
+            if episode_id in self._processing_episodes:
+                logger.warning(f"Episode {episode_id} is already being processed, skipping duplicate processing")
+                return
             
             # Add to processing guard
             self._processing_episodes.add(episode_id)
@@ -541,7 +570,13 @@ class EpisodeService:
             
             try:
                 # Check if clips already exist to avoid re-scoring
-                if hasattr(episode, 'clips') and episode.clips:
+                # More robust check: ensure clips exist, are a list, and have content
+                clips_exist = (hasattr(episode, 'clips') and 
+                             episode.clips is not None and 
+                             isinstance(episode.clips, list) and 
+                             len(episode.clips) > 0)
+                
+                if clips_exist:
                     logger.info(f"Using existing clips for episode {episode_id}: {len(episode.clips)} clips")
                     clips = episode.clips
                     
@@ -572,6 +607,7 @@ class EpisodeService:
                     except Exception as e:
                         logger.error(f"Failed to save existing clips to file: {e}")
                 else:
+                    logger.info(f"No existing clips found for episode {episode_id}, generating new clips...")
                     # Import clip scoring service
                     from services.clip_score import ClipScoreService
                     clip_score_service = ClipScoreService(self)

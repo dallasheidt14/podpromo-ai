@@ -700,15 +700,37 @@ def generate_titles(
                 return filtered_titles[:n]
     
     if not text or _is_too_short(text):
-        # Safe fallbacks; never return empty.
-        fallbacks = [
-            "Most Leaders Solve the Wrong Problem",
-            "Before You Decide, Do This",
-            "The Hidden Trap Most Teams Miss",
-        ]
+        # Generate contextual fallbacks based on available text
+        fallbacks = []
+        
+        # Try to extract meaningful words from the text
+        if text and len(text.strip()) > 10:
+            words = re.findall(r'\b\w+\b', text.lower())
+            if words:
+                # Use the most common meaningful words
+                word_counts = Counter(words)
+                common_words = [w for w, c in word_counts.most_common(3) if len(w) > 3 and w not in {'that', 'this', 'with', 'from', 'they', 'have', 'been', 'will', 'said', 'each', 'which', 'their', 'time', 'would', 'there', 'could', 'other', 'after', 'first', 'well', 'also', 'where', 'much', 'some', 'very', 'when', 'here', 'just', 'into', 'than', 'only', 'over', 'think', 'know', 'take', 'come', 'made', 'find', 'give', 'tell', 'work', 'call', 'try', 'ask', 'need', 'feel', 'become', 'leave', 'put', 'mean', 'keep', 'let', 'begin', 'seem', 'help', 'talk', 'turn', 'start', 'show', 'hear', 'play', 'run', 'move', 'live', 'believe', 'hold', 'bring', 'happen', 'write', 'provide', 'sit', 'stand', 'lose', 'pay', 'meet', 'include', 'continue', 'set', 'learn', 'change', 'lead', 'understand', 'watch', 'follow', 'stop', 'create', 'speak', 'read', 'allow', 'add', 'spend', 'grow', 'open', 'walk', 'win', 'offer', 'remember', 'love', 'consider', 'appear', 'buy', 'wait', 'serve', 'die', 'send', 'expect', 'build', 'stay', 'fall', 'cut', 'reach', 'kill', 'remain', 'suggest', 'raise', 'pass', 'sell', 'require', 'report', 'decide', 'pull'}]
+                
+                if common_words:
+                    # Create contextual fallbacks using the actual content
+                    if len(common_words) >= 2:
+                        fallbacks.append(f"The {common_words[0].title()} {common_words[1].title()} Strategy")
+                        fallbacks.append(f"Why {common_words[0].title()} Matters More Than You Think")
+                    if len(common_words) >= 1:
+                        fallbacks.append(f"The {common_words[0].title()} Method")
+                        fallbacks.append(f"Master {common_words[0].title()} in Minutes")
+        
+        # If no contextual fallbacks, use generic ones
+        if not fallbacks:
+            fallbacks = [
+                "The Strategy That Changes Everything",
+                "What Most People Get Wrong",
+                "The Method That Actually Works",
+            ]
+        
         out = []
         for t in fallbacks:
-            sc, rs = _score(t, platform=plat, topic_hint="problem", text=text, avoid=avoid_keys)
+            sc, rs = _score(t, platform=plat, topic_hint="strategy", text=text, avoid=avoid_keys)
             out.append({"title": t, "score": sc, "reasons": rs})
         return sorted(out, key=lambda x: x["score"], reverse=True)[:max(1, n)]
 

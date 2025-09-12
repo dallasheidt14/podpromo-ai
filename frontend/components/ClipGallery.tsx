@@ -323,7 +323,7 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
                     {playingClipId === clip.id ? '⏸️ Pause Audio' : '🎵 Preview Audio'}
                   </button>
 
-                  {clip.previewUrl && !isAudio && (
+                  {clip.previewUrl && isVideo && (
                     <a className="btn" href={clip.previewUrl} target="_blank" rel="noreferrer">
                       Preview
                     </a>

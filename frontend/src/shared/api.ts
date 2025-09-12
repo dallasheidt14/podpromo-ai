@@ -82,6 +82,18 @@ export async function getClips(episodeId: string): Promise<ApiResult<{ clips: Cl
   return getJson<{ clips: Clip[] }>(apiUrl(`/api/episodes/${encodeURIComponent(episodeId)}/clips`));
 }
 
+export async function uploadYouTube(url: string): Promise<ApiResult<{ episode_id: string }>> {
+  const form = new FormData();
+  form.append('url', url);
+  const res = await fetch(apiUrl('/api/upload-youtube'), {
+    method: 'POST',
+    body: form
+  });
+  const data = await res.json().catch(() => undefined);
+  const err = (!res.ok && (data?.detail || data?.error || res.statusText)) || undefined;
+  return { ok: res.ok, data, error: err } as ApiResult<{ episode_id: string }>;
+}
+
 export async function uploadFile(
   file: File, 
   onProgress?: (progress: number) => void

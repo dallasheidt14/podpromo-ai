@@ -8,7 +8,7 @@ from typing import List, Optional, Dict, Any, Union
 # from sqlalchemy import Column, Integer, String, Float, DateTime, Text, Boolean, JSON, ForeignKey
 # from sqlalchemy.orm import relationship, declarative_base
 # from sqlalchemy.ext.declarative import declarative_base
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 import uuid
 
 # Import database configuration
@@ -160,6 +160,30 @@ class Episode(BaseModel):
         "from_attributes": True,
         "frozen": False  # Allow mutation of fields after creation
     }
+    
+    @field_validator('clips', mode='before')
+    @classmethod
+    def validate_clips(cls, v):
+        """Validate and clean clips data to handle corrupted data gracefully"""
+        if v is None:
+            return None
+        
+        # If it's already a list, validate each item
+        if isinstance(v, list):
+            cleaned_clips = []
+            for item in v:
+                if isinstance(item, dict):
+                    cleaned_clips.append(item)
+                elif isinstance(item, str):
+                    # Skip string items that shouldn't be in clips
+                    continue
+                else:
+                    # Skip other invalid types
+                    continue
+            return cleaned_clips
+        
+        # If it's not a list, return None (corrupted data)
+        return None
 
 class MomentScore(BaseModel):
     """Pydantic model for moment scoring"""

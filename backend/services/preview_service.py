@@ -160,11 +160,88 @@ def ensure_preview(
         logger.error(f"Unexpected error generating preview: {e}", exc_info=True)
         return None
 
+def _hash_name(episode_id: str, clip_id: str, start: float, end: float) -> str:
+    """Generate a hash-based filename for previews."""
+    key = f"{episode_id}:{clip_id}:{round(start,2)}:{round(end,2)}"
+    return hashlib.md5(key.encode("utf-8")).hexdigest()[:16]
+
+def _run_ffmpeg(argv: list[str]) -> None:
+    """Run ffmpeg command with error handling."""
+    proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.decode("utf-8", errors="ignore")[:400])
+
+def ensure_preview(
+    *,
+    source_media: Path,
+    episode_id: str,
+    clip_id: str,
+    start_sec: float,
+    end_sec: float,
+    max_preview_sec: float = 20.0,
+    audio_bitrate: str = "128k",
+    sample_rate: int = 44100,
+    **kwargs,
+) -> Optional[str]:
+    """
+    Create (or reuse) an H.264/AAC MP4 preview and return its public URL.
+    Always produces MP4 so <video> works in the browser.
+    """
+    try:
+        PREVIEWS_DIR.mkdir(parents=True, exist_ok=True)
+        duration = max(0.2, min(max_preview_sec, float(end_sec) - float(start_sec)))
+        name = _hash_name(episode_id, clip_id, start_sec, start_sec + duration)
+        out_path = PREVIEWS_DIR / f"{episode_id}_{clip_id}_{name}.mp4"
+        if out_path.exists():
+            return f"/clips/previews/{out_path.name}"
+
+        src = str(source_media)
+        dst = str(out_path)
+        # Detect if source is video (we'll assume video if not pure audio extension)
+        is_video = not source_media.suffix.lower() in {".wav", ".mp3", ".m4a"}
+
+        if is_video:
+            # Trim video + audio; faststart for streaming
+            argv = [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-ss", f"{start_sec:.3f}", "-i", src, "-t", f"{duration:.3f}",
+                "-vf", "scale='min(1280,iw)':-2,format=yuv420p",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+                "-c:a", "aac", "-b:a", audio_bitrate, "-ar", str(sample_rate),
+                "-movflags", "+faststart", dst,
+            ]
+        else:
+            # Audio-only → audiogram on black canvas
+            argv = [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-ss", f"{start_sec:.3f}", "-i", src, "-t", f"{duration:.3f}",
+                "-f", "lavfi", "-i", f"color=c=black:s=1280x720:d={duration:.3f}",
+                "-lavfi", "showspectrum=mode=lines:color=intensity:slide=scroll:scale=log",
+                "-shortest",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+                "-c:a", "aac", "-b:a", audio_bitrate, "-ar", str(sample_rate),
+                "-movflags", "+faststart", dst,
+            ]
+        _run_ffmpeg(argv)
+        return f"/clips/previews/{out_path.name}"
+    except Exception as e:
+        logger.error(f"Preview generation failed for {episode_id}/{clip_id}: {e}", exc_info=True)
+        return None
+
 def get_episode_media_path(episode_id: str) -> Optional[Path]:
-    """Get the path to the episode's audio file."""
-    # Try common audio extensions
-    for ext in ['.mp3', '.wav', '.m4a', '.mp4', '.mov', '.avi']:
+    """Get the path to the episode's media file (backward-compatible resolver)."""
+    # New flat structure: backend/uploads/<episode_id>.{ext}
+    for ext in ['.mp4', '.mp3', '.wav', '.m4a', '.mov', '.avi']:
         path = UPLOADS_DIR / f"{episode_id}{ext}"
         if path.exists():
             return path
+    
+    # Legacy directory structure: backend/uploads/<episode_id>/{source.mp3|input.wav|input.mp3}
+    episode_dir = UPLOADS_DIR / episode_id
+    if episode_dir.exists():
+        for filename in ['source.mp3', 'input.wav', 'input.mp3', 'audio.mp3', 'audio.wav']:
+            path = episode_dir / filename
+            if path.exists():
+                return path
+    
     return None

@@ -1549,3 +1549,59 @@ class ClipScoreService:
         except Exception as e:
             logger.error(f"Failed to get candidates: {e}", exc_info=True)
             return [], None
+
+async def score_episode(episode, segments):
+    """
+    Score an episode and return ranked clips.
+    This is a standalone function for compatibility with the existing main.py usage.
+    """
+    try:
+        # Create a ClipScoreService instance
+        from services.episode_service import EpisodeService
+        episode_service = EpisodeService()
+        clip_service = ClipScoreService(episode_service)
+        
+        # Get audio path for the episode
+        audio_path = episode.audio_path
+        if not audio_path:
+            logger.error(f"No audio path found for episode {episode.id}")
+            return []
+        
+        # Convert segments to the format expected by the service
+        transcript_segments = []
+        for seg in segments:
+            transcript_segments.append({
+                'start': seg.get('start', 0),
+                'end': seg.get('end', 0),
+                'text': seg.get('text', ''),
+                'confidence': seg.get('confidence', 0.0)
+            })
+        
+        # Get candidates using the service (await the async call)
+        candidates, default_clip_id = await clip_service.get_candidates(
+            episode_id=episode.id,
+            platform="tiktok_reels",
+            genre="general"
+        )
+        
+        # Convert candidates to the expected format
+        scored_clips = []
+        for candidate in candidates:
+            scored_clips.append({
+                'id': candidate.get('id', ''),
+                'start': candidate.get('start', 0),
+                'end': candidate.get('end', 0),
+                'text': candidate.get('text', ''),
+                'score': candidate.get('score', 0),
+                'confidence': candidate.get('confidence', ''),
+                'genre': candidate.get('genre', 'general'),
+                'platform': candidate.get('platform', 'tiktok'),
+                'features': candidate.get('features', {}),
+                'meta': candidate.get('meta', {})
+            })
+        
+        return scored_clips
+        
+    except Exception as e:
+        logger.error(f"Failed to score episode {episode.id}: {e}", exc_info=True)
+        return []

@@ -94,9 +94,45 @@ export default function EpisodeUpload({
     }
   }, [progressData, episodeId, onCompleted]);
 
+  // YouTube URL validation
+  const validateYouTubeUrl = (url: string): { valid: boolean; error?: string } => {
+    const trimmed = url.trim();
+    if (!trimmed) return { valid: false, error: 'Please enter a YouTube URL' };
+    
+    const youtubeRegex = /^https?:\/\/(www\.)?(youtube\.com|youtu\.be)\/.+/i;
+    if (!youtubeRegex.test(trimmed)) {
+      return { valid: false, error: 'Please enter a valid YouTube URL' };
+    }
+    
+    return { valid: true };
+  };
+
+  // Error message mapping
+  const mapYouTubeError = (error: string): string => {
+    const errorMap: Record<string, string> = {
+      'invalid_url': 'Please enter a valid YouTube URL',
+      'too_short': 'Video is too short (minimum 60 seconds)',
+      'too_long': 'Video is too long (maximum 4 hours)',
+      'live_stream_not_supported': 'Live streams are not supported',
+      'download_failed': 'Failed to download video. Please try again.',
+      'audio_conversion_failed': 'Failed to process audio. Please try again.',
+      'youtube_disabled': 'YouTube upload is currently disabled',
+      'internal_error': 'An unexpected error occurred. Please try again.'
+    };
+    
+    return errorMap[error] || error;
+  };
+
   const onYouTubeUpload = useCallback(async (url: string) => {
     if (uploadStatus === 'uploading') return;
-    if (!url.trim()) return;
+    
+    // Validate URL first
+    const validation = validateYouTubeUrl(url);
+    if (!validation.valid) {
+      setError(validation.error!);
+      setUploadStatus('error');
+      return;
+    }
 
     // Reset state
     if (pollerRef.current) {
@@ -119,9 +155,9 @@ export default function EpisodeUpload({
         result,
         (data) => {
           if (process.env.NODE_ENV === 'development') {
-            console.log('[YOUTUBE_UPLOAD] Upload successful, episode ID:', data.episodeId);
+            console.log('[YOUTUBE_UPLOAD] Upload successful, episode ID:', data.episode_id);
           }
-          const episodeId = data.episodeId;
+          const episodeId = data.episode_id;
 
           setEpisodeId(episodeId);
           setUploadProgress(25); // Initial progress after upload
@@ -171,7 +207,7 @@ export default function EpisodeUpload({
           if (process.env.NODE_ENV === 'development') {
             console.error('[YOUTUBE_UPLOAD] Upload failed:', error);
           }
-          setError(error);
+          setError(mapYouTubeError(error));
           setUploadStatus('error');
         }
       );
@@ -179,7 +215,7 @@ export default function EpisodeUpload({
       if (process.env.NODE_ENV === 'development') {
         console.error('[YOUTUBE_UPLOAD] Upload error:', err);
       }
-      setError(err.message || 'YouTube upload failed');
+      setError(mapYouTubeError(err.message || 'YouTube upload failed'));
       setUploadStatus('error');
     }
   }, [uploadStatus, onEpisodeUploaded]);

@@ -1,221 +1,265 @@
-"""
-YouTube service for downloading and processing YouTube videos
-"""
-
-import os
-import re
-import uuid
-import logging
-from typing import Optional, Dict, Any
+"""YouTube service: metadata gating, resilient download, and audio/video prep."""
+from __future__ import annotations
+import os, re, json, subprocess, logging
+from dataclasses import dataclass
 from pathlib import Path
-import asyncio
-import subprocess
-from urllib.parse import urlparse, parse_qs
+from typing import Dict, Any, Tuple
 
-logger = logging.getLogger(__name__)
+from yt_dlp import YoutubeDL
+from yt_dlp.utils import DownloadError, ExtractorError
 
-class YouTubeService:
-    def __init__(self):
-        self.upload_dir = Path(os.getenv("UPLOAD_DIR", "./uploads"))
-        self.upload_dir.mkdir(exist_ok=True)
-        
-    def is_youtube_url(self, url: str) -> bool:
-        """Check if the URL is a valid YouTube URL"""
-        youtube_patterns = [
-            r'(?:https?://)?(?:www\.)?youtube\.com/watch\?v=([a-zA-Z0-9_-]{11})',
-            r'(?:https?://)?(?:www\.)?youtu\.be/([a-zA-Z0-9_-]{11})',
-            r'(?:https?://)?(?:www\.)?youtube\.com/embed/([a-zA-Z0-9_-]{11})',
-            r'(?:https?://)?(?:www\.)?youtube\.com/v/([a-zA-Z0-9_-]{11})',
-        ]
-        
-        for pattern in youtube_patterns:
-            if re.match(pattern, url):
-                return True
-        return False
+from config.settings import UPLOAD_DIR
+from services.progress_writer import write_progress
+from utils.paths import safe_join, ensure_dir
+
+log = logging.getLogger(__name__)
+
+MIN_DURATION = 60
+MAX_DURATION = 4 * 60 * 60  # 4h
+
+YTDLP_COMMON = {
+    "retries": 8,
+    "fragment_retries": 8,
+    "http_chunk_size": 10 * 1024 * 1024,  # 10 MB
+    "quiet": True,
+    "no_warnings": True,
+    "nocheckcertificate": True,
+    "user_agent": os.getenv(
+        "YTDLP_UA",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    ),
+}
+
+YT_REGEX = re.compile(r"^https?://(www\.)?(youtube\.com|youtu\.be)/.+", re.I)
+
+@dataclass
+class VideoMeta:
+    id: str
+    title: str
+    duration: int
+    is_live: bool
+    webpage_url: str
+
+def _validate_url(url: str) -> bool:
+    """Validate YouTube URL format."""
+    return bool(YT_REGEX.match(url or ""))
+
+def probe(url: str) -> VideoMeta:
+    """Extract video metadata without downloading."""
+    if not _validate_url(url):
+        raise ValueError("invalid_url")
     
-    def extract_video_id(self, url: str) -> Optional[str]:
-        """Extract video ID from YouTube URL"""
-        youtube_patterns = [
-            r'(?:https?://)?(?:www\.)?youtube\.com/watch\?v=([a-zA-Z0-9_-]{11})',
-            r'(?:https?://)?(?:www\.)?youtu\.be/([a-zA-Z0-9_-]{11})',
-            r'(?:https?://)?(?:www\.)?youtube\.com/embed/([a-zA-Z0-9_-]{11})',
-            r'(?:https?://)?(?:www\.)?youtube\.com/v/([a-zA-Z0-9_-]{11})',
-        ]
-        
-        for pattern in youtube_patterns:
-            match = re.match(pattern, url)
-            if match:
-                return match.group(1)
-        return None
+    with YoutubeDL({**YTDLP_COMMON}) as ydl:
+        info = ydl.extract_info(url, download=False)
     
-    def get_video_info(self, video_id: str) -> Optional[Dict[str, Any]]:
-        """Get video information using yt-dlp"""
-        try:
-            import yt_dlp
-            
-            ydl_opts = {
-                'quiet': True,
-                'no_warnings': True,
-                'extract_flat': False,
-            }
-            
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
-                
-                return {
-                    'id': video_id,
-                    'title': info.get('title', 'Unknown Title'),
-                    'duration': info.get('duration', 0),
-                    'description': info.get('description', ''),
-                    'uploader': info.get('uploader', 'Unknown'),
-                    'upload_date': info.get('upload_date', ''),
-                    'view_count': info.get('view_count', 0),
-                    'thumbnail': info.get('thumbnail', ''),
-                }
-        except Exception as e:
-            logger.error(f"Failed to get video info for {video_id}: {e}")
-            return None
+    duration = int(info.get("duration") or 0)
+    is_live = bool(info.get("is_live") or info.get("live_status") in {"is_live", "is_upcoming"})
+    video_id = info.get("id") or ""
+    title = info.get("title") or ""
     
-    async def download_video(self, video_id: str, episode_id: str) -> Optional[Dict[str, Any]]:
-        """Download YouTube video and return file path"""
-        try:
-            import yt_dlp
-            
-            # Create episode directory
-            episode_dir = self.upload_dir / episode_id
-            episode_dir.mkdir(exist_ok=True)
-            
-            # Try multiple format configurations for better compatibility
-            format_configs = [
-                # First try: best audio with MP3 conversion
-                {
-                    'format': 'bestaudio/best',
-                    'outtmpl': str(episode_dir / 'audio.%(ext)s'),
-                    'quiet': True,
-                    'no_warnings': True,
-                    'extract_flat': False,
-                    'http_headers': {
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-                    },
-                    'postprocessors': [{
-                        'key': 'FFmpegExtractAudio',
-                        'preferredcodec': 'mp3',
-                        'preferredquality': '192',
-                    }],
-                },
-                # Fallback: any audio format
-                {
-                    'format': 'bestaudio',
-                    'outtmpl': str(episode_dir / 'audio.%(ext)s'),
-                    'quiet': True,
-                    'no_warnings': True,
-                    'extract_flat': False,
-                    'http_headers': {
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-                    },
-                },
-                # Last resort: any format
-                {
-                    'format': 'best',
-                    'outtmpl': str(episode_dir / 'audio.%(ext)s'),
-                    'quiet': True,
-                    'no_warnings': True,
-                    'extract_flat': False,
-                    'http_headers': {
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-                    },
-                }
-            ]
-            
-            info = None
-            for i, ydl_opts in enumerate(format_configs):
-                try:
-                    logger.info(f"Trying download format config {i+1} for video {video_id}")
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=True)
-                        logger.info(f"Successfully downloaded video {video_id} with config {i+1}")
-                        break
-                except Exception as e:
-                    logger.warning(f"Format config {i+1} failed for video {video_id}: {e}")
-                    if i == len(format_configs) - 1:  # Last attempt
-                        raise e
-                    continue
-            
-            if not info:
-                raise Exception("All download format configurations failed")
-            
-            # Find the downloaded file
-            downloaded_files = list(episode_dir.glob('audio.*'))
-            if not downloaded_files:
-                logger.error(f"No audio file found after download for {video_id}")
-                return None
-            
-            audio_file = downloaded_files[0]
-            
-            # Get video info
-            video_info = {
-                    'id': video_id,
-                    'title': info.get('title', 'Unknown Title'),
-                    'duration': info.get('duration', 0),
-                    'description': info.get('description', ''),
-                    'uploader': info.get('uploader', 'Unknown'),
-                    'upload_date': info.get('upload_date', ''),
-                    'view_count': info.get('view_count', 0),
-                    'thumbnail': info.get('thumbnail', ''),
-                    'filename': audio_file.name,
-                    'file_path': str(audio_file),
-                    'file_size': audio_file.stat().st_size,
-            }
-            
-            logger.info(f"Downloaded YouTube video {video_id} to {audio_file}")
-            return video_info
-                
-        except Exception as e:
-            error_msg = str(e)
-            if "403" in error_msg or "Forbidden" in error_msg:
-                logger.error(f"YouTube video {video_id} is blocked (403 Forbidden). This may be due to geographic restrictions, copyright protection, or YouTube's anti-bot measures.")
-            elif "format is not available" in error_msg:
-                logger.error(f"YouTube video {video_id} has no downloadable formats available.")
-            else:
-                logger.error(f"Failed to download YouTube video {video_id}: {e}")
-            return None
+    # Structured logging
+    log.info("yt.probe_ok", extra={
+        "video_id": video_id,
+        "duration_sec": duration,
+        "is_live": is_live,
+        "title": title[:100]  # Truncate for logging
+    })
     
-    def validate_youtube_url(self, url: str) -> Dict[str, Any]:
-        """Validate YouTube URL and return validation result"""
-        if not url or not isinstance(url, str):
-            return {"valid": False, "error": "No URL provided"}
-        
-        # Clean up URL
-        url = url.strip()
-        if not url.startswith(('http://', 'https://')):
-            url = 'https://' + url
-        
-        if not self.is_youtube_url(url):
-            return {"valid": False, "error": "Invalid YouTube URL format"}
-        
-        video_id = self.extract_video_id(url)
-        if not video_id:
-            return {"valid": False, "error": "Could not extract video ID from URL"}
-        
-        # Check if video exists and is accessible
-        video_info = self.get_video_info(video_id)
-        if not video_info:
-            return {"valid": False, "error": "Video not found or not accessible"}
-        
-        # Check duration (max 4 hours)
-        duration = video_info.get('duration', 0)
-        if duration > 4 * 3600:  # 4 hours
-            return {"valid": False, "error": "Video too long (max 4 hours)"}
-        
-        if duration < 60:  # 1 minute
-            return {"valid": False, "error": "Video too short (min 1 minute)"}
-        
+    if is_live:
+        raise ValueError("live_stream_not_supported")
+    if duration < MIN_DURATION:
+        raise ValueError("too_short")
+    if duration > MAX_DURATION:
+        raise ValueError("too_long")
+    
+    return VideoMeta(
+        id=video_id,
+        title=title,
+        duration=duration,
+        is_live=is_live,
+        webpage_url=info.get("webpage_url") or url,
+    )
+
+def _paths(episode_id: str) -> Tuple[Path, Path]:
+    """Get deterministic paths for video and audio files."""
+    up = Path(UPLOAD_DIR)
+    ensure_dir(up)
+    return (up / f"{episode_id}.mp4", up / f"{episode_id}.wav")
+
+def _ffmpeg(src: str, dst: str, extra_args: list[str]) -> None:
+    """
+    Cross-platform ffmpeg call using argv (no shell; no quoting issues on Windows).
+    """
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", src, *extra_args, dst]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg_failed: {proc.stderr.decode('utf-8', errors='ignore')[:400]}")
+
+def _ffmpeg_audio_to_mp4_audiogram(audio_src: str, dst: str) -> None:
+    """
+    Build an MP4 with a black video layer so previews can trim 'video' even if
+    YouTube provided audio-only. The black canvas is long (15000s) and we use
+    -shortest so output matches the audio duration (max audio is 4h).
+    """
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-i", audio_src,
+        "-f", "lavfi", "-i", "color=c=black:s=1280x720:d=15000",
+        "-shortest",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-movflags", "+faststart",
+        dst,
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg_failed: {proc.stderr.decode('utf-8', errors='ignore')[:400]}")
+
+def download_and_prepare(url: str, episode_id: str) -> Dict[str, Any]:
+    """
+    Download best video+audio merged to MP4, extract 16k/mono WAV for ASR.
+    Falls back to audio-only if video is truly unavailable.
+    """
+    meta = probe(url)
+    write_progress(episode_id, "fetching_metadata", 5, "Fetched video metadata")
+    mp4_path, wav_path = _paths(episode_id)
+    
+    # Log download start
+    log.info("yt.download.start", extra={
+        "episode_id": episode_id,
+        "video_id": meta.id,
+        "duration_sec": meta.duration
+    })
+
+    # Primary attempt: video+audio merged MP4
+    ytdlp_primary = {
+        **YTDLP_COMMON,
+        "format": "bv*+ba/b",                 # best video + best audio, else best
+        "merge_output_format": "mp4",
+        "outtmpl": str(mp4_path.with_suffix(".%(ext)s")),
+    }
+
+    # Fallback: audio-only to MP3 (we still render previews as audiogram)
+    ytdlp_fallback = {
+        **YTDLP_COMMON,
+        "format": "bestaudio/best",
+        "outtmpl": str(mp4_path.with_suffix(".%(ext)s")),  # may be .webm/.m4a
+    }
+
+    try:
+        write_progress(episode_id, "downloading", 8, "Downloading video")
+        with YoutubeDL(ytdlp_primary) as ydl:
+            ydl.download([meta.webpage_url])
+
+        # Normalize extension to .mp4 if merger picked different container
+        # If file already .mp4, this is a no-op rename
+        guessed = next(mp4_path.parent.glob(f"{episode_id}.*"), None)
+        if guessed and guessed.suffix != ".mp4":
+            # Convert container to mp4 without re-encode when possible
+            tmp_mp4 = mp4_path.with_suffix(".mp4")
+            _ffmpeg(str(guessed), str(tmp_mp4), ["-c", "copy"])
+            guessed.unlink(missing_ok=True)
+            tmp_mp4.rename(mp4_path)
+        elif guessed and guessed.suffix == ".mp4":
+            guessed.rename(mp4_path)
+        else:
+            # Shouldn't happen, but be defensive
+            raise RuntimeError("download_no_output")
+
+    except (DownloadError, ExtractorError) as e:
+        log.warning("yt.download.fallback_audio_only", extra={
+            "episode_id": episode_id,
+            "video_id": meta.id,
+            "reason": type(e).__name__
+        })
+        write_progress(episode_id, "downloading", 10, "Falling back to audio-only")
+        with YoutubeDL(ytdlp_fallback) as ydl:
+            ydl.download([meta.webpage_url])
+        # Find produced audio and transcode to mp4 audiogram (black video)
+        produced = next(mp4_path.parent.glob(f"{episode_id}.*"), None)
+        if not produced:
+            raise RuntimeError("download_failed")
+        # Build an MP4 with black canvas so trims work as 'video'
+        tmp_mp4 = mp4_path.with_suffix(".mp4")
+        _ffmpeg_audio_to_mp4_audiogram(str(produced), str(tmp_mp4))
+        produced.unlink(missing_ok=True)
+        tmp_mp4.rename(mp4_path)
+
+    write_progress(episode_id, "extracting_audio", 15, "Extracting audio for transcription")
+    
+    # Debug: Check if mp4 file exists and log paths
+    log.info("yt.audio.extract_start", extra={
+        "episode_id": episode_id,
+        "mp4_path": str(mp4_path),
+        "wav_path": str(wav_path),
+        "mp4_exists": mp4_path.exists(),
+        "mp4_size": mp4_path.stat().st_size if mp4_path.exists() else 0
+    })
+    
+    _ffmpeg(str(mp4_path), str(wav_path), ["-ac", "1", "-ar", "16000"])
+    
+    # Log successful completion
+    log.info("yt.audio.extract_ok", extra={
+        "episode_id": episode_id,
+        "video_id": meta.id,
+        "video_path": str(mp4_path),
+        "wav_path": str(wav_path)
+    })
+    
+    return {
+        "meta": {
+            "id": meta.id,
+            "title": meta.title,
+            "duration": meta.duration,
+            "url": meta.webpage_url,
+        },
+        "video_path": str(mp4_path),
+        "wav_path": str(wav_path),
+    }
+
+def map_error(e: Exception) -> Tuple[int, str]:
+    """Map exceptions to HTTP status codes and error strings."""
+    if isinstance(e, ValueError):
+        msg = str(e)
+        if msg in {"invalid_url", "too_short", "too_long", "live_stream_not_supported"}:
+            return 400, msg
+    if isinstance(e, (DownloadError, ExtractorError)):
+        return 502, "download_failed"
+    if isinstance(e, RuntimeError) and "ffmpeg_failed" in str(e):
+        return 500, "audio_conversion_failed"
+    return 500, "internal_error"
+
+# Backward compatibility functions
+def is_youtube_url(url: str) -> bool:
+    """Check if URL is a valid YouTube URL."""
+    return _validate_url(url)
+
+def validate_youtube_url(url: str) -> Dict[str, Any]:
+    """Validate YouTube URL and return validation result (legacy compatibility)."""
+    try:
+        meta = probe(url)
         return {
             "valid": True,
-            "video_id": video_id,
-            "video_info": video_info,
-            "url": url
+            "video_id": meta.id,
+            "video_info": {
+                "id": meta.id,
+                "title": meta.title,
+                "duration": meta.duration,
+                "description": "",
+                "uploader": "Unknown",
+                "view_count": 0,
+                "thumbnail": "",
+            },
+            "url": meta.webpage_url
         }
+    except ValueError as e:
+        return {"valid": False, "error": str(e)}
+    except Exception as e:
+        return {"valid": False, "error": "validation_failed"}
 
-# Global instance
-youtube_service = YouTubeService()
+# Global instance for backward compatibility
+youtube_service = type('YouTubeService', (), {
+    'is_youtube_url': is_youtube_url,
+    'validate_youtube_url': validate_youtube_url,
+    'download_video': lambda self, video_id, episode_id: download_and_prepare(f"https://www.youtube.com/watch?v={video_id}", episode_id),
+})()

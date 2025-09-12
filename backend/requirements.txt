@@ -26,6 +26,7 @@ aiofiles==24.1.0
 
 # YouTube support
 yt-dlp==2023.12.30
+sentry-sdk
 
 # Optional: For development
 python-dotenv==1.0.0
