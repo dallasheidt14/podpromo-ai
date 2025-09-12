@@ -34,7 +34,12 @@ def _load_clip(clip_id: str, uploads_dir: pathlib.Path) -> Optional[Dict[str, An
     
     try:
         data = json.loads(clips_file.read_text(encoding="utf-8"))
-        clips = data.get("clips", [])
+        
+        # Handle both formats: direct array or wrapped in object
+        if isinstance(data, list):
+            clips = data
+        else:
+            clips = data.get("clips", [])
         
         # Find the specific clip
         for clip in clips:
