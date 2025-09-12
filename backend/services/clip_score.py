@@ -18,6 +18,127 @@ from config.settings import (
     DURATION_TARGET_MIN, DURATION_TARGET_MAX
 )
 
+# Quality gate thresholds
+THRESHOLDS = {
+    "strict": {
+        "payoff_min": 0.12,   # was ~0.20; allow more clips with moderate payoff
+        "ql_max": 0.78,       # allow a bit more "QL" penalty on interviews
+        "hook_min": 0.08,
+        "arousal_min": 0.20,
+    },
+    "balanced": {
+        "payoff_min": 0.08,
+        "ql_max": 0.85,
+        "hook_min": 0.06,
+        "arousal_min": 0.15,
+    },
+    "relaxed": {
+        "payoff_min": 0.05,
+        "ql_max": 0.90,
+        "hook_min": 0.04,
+        "arousal_min": 0.10,
+    }
+}
+
+def _gate(candidates: List[Dict], mode: str) -> List[Dict]:
+    """Apply quality gate with specified mode"""
+    if not candidates:
+        return []
+    
+    thresholds = THRESHOLDS.get(mode, THRESHOLDS["balanced"])
+    passed = []
+    
+    for c in candidates:
+        # Check if clip passes quality gates
+        payoff = c.get("payoff_score", 0.0)
+        hook = c.get("hook_score", 0.0)
+        arousal = c.get("arousal_score", 0.0)
+        info_density = c.get("info_density", 0.0)
+        
+        # Calculate quality penalty (QL)
+        ql_penalty = 0.0
+        if info_density > 0:
+            ql_penalty = min(1.0, (1.0 - info_density) * 0.5)
+        
+        # Apply thresholds
+        if (payoff >= thresholds["payoff_min"] and 
+            hook >= thresholds["hook_min"] and 
+            arousal >= thresholds["arousal_min"] and
+            ql_penalty <= thresholds["ql_max"]):
+            passed.append(c)
+    
+    logger.info(f"QUALITY_GATE[{mode}]: {len(candidates)} -> {len(passed)}")
+    return passed
+
+def apply_quality_gate(candidates: List[Dict], mode: str = "strict") -> List[Dict]:
+    """Apply quality gate with auto-relaxation when too few clips remain"""
+    passed = _gate(candidates, mode)
+    
+    if len(passed) < 3 and mode == "strict":
+        # Auto relax to get usable output
+        logger.info(f"QUALITY_GATE: strict yielded {len(passed)} < 3, auto-relaxing to balanced")
+        relaxed = _gate(candidates, "balanced")
+        
+        # Keep order stable: take what strict allowed, then add best relaxed
+        seen = {id(c) for c in passed}
+        for c in relaxed:
+            if id(c) not in seen:
+                passed.append(c)
+            if len(passed) >= 3:
+                break
+    
+    return passed
+
+def adaptive_gate(candidates: List[Dict], min_count: int = 3) -> List[Dict]:
+    """Adaptive gate that adds clips from remaining pool by score + platform-fit"""
+    base = [c for c in candidates if c.get("quality_ok", False)]
+    if len(base) >= min_count:
+        return base
+    
+    # Build pool of non-ads, non-questions
+    pool = [
+        c for c in candidates
+        if c not in base and not c.get("is_ad", False) and not c.get("is_question", False)
+    ]
+    
+    # Sort by score, then platform fit, then info density
+    pool.sort(key=lambda c: (
+        c.get("final_score", 0.0),
+        c.get("platform_length_score_v2", 0.0),
+        c.get("info_density", 0.0)
+    ), reverse=True)
+    
+    start_len = len(base)
+    for c in pool:
+        base.append(c)
+        if len(base) >= min_count:
+            break
+    
+    logger.info(f"ADAPTIVE_GATE: start={start_len} target={min_count} added={len(base)-start_len} final={len(base)}")
+    return base
+
+def enforce_soft_floor(candidates: List[Dict], min_count: int = 3) -> List[Dict]:
+    """Enforce final soft floor after all gates"""
+    if len(candidates) >= min_count:
+        return candidates
+    
+    # Get all remaining candidates (non-ads)
+    pool = [c for c in candidates if not c.get("is_ad", False)]
+    
+    # Sort by score
+    pool.sort(key=lambda c: c.get("final_score", 0.0), reverse=True)
+    
+    # Add from pool until we reach min_count
+    result = list(candidates)
+    for c in pool:
+        if c not in result:
+            result.append(c)
+        if len(result) >= min_count:
+            break
+    
+    logger.info(f"SOFT_FLOOR: {len(candidates)} -> {len(result)} (target: {min_count})")
+    return result
+
 # --- helpers for authoritative finish-thought tracking ---
 def authoritative_fallback_mode(result_meta):
     try:
@@ -506,6 +627,7 @@ class ClipScoreService:
                 write_progress(episode_id or "unknown", "scoring:full", progress_pct, f"Scoring candidate {i+1}/{len(segments_to_score)}...")
             
             # Use enhanced V4 feature computation with all Phase 1-3 features
+            feats = None
             try:
                 feats = _compute_features(
                     segment=seg,
@@ -537,6 +659,10 @@ class ClipScoreService:
                 except Exception as e2:
                     logger.exception(f"Both enhanced and fallback feature compute failed for segment {seg.get('id', i)}: {e2}")
                     continue
+            
+            # Skip if no features were computed
+            if feats is None:
+                continue
             
             # Get raw score using V4 multi-path scoring with genre awareness
             current_weights = get_clip_weights()
@@ -1316,7 +1442,7 @@ class ClipScoreService:
             
             # Apply quality filtering with safety net
             quality_filtered = filter_low_quality(filtered_candidates, min_score=15)
-            logger.info(f"After quality filtering: {len(quality_filtered)} candidates")
+            logger.info(f"QUALITY_FILTER: kept={len(quality_filtered)} of {len(filtered_candidates)}")
             
             # CANDIDATES_BEFORE_SAFETY: Log before safety pass
             logger.info(f"CANDIDATES_BEFORE_SAFETY: {len(quality_filtered)}")
@@ -1331,55 +1457,12 @@ class ClipScoreService:
                     updated += 1
             logger.info(f"SAFETY_PASS: updated {updated}/{len(quality_filtered)}")
             
-            # --- Now gate strictly/fallback based on authoritative mode ---
-            allowed = {"finished"} if not episode_fallback_mode else {"finished", "sparse_finished"}
-            kept = [c for c in quality_filtered if c.get("ft_status") in allowed]
+            # --- Apply quality gate with auto-relaxation ---
+            quality_filtered = apply_quality_gate(quality_filtered, mode="strict" if not episode_fallback_mode else "fallback")
             
-            if kept:
-                quality_filtered = kept
-                logger.info(f"QUALITY_GATE: mode={'strict' if not episode_fallback_mode else 'fallback'} kept={len(kept)}/{len(quality_filtered)}")
-            else:
-                # Soft-relax so we never end with 0 — behind an env flag:
-                if os.getenv("FT_SOFT_RELAX_ON_ZERO", "1") == "1":
-                    logger.warning("QUALITY_GATE: yielded 0; soft-relaxing gate (keep unresolved this run)")
-                    # keep unresolved, but mark explicitly
-                    for c in quality_filtered:
-                        c.setdefault("ft_status", "unresolved")
-                else:
-                    logger.warning("QUALITY_GATE: yielded 0; dropping all (strict, no-relax)")
-                    quality_filtered = []
-            
-            # Adaptive quality gate: if we have too few clips, apply relaxed criteria
-            MIN_CLIPS = 3
-            MAX_CLIPS = 5
-            
-            if len(quality_filtered) < MIN_CLIPS:
-                logger.info(f"ADAPTIVE_GATE: only {len(quality_filtered)} clips, applying relaxed criteria")
-                
-                def passes_relaxed(c):
-                    hook = c.get("hook", 0)
-                    payoff = c.get("payoff", 0)
-                    info = c.get("info", 0)
-                    pl_v2 = c.get("platform_length_score_v2", 0)
-                    has_filler = c.get("has_filler", False)
-                    duration = c.get("end", 0) - c.get("start", 0)
-                    platform_max_sec = PLATFORM_LIMITS.get(backend_platform, 30.0)
-                    
-                    # allow strong Hook/Info to compensate for lower Payoff
-                    return (hook >= 0.90 and info >= 0.60 and pl_v2 >= 0.60 and 
-                            (payoff >= 0.12 or (info >= 0.75)) and not has_filler and 
-                            duration <= platform_max_sec)
-                
-                # Get all candidates before quality filtering for relaxed pass
-                all_candidates = [c for c in clips if c.get("score", 0) > 0]
-                relaxed_kept = [c for c in all_candidates if passes_relaxed(c)]
-                
-                # Combine strict + relaxed, deduplicate
-                combined = quality_filtered + relaxed_kept
-                quality_filtered = _dedup_by_time_iou(combined, iou_thresh=0.3, target_len=18.0)
-                quality_filtered = quality_filtered[:MAX_CLIPS]
-                
-                logger.info(f"ADAPTIVE_GATE: added {len(relaxed_kept)} relaxed clips, final count: {len(quality_filtered)}")
+            # Apply adaptive gate if we have too few clips
+            if len(quality_filtered) < 3:
+                quality_filtered = adaptive_gate(quality_filtered, min_count=3)
             
             # Apply temporal deduplication to remove near-duplicate clips
             iou = float(os.getenv("DEDUP_IOU_THRESHOLD", "0.85"))
@@ -1435,6 +1518,9 @@ class ClipScoreService:
                     finals[-1] = long_best  # Replace last slot
                     finals.sort(key=sort_key, reverse=True)  # Re-sort
                     logger.info(f"DIVERSITY GUARD: promoted long clip dur={long_best.get('end', 0) - long_best.get('start', 0):.1f}s pl_v2={long_best.get('platform_length_score_v2', 0):.2f}")
+            
+            # Enforce final soft floor after all gates
+            finals = enforce_soft_floor(finals, min_count=3)
             
             # Mark all selected clips with protected status
             for c in finals:
