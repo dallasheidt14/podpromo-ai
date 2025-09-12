@@ -24,16 +24,14 @@ DEFAULT_PAD_END_SEC   = 0.24   # +240ms
 
 # Valid spectrum settings
 SPECTRUM_FILTER = (
-    "showspectrum="
-    "s=640x360:"
-    "mode=combined:"          # valid mode for showspectrum
-    "color=intensity:"        # intensity|channel|rainbow|more
-    "scale=cbrt"              # lin|log|sqrt|cbrt
+    "showspectrum=s=640x360:mode=combined:color=intensity:scale=cbrt,"
+    "format=yuv420p"
 )
 
-# Nice looking, widely compatible waveform (line)
+# Nice looking, widely compatible waveform (line) with A/V sync
 WAVES_FILTER = (
     "aformat=channel_layouts=stereo,"
+    "aresample=async=1:first_pts=0,"     # keeps A/V in sync
     "showwaves=s=640x360:mode=line:rate=25,"
     "format=yuv420p"
 )
@@ -62,16 +60,17 @@ def _hash(*parts: str) -> str:
     return h.hexdigest()[:16]
 
 def _ffmpeg_preview_args(in_wav: str, out_mp4: str, ss: float, dur: float, filter_expr: str):
-    """Build FFmpeg arguments for preview generation"""
+    """Build FFmpeg arguments for preview generation with proper audio mapping"""
     return [
         "ffmpeg", "-hide_banner", "-nostats", "-loglevel", "error", "-y",
-        "-ss", f"{ss}", "-t", f"{dur}",
+        "-ss", f"{ss}", "-t", f"{dur}",            # trim input (applies to both A & V)
         "-i", in_wav,
-        "-filter_complex", f"[0:a]{filter_expr}[v]",
-        "-map", "[v]", "-map", "0:a?",
+        "-filter_complex", f"[0:a]{filter_expr}[v]",  # build the video from audio
+        "-map", "[v]", "-map", "0:a",              # ALWAYS include the audio stream
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "28",
-        "-c:a", "aac", "-b:a", "96k",
-        "-shortest",
+        "-c:a", "aac", "-b:a", "128k", "-ac", "2",
+        "-shortest",                                # end when either stream ends
+        "-movflags", "+faststart",                  # web-friendly
         out_mp4,
     ]
 
@@ -79,117 +78,6 @@ def build_preview_filename(episode_id: str, clip_id: str) -> str:
     """Generate a stable filename for caching and re-use."""
     return f"{_hash(episode_id, clip_id)}.m4a"
 
-def ensure_preview(
-    *,
-    source_media: Path,
-    episode_id: str,
-    clip_id: str,
-    start_sec: float,
-    end_sec: float,
-    max_preview_sec: float = 20.0,   # keep fast; adjust to taste
-    pad_start_sec: float = None,     # -80ms default
-    pad_end_sec: float = None,       # +240ms default
-    audio_bitrate: str = "96k",
-    sample_rate: int = 44100,
-    **kwargs,  # swallow unknown future options to avoid breaking callers
-) -> Optional[str]:
-    """
-    Create a trimmed audio preview with tiny safety pads and return relative URL.
-    - Uses accurate trimming (-i then -ss/-to).
-    - Pads are configurable; defaults are conservative for AAC encoder delay.
-    """
-    try:
-        if not source_media.exists():
-            return None
-
-        # Allow legacy arg names (defensive)
-        if "pad_start" in kwargs and pad_start_sec is None:
-            pad_start_sec = kwargs["pad_start"]
-        if "pad_end" in kwargs and pad_end_sec is None:
-            pad_end_sec = kwargs["pad_end"]
-
-        pad_start = DEFAULT_PAD_START_SEC if pad_start_sec is None else float(pad_start_sec)
-        pad_end   = DEFAULT_PAD_END_SEC   if pad_end_sec   is None else float(pad_end_sec)
-
-        # Compute padded boundaries with explicit duration math
-        window_dur = float(end_sec) - float(start_sec)
-        
-        # Our intended file length including pads
-        max_output_dur = window_dur + pad_start + pad_end
-        
-        # If caller gives max_preview_sec, treat it as the UNPADDED window target and add pads
-        if max_preview_sec is not None:
-            max_output_dur = float(max_preview_sec) + pad_start + pad_end
-        
-        cut_start = max(0.0, float(start_sec) - pad_start)
-        cut_end   = min(float(end_sec) + pad_end, cut_start + max_output_dur)
-        
-        # Clamp end to prevent overrun (hard cap after padding)
-        if max_preview_sec is not None:
-            cut_end = min(cut_end, cut_start + max_preview_sec)
-
-        out_name = build_preview_filename(episode_id, clip_id)
-        out_path = PREVIEWS_DIR / out_name
-
-        # Return existing preview if it exists and has content
-        if out_path.exists() and out_path.stat().st_size > 0:
-            return f"/clips/previews/{out_name}"
-
-        # Accurate trim: input first, then -ss/-to
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", str(source_media),
-            "-ss", f"{cut_start:.3f}",
-            "-to", f"{cut_end:.3f}",
-            "-map", "0:a:0",
-            "-c:a", "aac",
-            "-b:a", audio_bitrate,
-            "-ar", str(sample_rate),
-            "-ac", "2",
-            "-movflags", "+faststart",
-            str(out_path),
-        ]
-        
-        # Run ffmpeg command
-        result = subprocess.run(
-            cmd, 
-            check=True, 
-            stdout=subprocess.DEVNULL, 
-            stderr=subprocess.DEVNULL,
-            timeout=30  # prevent hanging
-        )
-        
-        if out_path.exists() and out_path.stat().st_size > 0:
-            # Get actual duration from ffprobe
-            try:
-                dur = ffprobe_duration(str(out_path))
-                
-                # Helpful metrics for logs and UI guards
-                intended_unpadded = window_dur
-                overrun_ms = int(round((dur - intended_unpadded) * 1000))
-                
-                logger.info(
-                    "PREVIEW: start=%.3f, end=%.3f, dur=%.3f, max_preview_sec=%s, overrun_ms=%d",
-                    start_sec, end_sec, dur,
-                    f"{max_preview_sec:.3f}" if max_preview_sec else "None",
-                    overrun_ms
-                )
-            except Exception:
-                dur = cut_end - cut_start
-                intended_unpadded = window_dur
-                overrun_ms = int(round((dur - intended_unpadded) * 1000))
-                logger.info(f"PREVIEW: start={start_sec:.3f}, end={end_sec:.3f}, dur={dur:.3f} (estimated), overrun_ms={overrun_ms}")
-            
-            return f"/clips/previews/{out_name}"
-        else:
-            return None
-            
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
-        logger.error(f"Preview generation failed for {episode_id}/{clip_id}: {e}")
-        return None
-    except Exception as e:
-        logger.error(f"Unexpected error generating preview: {e}", exc_info=True)
-        return None
 
 def _hash_name(episode_id: str, clip_id: str, start: float, end: float) -> str:
     """Generate a hash-based filename for previews."""
@@ -262,8 +150,7 @@ def ensure_preview(
 
             # 2) Try spectrum (valid params)
             try:
-                spec = SPECTRUM_FILTER + ",format=yuv420p"  # ensure 420p for H.264 players
-                _run_ffmpeg(_ffmpeg_preview_args(src, dst, start_sec, duration, spec))
+                _run_ffmpeg(_ffmpeg_preview_args(src, dst, start_sec, duration, SPECTRUM_FILTER))
                 return f"/clips/previews/{out_path.name}"
             except Exception as e2:
                 logger.error("Spectrum preview failed: %s", e2)

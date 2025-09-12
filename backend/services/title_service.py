@@ -98,27 +98,59 @@ def normalize_text(text: str) -> str:
     
     return text
 
+# Improved stop words list (includes previously problematic words)
+STOP_WORDS = {
+    "the", "a", "an", "and", "or", "but", "so", "to", "of", "for", "on", "in", "at", "with",
+    "like", "you", "i", "we", "they", "he", "she", "it", "that", "this", "these", "those",
+    "just", "really", "gonna", "got", "kind", "sort", "thing", "things", "stuff",
+    # previously junky offenders:
+    "need", "team", "sample",
+    # additional common words
+    "is", "are", "was", "were", "be", "as", "your", "our", "me", "my", "them", "their", 
+    "his", "her", "us", "do", "did", "does", "have", "has", "had", "if", "can", "could", 
+    "should", "would", "will", "may", "might", "must", "shall"
+}
+
+def key_terms(text: str, max_terms: int = 4) -> List[str]:
+    """Extract key terms from text using improved heuristics"""
+    if not text:
+        return []
+    
+    # Normalize text first
+    text = normalize_text(text)
+    
+    # Extract words (letters, hyphens, apostrophes)
+    words = [w.lower() for w in re.findall(r"[A-Za-z][A-Za-z'-]{1,}", text)]
+    
+    # Filter out stop words and short words
+    words = [w for w in words if w not in STOP_WORDS and len(w) > 2]
+    
+    if not words:
+        return []
+    
+    # Calculate frequency and position
+    freq, order = {}, {}
+    for i, w in enumerate(words):
+        freq[w] = freq.get(w, 0) + 1
+        order.setdefault(w, i)
+    
+    # Rank by frequency (descending), then by position (ascending)
+    ranked = sorted(freq, key=lambda w: (-freq[w], order[w]))
+    
+    return ranked[:max_terms]
+
 def clean_for_keywords(text: str) -> str:
-    """Clean text for keyword extraction"""
+    """Clean text for keyword extraction using improved heuristics"""
     if not text:
         return ""
     
     # Normalize first
     text = normalize_text(text)
     
-    # Remove common stop words but keep meaningful content
-    stop_words = {
-        'the', 'a', 'an', 'and', 'or', 'but', 'to', 'of', 'in', 'on', 'for', 'with', 'at', 'by', 'from',
-        'is', 'are', 'was', 'were', 'be', 'as', 'that', 'this', 'it', 'you', 'your', 'we', 'our',
-        'i', 'me', 'my', 'they', 'them', 'their', 'he', 'she', 'his', 'her', 'us', 'do', 'did', 'does',
-        'have', 'has', 'had', 'if', 'so', 'just', 'very', 'really', 'can', 'could', 'should', 'would',
-        'will', 'would', 'may', 'might', 'must', 'shall', 'could', 'should', 'would', 'may', 'might'
-    }
+    # Use the improved key_terms function
+    terms = key_terms(text, max_terms=10)
     
-    words = text.lower().split()
-    meaningful_words = [w for w in words if w not in stop_words and len(w) > 2]
-    
-    return ' '.join(meaningful_words)
+    return ' '.join(terms)
 
 # ---------- Relaxed title validation ----------
 def is_valid_title(title: str) -> bool:
@@ -199,36 +231,64 @@ TITLE_TEMPLATES = [
 ]
 
 def extract_topic(text: str) -> str:
-    """Extract the main topic from text"""
+    """Extract the main topic from text using improved heuristics"""
     if not text:
         return "Strategy"
     
-    # Clean the text
-    clean_text = clean_for_keywords(text)
-    words = clean_text.split()
+    # Get key terms using improved extraction
+    terms = key_terms(text, max_terms=6)
     
-    if not words:
+    if not terms:
         return "Strategy"
     
     # Look for business/leadership terms
     business_terms = [
         'strategy', 'leadership', 'team', 'feedback', 'decision', 'problem', 'solution',
         'management', 'communication', 'culture', 'growth', 'innovation', 'change',
-        'planning', 'execution', 'performance', 'collaboration', 'trust', 'vision'
+        'planning', 'execution', 'performance', 'collaboration', 'trust', 'vision',
+        'practice', 'training', 'coaching', 'development', 'improvement', 'skill'
     ]
     
     # Find the most relevant business term
     for term in business_terms:
-        if term in clean_text.lower():
+        if term in [t.lower() for t in terms]:
             return term.title()
     
-    # Use the most common meaningful word
-    word_counts = Counter(words)
-    if word_counts:
-        most_common = word_counts.most_common(1)[0][0]
-        return most_common.title()
+    # Use the first key term as topic
+    return terms[0].title()
+
+def make_titles(text: str) -> List[str]:
+    """Generate titles using improved heuristics with real text"""
+    if not text:
+        return ["Quick Tip", "Coach's Insight", "One Thing Most Players Miss"]
     
-    return "Strategy"
+    terms = key_terms(text, max_terms=4)
+    options = []
+    
+    if terms:
+        head = " ".join(t.capitalize() for t in terms[:2])
+        options += [
+            f"Stop Ignoring {head}",
+            f"{head}: The Mistake Everyone Makes",
+            f"Do This to Improve {terms[0].capitalize()}",
+            f"Why {terms[0].capitalize()} Matters More Than You Think",
+        ]
+    
+    # Add a direct, cleaned sentence if present
+    sentences = text.strip().split(".")
+    if sentences:
+        s = sentences[0].strip()[:80]
+        if len(s) > 12:
+            options.append(s.strip() + "…")
+    
+    # Dedupe & cap to 6
+    seen, deduped = set(), []
+    for t in options:
+        if t not in seen:
+            seen.add(t)
+            deduped.append(t)
+    
+    return deduped[:6]
 
 def generate_titles(
     text: str,
@@ -266,27 +326,36 @@ def generate_titles(
     # Extract topic
     topic = extract_topic(clean_text)
     
-    # Generate candidate titles
+    # Generate candidate titles using improved heuristics
     candidates = []
     
-    # Use templates with topic substitution
+    # Use improved title generation with real text
+    improved_titles = make_titles(clean_text)
+    for title in improved_titles:
+        if is_valid_title(title) and title not in avoid_set:
+            candidates.append(title)
+    
+    # Use templates with topic substitution as fallback
     for template in TITLE_TEMPLATES:
         if '{topic}' in template:
             title = template.format(topic=topic)
         else:
             title = template
         
-        if is_valid_title(title) and title not in avoid_set:
+        if is_valid_title(title) and title not in avoid_set and title not in candidates:
             candidates.append(title)
     
     # Add some topic-specific variations
     if topic != "Strategy":
-        candidates.extend([
+        topic_variations = [
             f"The {topic} Method",
             f"Master {topic} in Minutes",
             f"Why {topic} Matters More Than You Think",
             f"The {topic} Approach That Works",
-        ])
+        ]
+        for title in topic_variations:
+            if is_valid_title(title) and title not in avoid_set and title not in candidates:
+                candidates.append(title)
     
     # Score and rank candidates
     scored_candidates = []
