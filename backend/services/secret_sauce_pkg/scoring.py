@@ -72,8 +72,8 @@ def score_segment_v4(features: Dict, apply_penalties: bool = True, genre: str = 
     winning_path = max(path_scores.items(), key=lambda x: x[1])[0]
     base_score = path_scores[winning_path]
     
-    # Apply synergy bonus
-    synergy_multiplier = _synergy_v4(
+    # Apply synergy (additive, bounded)
+    synergy_boost = _synergy_v4(
         f.get("hook_score", 0.0), 
         f.get("arousal_score", 0.0), 
         f.get("payoff_score", 0.0)
@@ -109,8 +109,12 @@ def score_segment_v4(features: Dict, apply_penalties: bool = True, genre: str = 
     if apply_penalties and ad_penalty > 0:
         base_score -= ad_penalty
     
-    # Calculate final score
-    final_score = base_score * synergy_multiplier + bonuses_applied
+    # Calculate final score (additive synergy)
+    final_score = base_score + synergy_boost + bonuses_applied
+    # DEBUG/telemetry (non-functional, backward-compatible)
+    # Keep legacy multiplier for dashboards; never used for computation.
+    f["_synergy_boost"] = synergy_boost
+    f["_synergy_multiplier"] = 1.0 + synergy_boost
     
     # Platform-fit boost for excellent length matches
     pl_v2 = f.get("platform_length_score_v2", f.get("platform_len_match", 0.0))
@@ -129,7 +133,7 @@ def score_segment_v4(features: Dict, apply_penalties: bool = True, genre: str = 
         "viral_score_100": viral_score_100,
         "winning_path": winning_path,
         "path_scores": path_scores,
-        "synergy_multiplier": synergy_multiplier,
+        "synergy_multiplier": 1.0 + synergy_boost,  # Legacy field for backward compatibility
         "bonuses_applied": bonuses_applied,
         "bonus_reasons": bonus_reasons
     }
@@ -267,11 +271,13 @@ def explain_segment_from_segment(segment: Dict, audio_file: str, genre: str = 'g
     features = compute_features_v4(segment, audio_file, genre=genre, platform=platform)
     return explain_segment_v4(features, genre=genre)
 
-def _synergy_v4(hook: float, arousal: float, payoff: float, alpha: float = 0.3) -> float:
-    """Calculate synergy bonus for V4 scoring"""
-    if hook >= 0.6 and arousal >= 0.5 and payoff >= 0.4:
-        return 1.0 + alpha
-    elif hook >= 0.4 and (arousal >= 0.4 or payoff >= 0.3):
-        return 1.0 + alpha * 0.5
-    else:
-        return 1.0
+def _synergy_v4(hook: float, arousal: float, payoff: float) -> float:
+    """
+    Additive synergy boost (0.00..0.12).
+    High triad → +0.12, moderate → +0.06, else +0.00.
+    """
+    if hook >= 0.60 and arousal >= 0.50 and payoff >= 0.40:
+        return 0.12
+    if hook >= 0.40 and (arousal >= 0.40 or payoff >= 0.30):
+        return 0.06
+    return 0.0
