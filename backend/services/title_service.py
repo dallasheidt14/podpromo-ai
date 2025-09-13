@@ -14,7 +14,9 @@ STOP = {
     "the","a","an","and","or","of","to","in","on","for","with","from","as","at","by","is","are","was","were",
     "be","been","being","it","its","this","that","these","those","you","your","we","our","they","their","i",
     "he","she","him","her","his","hers","them","do","does","did","doing","have","has","had","having","not",
-    "no","but","so","if","then","than","there","here","what","which","who","whom","into","over","under","about"
+    "no","but","so","if","then","than","there","here","what","which","who","whom","into","over","under","about",
+    # extra fillers that polluted titles in your logs
+    "through","again","maybe","say","first","company","will","ill"
 }
 
 # Patterns we never want in shorts titles
@@ -30,34 +32,98 @@ def _clean_text(t: str) -> str:
     t = re.sub(r"\s+", " ", t)
     return t
 
+# Domain anchors we care about; map variants -> canonical title token
+ANCHORS: List[Tuple[re.Pattern, str]] = [
+    (re.compile(r"\bdigital[-\s]?first\b", re.I), "Digital-First"),
+    (re.compile(r"\brestructuring\b", re.I), "Restructuring"),
+    (re.compile(r"\bpartnerships?\b", re.I), "Partnership"),
+    (re.compile(r"\bacquisition(s)?\b|\bmerger(s)?\b", re.I), "Acquisition"),
+    (re.compile(r"\bbankruptcy\b", re.I), "Bankruptcy"),
+    (re.compile(r"\brevenue\b", re.I), "Revenue"),
+    (re.compile(r"\bgrowth\b", re.I), "Growth"),
+    (re.compile(r"\brefinanc(ing|e)\b|\bdebt\b", re.I), "Debt"),
+    (re.compile(r"\bai\b", re.I), "AI"),
+]
+
+def _mine_anchor_phrases(text: str) -> List[str]:
+    """
+    Extract compact, human-sounding phrases around domain anchors.
+    Example: "Last year, Salem ... went through some major restructuring" -> "Salem Restructuring"
+    """
+    clean = _clean_text(text)
+    # Tokens with original case for simple "proper noun" detection
+    toks = re.findall(r"[A-Za-z][A-Za-z'-]*", clean)
+    lowers = [t.lower() for t in toks]
+
+    phrases: Counter = Counter()
+
+    # Hyphenated terms are already good candidates (e.g., off-label)
+    for h in re.findall(r"[A-Za-z]+-[A-Za-z]+", clean):
+        phrases[h.title()] += 2
+
+    # Scan for each anchor and attach nearest proper noun to the left within a small window
+    for rx, canon in ANCHORS:
+        for m in rx.finditer(clean):
+            # find token index closest to match start
+            start_char = m.start()
+            # map char offset to token index roughly by cumulative lengths
+            acc = 0
+            idx = 0
+            for i, t in enumerate(toks):
+                acc += len(t) + 1
+                if acc >= start_char:
+                    idx = i
+                    break
+            # search left for a proper-ish noun (capitalized and not a stopword)
+            left = None
+            for j in range(max(0, idx-6), idx):
+                tj = toks[j]
+                if tj[0].isupper() and tj.lower() not in STOP:
+                    left = tj
+            if left:
+                phrase = f"{left} {canon}"
+                phrases[phrase] += 4  # strong preference for <ProperNoun + Anchor>
+            else:
+                phrases[canon] += 2
+
+    # Also consider frequent 2–3 word ngrams that aren't all stopwords
+    words = [w for w in lowers if w not in STOP]
+    for n in (3, 2):
+        for i in range(0, max(0, len(words)-n+1)):
+            gram = words[i:i+n]
+            if any(len(w) >= 6 for w in gram):
+                phrase = " ".join(gram).title()
+                if not BANNED.search(phrase) and not all(w in STOP for w in gram):
+                    phrases[phrase] += 1
+
+    # Return top unique phrases in order
+    out: List[str] = []
+    for p, _ in phrases.most_common(10):
+        if p not in out:
+            out.append(p)
+    return out[:6]
+
 def _extract_keywords(text: str, k: int = 6) -> List[str]:
-    """Very lightweight keyphrase mining: hyphen words, frequent nouns, long tokens."""
-    text = _clean_text(text)
-    # hyphenated phrases (boost e.g., off-label)
-    hyphens = re.findall(r"[A-Za-z]+-[A-Za-z]+", text)
-    words = re.findall(r"[A-Za-z][A-Za-z'-]{2,}", text)
+    """
+    Phrase-first extraction (anchors + hyphens + short ngrams).
+    Produces human-friendly phrases like "Salem Restructuring", "Digital-First Company".
+    """
+    phrases = _mine_anchor_phrases(text)
+    if phrases:
+        return phrases[:k]
+    # fallback to unigram frequency if anchors fail
+    clean = _clean_text(text)
+    words = re.findall(r"[A-Za-z][A-Za-z'-]{2,}", clean)
     freq = Counter(w.lower() for w in words if w.lower() not in STOP)
-    for h in hyphens:
-        freq[h.lower()] += 2.0
-    # length boost
-    for w in list(freq.keys()):
-        if len(w) >= 7:
-            freq[w] += 0.5
-    # prefer top-k unique
-    keys = []
-    for w, _ in freq.most_common(20):
-        if w not in keys:
-            keys.append(w)
-        if len(keys) >= k:
-            break
-    return keys
+    out = [w.title() for w, _ in freq.most_common(k)]
+    return out
 
 def _title_case(s: str) -> str:
     return " ".join([w.capitalize() if w.lower() not in STOP else w.lower() for w in s.split()])
 
 def _variants_from_keywords(keys: List[str], platform: str) -> List[str]:
     # assemble 6 concise variants; prefer 4–8 words; title-case; avoid banned phrases
-    main = " ".join([k.replace("-", " ") for k in keys[:2]]).strip()
+    main = " ".join([k.replace("-", " ") for k in keys[:1]]).strip()  # use top phrase only
     if not main:
         return []
     main_tc = _title_case(main)

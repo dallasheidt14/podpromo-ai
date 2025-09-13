@@ -1560,6 +1560,27 @@ class ClipScoreService:
             # Enforce final soft floor after all gates
             finals = enforce_soft_floor(finals, min_count=3)
             
+            # ---- FINISHED-THOUGHT BACKSTOP -----------------------------------------
+            # If finals contain zero "finished_thought", promote the best finished clip
+            # from prior survivors by swapping out the weakest final (bounded swap).
+            try:
+                has_finished = any(bool(c.get("finished_thought")) for c in finals)
+                if not has_finished:
+                    pool = [c for c in candidates if c.get("finished_thought")]
+                    if pool:
+                        pool.sort(key=lambda c: float(c.get("final_score", c.get("score", 0.0))), reverse=True)
+                        candidate = pool[0]
+                        if finals:
+                            finals.sort(key=lambda c: float(c.get("final_score", c.get("score", 0.0))))
+                            weakest = finals[0]
+                            if float(candidate.get("final_score", candidate.get("score", 0.0))) >= \
+                               float(weakest.get("final_score", weakest.get("score", 0.0))) - 0.05:
+                                finals[0] = candidate
+                                logger.info("QUALITY_BACKSTOP: promoted finished_thought clip %s", candidate.get("id"))
+            except Exception as e:
+                logger.error("QUALITY_BACKSTOP_ERROR: %s", e)
+            # -----------------------------------------------------------------------
+            
             # Mark all selected clips with protected status
             for c in finals:
                 c["protected"] = c.get("protected", False)
