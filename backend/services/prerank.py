@@ -1,6 +1,6 @@
 ﻿import logging
 import math
-import random
+import hashlib
 import re
 from typing import Dict, List
 
@@ -216,8 +216,16 @@ def pick_stratified(candidates: List[Dict], target_count: int) -> List[Dict]:
         exploration_count = min(5, target_count - len(selected))
         exploration_candidates = [seg for seg in remaining if seg not in selected]
         if exploration_candidates:
-            selected.extend(
-                random.sample(exploration_candidates, min(exploration_count, len(exploration_candidates)))
-            )
+            def _sid(seg):
+                seg_id = seg.get("id")
+                if seg_id:
+                    return str(seg_id)
+                a = seg.get("start"); b = seg.get("end")
+                return f"{a:.3f}-{b:.3f}"
+            def _key(seg):
+                raw = _sid(seg).encode("utf-8")
+                return hashlib.sha1(raw).hexdigest()
+            exploration_candidates.sort(key=_key)
+            selected.extend(exploration_candidates[:exploration_count])
     logger.info("Stratified selection: %d candidates from %d", len(selected), len(candidates))
     return selected[:target_count]
