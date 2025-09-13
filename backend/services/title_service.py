@@ -5,6 +5,99 @@ from __future__ import annotations
 import re, math, itertools, hashlib, time
 from collections import Counter
 from typing import List, Dict, Iterable, Tuple, Optional, Set
+import logging
+
+logger = logging.getLogger("titles_service")
+
+# Minimal English stopwords (expand if needed)
+STOP = {
+    "the","a","an","and","or","of","to","in","on","for","with","from","as","at","by","is","are","was","were",
+    "be","been","being","it","its","this","that","these","those","you","your","we","our","they","their","i",
+    "he","she","him","her","his","hers","them","do","does","did","doing","have","has","had","having","not",
+    "no","but","so","if","then","than","there","here","what","which","who","whom","into","over","under","about"
+}
+
+# Patterns we never want in shorts titles
+BANNED = re.compile(
+    r"(how to(?!\s+\w)|in \d+\s+steps|secrets?|ultimate guide|tips & tricks|hack(s)?|unlock|master(?!\w)|click here)",
+    re.I,
+)
+
+def _clean_text(t: str) -> str:
+    t = (t or "").strip()
+    # Keep hyphenated ("off-label") and apostrophes
+    t = re.sub(r"[^A-Za-z0-9\s'\-\.,:;!?]", " ", t)
+    t = re.sub(r"\s+", " ", t)
+    return t
+
+def _extract_keywords(text: str, k: int = 6) -> List[str]:
+    """Very lightweight keyphrase mining: hyphen words, frequent nouns, long tokens."""
+    text = _clean_text(text)
+    # hyphenated phrases (boost e.g., off-label)
+    hyphens = re.findall(r"[A-Za-z]+-[A-Za-z]+", text)
+    words = re.findall(r"[A-Za-z][A-Za-z'-]{2,}", text)
+    freq = Counter(w.lower() for w in words if w.lower() not in STOP)
+    for h in hyphens:
+        freq[h.lower()] += 2.0
+    # length boost
+    for w in list(freq.keys()):
+        if len(w) >= 7:
+            freq[w] += 0.5
+    # prefer top-k unique
+    keys = []
+    for w, _ in freq.most_common(20):
+        if w not in keys:
+            keys.append(w)
+        if len(keys) >= k:
+            break
+    return keys
+
+def _title_case(s: str) -> str:
+    return " ".join([w.capitalize() if w.lower() not in STOP else w.lower() for w in s.split()])
+
+def _variants_from_keywords(keys: List[str], platform: str) -> List[str]:
+    # assemble 6 concise variants; prefer 4–8 words; title-case; avoid banned phrases
+    main = " ".join([k.replace("-", " ") for k in keys[:2]]).strip()
+    if not main:
+        return []
+    main_tc = _title_case(main)
+    alts = []
+    if platform == "shorts":
+        alts = [
+            f"{main_tc}: What It Really Means",
+            f"{main_tc} Explained",
+            f"Why {main_tc} Matters",
+            f"{main_tc}: The Real Story",
+            f"{main_tc} — Fast Facts",
+            f"{main_tc} In Plain English",
+        ]
+    else:
+        alts = [
+            f"{main_tc}: What It Means",
+            f"{main_tc} Explained",
+            f"Inside {main_tc}",
+            f"Why {main_tc} Matters",
+            f"{main_tc}: Key Takeaways",
+            f"Understanding {main_tc}",
+        ]
+    # filter banned & overly long, dedupe
+    out = []
+    seen = set()
+    for t in alts:
+        t = re.sub(r"\s+", " ", t).strip()
+        if BANNED.search(t):
+            continue
+        if 4 <= len(t.split()) <= 10 and len(t) <= 80:
+            if t.lower() not in seen:
+                out.append(t)
+                seen.add(t.lower())
+    return out
+
+def _safe_fallback(clip_title: str, platform: str) -> List[str]:
+    base = clip_title.strip()[:60] if clip_title else "This Moment"
+    base = _title_case(base)
+    tail = "Explained" if platform == "shorts" else "What It Means"
+    return [f"{base}: {tail}"]
 
 # ---------- Title caching & deduplication ----------
 TITLE_GEN_VERSION = "v3"
@@ -302,7 +395,10 @@ def generate_titles(
     end: Optional[float] = None,
     episode_vocab: Optional[dict] = None,
 ) -> List[Dict[str, object]]:
-    """Generate titles with improved normalization and fallbacks"""
+    """
+    Deterministic, topic-aware titles from the actual clip text.
+    Avoids generic/banned clickbait; returns 6 or a safe fallback.
+    """
     
     # Normalize inputs
     clean_text = normalize_text(text)
@@ -323,80 +419,33 @@ def generate_titles(
             if filtered_titles:
                 return filtered_titles[:n]
     
-    # Extract topic
-    topic = extract_topic(clean_text)
+    # Extract keywords from actual text
+    keys = _extract_keywords(clean_text, k=6)
+    variants = _variants_from_keywords(keys, platform=platform)
     
-    # Generate candidate titles using improved heuristics
-    candidates = []
+    if not variants:
+        # Safe fallback
+        title_hint = clean_text[:60] if clean_text else "This Moment"
+        variants = _safe_fallback(title_hint, platform)
     
-    # Use improved title generation with real text
-    improved_titles = make_titles(clean_text)
-    for title in improved_titles:
-        if is_valid_title(title) and title not in avoid_set:
-            candidates.append(title)
+    logger.info("TITLES: k=%s variants=%s", keys[:4], variants[:3])
     
-    # Use templates with topic substitution as fallback
-    for template in TITLE_TEMPLATES:
-        if '{topic}' in template:
-            title = template.format(topic=topic)
-        else:
-            title = template
-        
-        if is_valid_title(title) and title not in avoid_set and title not in candidates:
-            candidates.append(title)
+    # Convert to expected format
+    result = []
+    for i, title in enumerate(variants[:n]):
+        if title not in avoid_set:
+            result.append({
+                "title": title,
+                "score": 1.0 - (i * 0.1),  # Decreasing score
+                "reasons": ["Generated from text analysis"]
+            })
     
-    # Add some topic-specific variations
-    if topic != "Strategy":
-        topic_variations = [
-            f"The {topic} Method",
-            f"Master {topic} in Minutes",
-            f"Why {topic} Matters More Than You Think",
-            f"The {topic} Approach That Works",
-        ]
-        for title in topic_variations:
-            if is_valid_title(title) and title not in avoid_set and title not in candidates:
-                candidates.append(title)
-    
-    # Score and rank candidates
-    scored_candidates = []
-    for title in candidates:
-        score = score_title(title, platform, topic, clean_text)
-        scored_candidates.append({
-            "title": fix_title(title),
-            "score": score,
-            "reasons": get_score_reasons(title, platform, topic)
-        })
-    
-    # Sort by score and deduplicate
-    scored_candidates.sort(key=lambda x: x["score"], reverse=True)
-    deduped = dedup_titles(scored_candidates)
-    
-    # Ensure we have at least 3-4 titles
-    if len(deduped) < 3:
-        # Add fallback titles
-        fallbacks = [
-            "The Strategy That Changes Everything",
-            "What Most People Get Wrong", 
-            "The Method That Actually Works",
-            "Do This Before Your Next Decision"
-        ]
-        
-        for fallback in fallbacks:
-            if fallback not in [t["title"] for t in deduped]:
-                deduped.append({
-                    "title": fallback,
-                    "score": 0.5,
-                    "reasons": ["fallback"]
-                })
-                if len(deduped) >= 4:
-                    break
-    
-    # Cache results
+    # Cache the result
     if episode_id and clip_id and platform:
         cache_key = _title_cache_key(episode_id=episode_id, clip_id=clip_id, platform=platform, text=clean_text)
-        _cache_titles(cache_key, deduped)
+        _cache_titles(cache_key, result)
     
-    return deduped[:n]
+    return result
 
 def score_title(title: str, platform: str, topic: str, text: str) -> float:
     """Score a title based on various factors"""

@@ -440,5 +440,29 @@ def filter_low_quality(candidates: List[Dict], min_score: int = 20) -> List[Dict
     except Exception:
         pass
     
+    # ---- FINISHED-THOUGHT BACKSTOP -----------------------------------------
+    # If none of the finals are "finished_thought", try to promote one that is.
+    # We scan the pre-dedupe survivors so behavior stays stable and bounded.
+    try:
+        has_finished = any(bool(c.get("finished_thought")) for c in text_filtered)
+        if not has_finished:
+            # Search among prior survivors (same batch) for the best finished-thought item
+            pool = [c for c in candidates if c.get("finished_thought")]
+            if pool:
+                # Highest score finished-thought that doesn't overlap heavily with an existing final
+                pool.sort(key=lambda c: float(c.get("final_score", c.get("score", 0.0))), reverse=True)
+                candidate = pool[0]
+                # Replace the weakest final to keep count stable
+                if text_filtered:
+                    text_filtered.sort(key=lambda c: float(c.get("final_score", c.get("score", 0.0))))
+                    weakest = text_filtered[0]
+                    # Only swap if the finished-thought is not worse than the weakest by a big margin
+                    if float(candidate.get("final_score", candidate.get("score", 0.0))) >= float(weakest.get("final_score", weakest.get("score", 0.0))) - 0.05:
+                        text_filtered[0] = candidate
+                        logger.info("QUALITY_BACKSTOP: promoted finished_thought clip %s", candidate.get("id"))
+    except Exception as e:
+        logger.error("QUALITY_BACKSTOP_ERROR: %s", e)
+    # -----------------------------------------------------------------------
+
     logger.info(f"Quality filter result: {len(candidates)} → {len(text_filtered)} candidates")
     return text_filtered
