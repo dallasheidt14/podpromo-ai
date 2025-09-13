@@ -3,7 +3,7 @@
 import React, { useMemo, useState, useEffect, useCallback } from "react";
 import Modal from "./Modal";
 import { Clip } from "@shared/types";
-import { getClipsSimple, type ClipSimple } from "../src/shared/api";
+import { getClipsSimple, apiUrl, type ClipSimple } from "../src/shared/api";
 import { onClipsReady } from "../src/shared/events";
 
 // Robust video preview component with error handling and remounting
@@ -34,7 +34,9 @@ function VideoPreview({ src, isVideo, isAudio, clipId }: {
         key={src} // Force remount when src changes
         src={src}
         className="h-full w-full object-cover"
-        muted
+        data-clip-id={clipId}
+        controls
+        muted={false}
         playsInline
         preload="metadata"
         onError={() => setError(true)}
@@ -94,9 +96,16 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
   // Use clips from props if provided, otherwise use internal state
   const displayClips = clips || internalClips;
 
-  // Normalize preview URL from various possible field names
+  // Normalize preview URL from various possible field names and ensure absolute
   const normalizeSrc = (clip: Clip | ClipSimple) => {
-    return (clip as any).previewUrl || (clip as any).preview_url || (clip as any).video_url || "";
+    const raw =
+      (clip as any).previewUrl ||
+      (clip as any).preview_url ||
+      (clip as any).video_url ||
+      (clip as any).audio_url || "";
+    if (!raw) return "";
+    if (raw.startsWith("http://") || raw.startsWith("https://")) return raw;
+    return apiUrl(raw);
   };
 
   // Convert ClipSimple to Clip format
@@ -211,42 +220,19 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
   );
 
   const handlePlayPause = (clip: Clip) => {
-    if (playingClipId === clip.id) {
-      // Stop current audio
-      const audio = document.querySelector(`audio[data-clip-id="${clip.id}"]`) as HTMLAudioElement;
-      if (audio) {
-        audio.pause();
-        audio.currentTime = 0;
-      }
+    const selector = `video[data-clip-id="${clip.id}"]`;
+    const thisVideo = document.querySelector(selector) as HTMLVideoElement | null;
+    const allVideos = Array.from(document.querySelectorAll('video[data-clip-id]')) as HTMLVideoElement[];
+    // Pause all others
+    allVideos.forEach(v => { if (v !== thisVideo) { v.pause(); v.currentTime = 0; } });
+    if (!thisVideo) return;
+    if (!thisVideo.paused) {
+      thisVideo.pause();
       setPlayingClipId(null);
-    } else {
-      // Stop any currently playing audio
-      const allAudio = document.querySelectorAll('audio');
-      allAudio.forEach(audio => {
-        (audio as HTMLAudioElement).pause();
-        (audio as HTMLAudioElement).currentTime = 0;
-      });
-      // Start new audio
-      setPlayingClipId(clip.id);
-      // Trigger play after state update
-      setTimeout(() => {
-        const newAudio = document.querySelector(`audio[data-clip-id="${clip.id}"]`) as HTMLAudioElement;
-        if (newAudio) {
-          if (process.env.NODE_ENV === 'development') {
-            console.log('Attempting to play audio:', newAudio.src);
-          }
-          newAudio.play().catch(e => {
-            if (process.env.NODE_ENV === 'development') {
-              console.log('Audio play failed:', e);
-            }
-          });
-        } else {
-          if (process.env.NODE_ENV === 'development') {
-            console.log('Audio element not found');
-          }
-        }
-      }, 100);
+      return;
     }
+    thisVideo.muted = false;
+    thisVideo.play().then(() => setPlayingClipId(clip.id)).catch(() => {});
   };
 
   const generateNewTitle = async (clipId: string) => {
@@ -429,11 +415,7 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
                     {playingClipId === clip.id ? '⏸️ Pause Audio' : '🎵 Preview Audio'}
                   </button>
 
-                  {src && isVideo && (
-                    <a className="btn" href={src} target="_blank" rel="noreferrer">
-                      Preview
-                    </a>
-                  )}
+                  {/* Removed legacy external "Preview" link */}
 
                   {clip.downloadUrl && (
                     <a className="btn" href={clip.downloadUrl} download>
@@ -448,26 +430,7 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
         </div>
       )}
 
-      {/* Hidden audio element for playback */}
-      {playingClipId && (() => {
-        const clip = displayClips.find(c => c.id === playingClipId);
-        const audioUrl = clip ? normalizeSrc(clip) : null;
-        return audioUrl ? (
-          <audio
-            key={playingClipId}
-            data-clip-id={playingClipId}
-            src={audioUrl}
-            autoPlay
-            onEnded={() => setPlayingClipId(null)}
-            onError={(e) => {
-              if (process.env.NODE_ENV === 'development') {
-                console.error('Audio playback error:', e);
-              }
-              setPlayingClipId(null);
-            }}
-          />
-        ) : null;
-      })()}
+      {/* Removed legacy global <audio>; we control the clip's <video> directly */}
 
       <Modal open={open} onClose={() => setOpen(false)}>
         <div>

@@ -112,7 +112,15 @@ export async function getClipsSimple(episodeId: string): Promise<Clip[]> {
     { cache: "no-store" }
   );
   if (!r.ok) throw new Error(r.error || `clips_http_${r.status ?? "unknown"}`);
-  return parseClips<Clip>(r.data);
+  const clips = parseClips<Clip>(r.data);
+  // Normalize media URLs to absolute backend URLs (handles "/clips/..." etc.)
+  const absolutize = (u?: string) =>
+    !u ? u : (u.startsWith("http://") || u.startsWith("https://")) ? u : apiUrl(u);
+  return clips.map((c: any) => ({
+    ...c,
+    preview_url: absolutize(c.preview_url || c.previewUrl || c.video_url),
+    audio_url: absolutize(c.audio_url || c.audioUrl),
+  }));
 }
 
 export async function uploadYouTube(url: string): Promise<ApiResult<{ episode_id: string }>> {

@@ -9,6 +9,7 @@ import re
 import random
 import math
 import os
+import json
 from typing import List, Dict, Tuple, Any, Optional
 from models import AudioFeatures, TranscriptSegment, MomentScore
 from config.settings import (
@@ -783,6 +784,43 @@ class ClipScoreService:
             # Add V4 viral score and platform recommendations
             length_s = float(seg["end"] - seg["start"])
             seg["viral"] = viral_potential_v4(feats, length_s, "general")
+            
+            # -------- DEBUG JSON LINE (feed to logs for analysis) --------
+            if logger.isEnabledFor(logging.INFO):
+                dbg = {
+                    "episode_id": episode_id or "unknown",
+                    "clip_id": seg.get("id", f"clip_{i}"),
+                    "start": round(float(seg.get("start", 0.0)), 3),
+                    "end": round(float(seg.get("end", 0.0)), 3),
+                    "duration_sec": round(length_s, 3),
+                    "final_score": round(raw_score, 4),
+                    "hook": round(feats.get("hook_score", 0.0), 4),
+                    "arousal": round(feats.get("arousal_score", 0.0), 4),
+                    "payoff": round(feats.get("payoff_score", 0.0), 4),
+                    "emotion": round(feats.get("emotion_score", 0.0), 4),
+                    "info_density": round(feats.get("info_density", 0.0), 4),
+                    "question_score": round(feats.get("question_score", 0.0), 4),
+                    "platform_length": round(feats.get("platform_length_score_v2", feats.get("platform_len_match", 0.0)), 4),
+                    "insight_score": round(feats.get("insight_score", 0.0), 4),
+                    "loopability": round(feats.get("loopability", 0.0), 4),
+                    "_synergy_boost": round(feats.get("_synergy_boost", 0.0), 4),
+                    "_bonuses": {
+                        "insight": round(feats.get("insight_score", 0.0) * 0.15 if feats.get("insight_score", 0.0) >= 0.7 else 0.0, 4),
+                        "question": round(feats.get("question_score", 0.0) * 0.10 if feats.get("question_score", 0.0) >= 0.6 else 0.0, 4),
+                        "platform_fit": round(0.02 if feats.get("platform_length_score_v2", feats.get("platform_len_match", 0.0)) >= 0.90 else 0.0, 4)
+                    },
+                    "_penalties": {
+                        "ad_penalty": round(feats.get("_ad_penalty", 0.0), 4),
+                        "soft_penalty": seg.get("soft_penalty", "none"),
+                        "energy_dampener": seg.get("energy_dampener", "none")
+                    },
+                    "winning_path": winning_path,
+                    "path_scores": {k: round(v, 4) for k, v in path_scores.items()},
+                    "title": seg.get("title", ""),
+                    "transcript_preview": (seg.get("text", "") or "").strip()[:240]
+                }
+                # Single-line JSON: greppable and easy to paste
+                logger.info("CLIP_SCORING %s", json.dumps(dbg, ensure_ascii=False))
             
             scored.append(seg)
         
