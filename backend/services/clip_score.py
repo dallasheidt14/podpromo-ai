@@ -1566,9 +1566,26 @@ class ClipScoreService:
             try:
                 has_finished = any(bool(c.get("finished_thought")) for c in finals)
                 if not has_finished:
-                    pool = [c for c in candidates if c.get("finished_thought")]
+                    import re
+                    _BAN_CHATTER = re.compile(
+                        r"\b(appreciate|honored|thanks?|thank you|glad|pleased|great to be here|"
+                        r"see you|next week|today we('| )?re|interview(ed)?|enjoyed)\b",
+                        re.I,
+                    )
+                    pool = []
+                    for c in candidates:
+                        if not c.get("finished_thought"):
+                            continue
+                        text = (c.get("transcript") or c.get("text") or "").lower()
+                        if _BAN_CHATTER.search(text):
+                            continue  # avoid pleasantries/outro banter
+                        pool.append(c)
                     if pool:
-                        pool.sort(key=lambda c: float(c.get("final_score", c.get("score", 0.0))), reverse=True)
+                        # Prefer payoff_ok=True, then by score
+                        pool.sort(key=lambda c: (
+                            0 if not c.get("payoff_ok") else 1,
+                            float(c.get("final_score", c.get("score", 0.0)))
+                        ), reverse=True)
                         candidate = pool[0]
                         if finals:
                             finals.sort(key=lambda c: float(c.get("final_score", c.get("score", 0.0))))

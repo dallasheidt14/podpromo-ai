@@ -15,13 +15,18 @@ STOP = {
     "be","been","being","it","its","this","that","these","those","you","your","we","our","they","their","i",
     "he","she","him","her","his","hers","them","do","does","did","doing","have","has","had","having","not",
     "no","but","so","if","then","than","there","here","what","which","who","whom","into","over","under","about",
-    # extra fillers that polluted titles in your logs
-    "through","again","maybe","say","first","company","will","ill"
+    # extra fillers that polluted titles
+    "through","again","maybe","say","will","ill","youre","very","answer","two","words"
 }
 
 # Patterns we never want in shorts titles
 BANNED = re.compile(
     r"(how to(?!\s+\w)|in \d+\s+steps|secrets?|ultimate guide|tips & tricks|hack(s)?|unlock|master(?!\w)|click here)",
+    re.I,
+)
+
+BAN_PHRASE = re.compile(
+    r"\b(appreciate|honored|thanks?|thank you|enjoyed|great to be here|see you|subscribe|like and subscribe)\b",
     re.I,
 )
 
@@ -36,6 +41,7 @@ def _clean_text(t: str) -> str:
 ANCHORS: List[Tuple[re.Pattern, str]] = [
     (re.compile(r"\bdigital[-\s]?first\b", re.I), "Digital-First"),
     (re.compile(r"\brestructuring\b", re.I), "Restructuring"),
+    (re.compile(r"\binvestment(s)?\b|\bfunding\b|\braise(d)?\b", re.I), "Investment"),
     (re.compile(r"\bpartnerships?\b", re.I), "Partnership"),
     (re.compile(r"\bacquisition(s)?\b|\bmerger(s)?\b", re.I), "Acquisition"),
     (re.compile(r"\bbankruptcy\b", re.I), "Bankruptcy"),
@@ -44,6 +50,28 @@ ANCHORS: List[Tuple[re.Pattern, str]] = [
     (re.compile(r"\brefinanc(ing|e)\b|\bdebt\b", re.I), "Debt"),
     (re.compile(r"\bai\b", re.I), "AI"),
 ]
+
+_MONEY = re.compile(r"(?:(?:\$?\s*\d+(?:\.\d+)?\s*(?:k|m|b))|(?:\$\s*\d[\d,]*\b)|(?:\d+\s*(?:million|billion)))", re.I)
+
+def _fmt_money(s: str) -> str:
+    s = s.lower().replace(",", "").replace("$", "").strip()
+    if "million" in s:
+        num = float(s.split()[0])
+        return f"${num:.0f}M"
+    if "billion" in s:
+        num = float(s.split()[0])
+        return f"${num:.0f}B"
+    if s.endswith("k") or s.endswith("m") or s.endswith("b"):
+        return f"${s.upper()}"
+    # raw number: keep as-is with $ if it looked like money
+    return f"${s}"
+
+def _title_case_hyphen(s: str) -> str:
+    parts = []
+    for token in s.split():
+        chunks = token.split("-")
+        parts.append("-".join(c.capitalize() for c in chunks))
+    return " ".join(parts)
 
 def _mine_anchor_phrases(text: str) -> List[str]:
     """
@@ -85,6 +113,18 @@ def _mine_anchor_phrases(text: str) -> List[str]:
                 phrases[phrase] += 4  # strong preference for <ProperNoun + Anchor>
             else:
                 phrases[canon] += 2
+            # money-aware: "<Left> $XM Investment"
+            if canon == "Investment":
+                # look ±8 tokens for a money figure
+                low = max(0, idx-8); hi = min(len(toks), idx+8)
+                window_text = " ".join(toks[low:hi])
+                mny = _MONEY.search(window_text)
+                if mny:
+                    amt = _fmt_money(mny.group(0))
+                    if left:
+                        phrases[f"{left} {amt} Investment"] += 6
+                    else:
+                        phrases[f"{amt} Investment"] += 3
 
     # Also consider frequent 2–3 word ngrams that aren't all stopwords
     words = [w for w in lowers if w not in STOP]
@@ -93,7 +133,7 @@ def _mine_anchor_phrases(text: str) -> List[str]:
             gram = words[i:i+n]
             if any(len(w) >= 6 for w in gram):
                 phrase = " ".join(gram).title()
-                if not BANNED.search(phrase) and not all(w in STOP for w in gram):
+                if not BANNED.search(phrase) and not all(w in STOP for w in gram) and not BAN_PHRASE.search(phrase):
                     phrases[phrase] += 1
 
     # Return top unique phrases in order
@@ -110,12 +150,25 @@ def _extract_keywords(text: str, k: int = 6) -> List[str]:
     """
     phrases = _mine_anchor_phrases(text)
     if phrases:
-        return phrases[:k]
+        # normalize hyphen case (Digital-First), filter banter
+        cleaned = []
+        for p in phrases:
+            if BAN_PHRASE.search(p):
+                continue
+            cleaned.append(_title_case_hyphen(p))
+        return cleaned[:k]
     # fallback to unigram frequency if anchors fail
     clean = _clean_text(text)
     words = re.findall(r"[A-Za-z][A-Za-z'-]{2,}", clean)
     freq = Counter(w.lower() for w in words if w.lower() not in STOP)
-    out = [w.title() for w, _ in freq.most_common(k)]
+    out = []
+    for w, _ in freq.most_common(20):
+        t = w.title()
+        if BAN_PHRASE.search(t):
+            continue
+        out.append(t)
+        if len(out) >= k:
+            break
     return out
 
 def _title_case(s: str) -> str:
@@ -126,7 +179,7 @@ def _variants_from_keywords(keys: List[str], platform: str) -> List[str]:
     main = " ".join([k.replace("-", " ") for k in keys[:1]]).strip()  # use top phrase only
     if not main:
         return []
-    main_tc = _title_case(main)
+    main_tc = _title_case_hyphen(main)
     alts = []
     if platform == "shorts":
         alts = [
