@@ -3,6 +3,12 @@ from typing import Dict, List, Any
 import numpy as np
 
 logger = logging.getLogger(__name__)
+log = logging.getLogger("services.quality_filters")
+
+# Tunables
+_LONG_SEC_1 = 20.0   # minimum for "long"
+_LONG_SEC_2 = 24.0   # encourage at least one in 24–30s range when available
+_LONG_MIX_MIN = 2    # target at least 2 long clips in finals
 
 def calculate_resolution_delta(candidate: Dict[str, Any]) -> float:
     """Calculate resolution_delta: payoff curve increase over the last ~25% of the clip window"""
@@ -462,6 +468,34 @@ def filter_low_quality(candidates: List[Dict], min_score: int = 20) -> List[Dict
                         logger.info("QUALITY_BACKSTOP: promoted finished_thought clip %s", candidate.get("id"))
     except Exception as e:
         logger.error("QUALITY_BACKSTOP_ERROR: %s", e)
+    # -----------------------------------------------------------------------
+
+    # ---- DURATION MIX GUARD ------------------------------------------------
+    # Ensure at least 2 long (>=20s) clips in finals when such survivors exist.
+    try:
+        have_long = sum(1 for c in text_filtered if float(c.get("dur", 0.0)) >= _LONG_SEC_1)
+        if have_long < _LONG_MIX_MIN:
+            pool = [c for c in candidates if float(c.get("dur", 0.0)) >= _LONG_SEC_1]
+            # prefer finished_thought and payoff_ok, then by score and length
+            pool.sort(key=lambda c: (
+                1 if c.get("finished_thought") else 0,
+                1 if c.get("payoff_ok") else 0,
+                float(c.get("final_score", c.get("score", 0.0))),
+                float(c.get("dur", 0.0))
+            ), reverse=True)
+            while have_long < _LONG_MIX_MIN and pool:
+                candidate = pool.pop(0)
+                # swap out weakest short
+                shorts = [c for c in text_filtered if float(c.get("dur", 0.0)) < _LONG_SEC_1]
+                if not shorts:
+                    break
+                weakest = min(shorts, key=lambda c: float(c.get("final_score", c.get("score", 0.0))))
+                idx = text_filtered.index(weakest)
+                text_filtered[idx] = candidate
+                have_long += 1
+                log.info("DIVERSITY_GUARD_LONG: promoted long clip id=%s dur=%.1fs", candidate.get("id"), candidate.get("dur",0.0))
+    except Exception as e:
+        log.warning("DIVERSITY_GUARD_LONG_ERROR: %s", e)
     # -----------------------------------------------------------------------
 
     logger.info(f"Quality filter result: {len(candidates)} → {len(text_filtered)} candidates")

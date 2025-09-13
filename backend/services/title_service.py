@@ -49,6 +49,14 @@ ANCHORS: List[Tuple[re.Pattern, str]] = [
     (re.compile(r"\bgrowth\b", re.I), "Growth"),
     (re.compile(r"\brefinanc(ing|e)\b|\bdebt\b", re.I), "Debt"),
     (re.compile(r"\bai\b", re.I), "AI"),
+    # Sports/training domain
+    (re.compile(r"\bpractice\b", re.I), "Practice"),
+    (re.compile(r"\btraining\b", re.I), "Training"),
+    (re.compile(r"\bdrills?\b", re.I), "Drills"),
+    (re.compile(r"\bjuggl(e|ing)\b", re.I), "Juggling"),
+    (re.compile(r"\bclub\b", re.I), "Club"),
+    (re.compile(r"\bchelsea\b", re.I), "Chelsea"),
+    (re.compile(r"\bajax\b|\biaxe\b", re.I), "Ajax"),
 ]
 
 _MONEY = re.compile(r"(?:(?:\$?\s*\d+(?:\.\d+)?\s*(?:k|m|b))|(?:\$\s*\d[\d,]*\b)|(?:\d+\s*(?:million|billion)))", re.I)
@@ -133,6 +141,9 @@ def _mine_anchor_phrases(text: str) -> List[str]:
             gram = words[i:i+n]
             if any(len(w) >= 6 for w in gram):
                 phrase = " ".join(gram).title()
+                # drop junk like "Players Anomalies Need"
+                if any(w in ("need","because","there","just") for w in gram):
+                    continue
                 if not BANNED.search(phrase) and not all(w in STOP for w in gram) and not BAN_PHRASE.search(phrase):
                     phrases[phrase] += 1
 

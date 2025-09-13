@@ -1140,7 +1140,13 @@ class ClipScoreService:
             # Use dynamic segmentation based on natural content boundaries
             from services.secret_sauce_pkg.features import create_dynamic_segments
             
-            dynamic_segments = create_dynamic_segments(filtered_segments, platform)
+            # Extract EOS times for coherence extension
+            eos_times = None
+            eos = episode.get("eos_unified") or episode.get("eos") or {}
+            if isinstance(eos, dict):
+                eos_times = eos.get("times") or eos.get("ts") or None
+            
+            dynamic_segments = create_dynamic_segments(filtered_segments, platform, eos_times)
             
             logger.info(f"Created {len(dynamic_segments)} dynamic segments based on natural boundaries")
             

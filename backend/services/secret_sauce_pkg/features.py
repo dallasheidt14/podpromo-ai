@@ -40,6 +40,75 @@ from scipy import signal
 from scipy.stats import skew, kurtosis
 from bisect import bisect_left
 from config_loader import get_config
+import logging
+log = logging.getLogger("services.secret_sauce_pkg.features")
+
+# --- Helpers ---------------------------------------------------------------
+def _extend_to_eos(start_s: float, end_s: float, eos_times: list[float] | None,
+                   *, max_extra: float = 8.0, hard_cap: float = 30.0) -> float:
+    """
+    Extend end time to the first EOS marker after current end, within max_extra seconds,
+    without exceeding hard_cap duration from start.
+    """
+    if not eos_times:
+        return end_s
+    max_end = min(start_s + hard_cap, end_s + max_extra)
+    i = bisect_left(eos_times, end_s + 0.05)  # first EOS strictly after end
+    if i < len(eos_times) and eos_times[i] <= max_end:
+        return eos_times[i]
+    return end_s
+
+def _looks_finished(text: str) -> bool:
+    # lightweight heuristic: ends with terminal punctuation or "so…" -> false
+    t = (text or "").strip()
+    if not t:
+        return False
+    return t.endswith((".", "!", "?"", "?"", "'."", "."", "?"")) or t.endswith("?")
+
+def _choose_target_duration(pl_v2: float, base: float) -> float:
+    """
+    More assertive length targeting for platforms:
+      - pl_v2 >= 0.60: aim 22–26s
+      - 0.40–0.60: aim ~18–22s
+      - else: 16–18s
+    """
+    if pl_v2 >= 0.60:
+        return 24.0
+    if pl_v2 >= 0.40:
+        return 20.0
+    return max(16.0, min(18.0, base))
+
+def _apply_eos_extension(segment: dict, eos_times: list[float] | None, platform: str) -> dict:
+    """
+    Apply EOS-aware extension to improve coherence and finished_thought status.
+    """
+    start_s = float(segment["start"])
+    end_s = float(segment["end"])
+    text = segment.get("text", "")
+    
+    # Calculate platform length score for targeting
+    pl_v2 = segment.get("platform_length_score_v2", 0.5)  # Default to mid-range
+    
+    # Choose target duration based on platform fit
+    target_dur = _choose_target_duration(pl_v2, end_s - start_s)
+    new_end = min(start_s + target_dur, start_s + 30.0)  # Cap at 30s
+    
+    # If still short or unfinished, extend to next EOS
+    if (new_end - start_s) < 20.0 or not _looks_finished(text):
+        extended_end = _extend_to_eos(start_s, new_end, eos_times, max_extra=8.0, hard_cap=30.0)
+        if extended_end > new_end:
+            new_end = extended_end
+            log.info("COHERENCE_EXTEND: seg=%s dur=%.1fs→%.1fs", segment.get("id","?"), end_s-start_s, new_end-start_s)
+    
+    # Update segment
+    segment["end"] = new_end
+    segment["dur"] = round(new_end - start_s, 2)
+    
+    # Mark as finished if text looks finished or we landed on EOS
+    if _looks_finished(text) or (eos_times and abs(new_end - _extend_to_eos(start_s, new_end-0.1, eos_times)) < 0.11):
+        segment["finished_thought"] = True
+    
+    return segment
 
 # Finish-Thought Gate Configuration
 FINISH_THOUGHT_CONFIG = {
@@ -2695,7 +2764,7 @@ def find_natural_boundaries(text: str) -> List[Dict]:
     
     return unique_boundaries
 
-def create_dynamic_segments(segments: List[Dict], platform: str = 'tiktok') -> List[Dict]:
+def create_dynamic_segments(segments: List[Dict], platform: str = 'tiktok', eos_times: list[float] | None = None) -> List[Dict]:
     """
     Create dynamic segments based on natural content boundaries and platform optimization.
     """
@@ -2801,6 +2870,8 @@ def create_dynamic_segments(segments: List[Dict], platform: str = 'tiktok') -> L
                 "boundary_type": boundary["type"],
                 "confidence": boundary["confidence"]
             }
+            # Apply EOS extension for coherence
+            segment = _apply_eos_extension(segment, eos_times, platform)
             # Apply caps filtering
             if _keep(segment):
                 dynamic_segments.append(segment)
@@ -2814,6 +2885,8 @@ def create_dynamic_segments(segments: List[Dict], platform: str = 'tiktok') -> L
                 "boundary_type": "extended",
                 "confidence": boundary["confidence"]
             }
+            # Apply EOS extension for coherence
+            segment = _apply_eos_extension(segment, eos_times, platform)
             # Apply caps filtering
             if _keep(segment):
                 dynamic_segments.append(segment)
