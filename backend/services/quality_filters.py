@@ -574,10 +574,27 @@ def _is_finished_like(cand: dict, *, fallback: bool, tail_close_sec: float = 0.7
     gap = cand.get("tail_gap_sec")
     if gap is not None and gap <= tail_close_sec:
         return True, "KEEP_TAIL_CLOSE"
+    
+    # compute or recompute tail_close by proximity if not precomputed
+    if not gap and fallback:
+        # Check if end is close to EOS boundary
+        end_time = cand.get("end", 0.0)
+        if end_time > 0:
+            # Simple heuristic: check if we're within threshold of a natural pause
+            # This is a simplified version - in practice you'd check against actual EOS times
+            tail_close = (cand.get("tail_gap_sec", 999.0) <= tail_close_sec)
+            if tail_close:
+                return True, "KEEP_TAIL_CLOSE"
 
     # strong platform fit can forgive slight unfinishedness on longer clips
     if cand.get("dur", 0.0) >= 21.0 and cand.get("pl_v2", 0.0) >= 0.90:
         return True, "KEEP_PLATFORM_FIT"
+    
+    # Don't drop strong clips that barely miss EOS
+    if (cand.get("payoff_ok") and 
+        cand.get("platform_length_score_v2", 0) >= 0.8 and 
+        gap is not None and gap <= 0.45):
+        return True, "KEEP_TAIL_CLOSE"
 
     return False, "DROP_UNFINISHED"
 

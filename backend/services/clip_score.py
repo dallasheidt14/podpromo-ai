@@ -305,16 +305,20 @@ def _diversity_tiebreaker(picks, reserve, LOG=None):
     
     return picks
 
-def adaptive_gate(candidates: List[Dict], min_count: int = 3) -> List[Dict]:
+def adaptive_gate(candidates: List[Dict], min_count: int = 3, gate_mode=None) -> List[Dict]:
     """Adaptive gate with salvage pass - never relax finished_thought"""
     from services.quality_filters import essential_gates
     
-    # Detect fallback mode from candidates
-    fallback = any(
-        bool(c.get("fallback") or c.get("meta", {}).get("fallback")) or
-        "sparse" in (c.get("ft_classifier", "") or "")
-        for c in candidates
-    )
+    # infer fallback safely from gate_mode if provided
+    fallback = bool(gate_mode.get("fallback")) if isinstance(gate_mode, dict) else False
+    
+    # Detect fallback mode from candidates if not provided
+    if not fallback:
+        fallback = any(
+            bool(c.get("fallback") or c.get("meta", {}).get("fallback")) or
+            "sparse" in (c.get("ft_classifier", "") or "")
+            for c in candidates
+        )
     
     # Apply fallback-aware gates
     passed, reason_counts = essential_gates(
@@ -337,7 +341,8 @@ def adaptive_gate(candidates: List[Dict], min_count: int = 3) -> List[Dict]:
         salvaged = _salvage_pass(
             candidates,
             fallback=bool(gate_mode and gate_mode.get("fallback")),
-            tail_close_sec=1.0,
+            tail_close_sec=gate_mode.get("tail_close_sec", 0.60) if gate_mode else 1.0,
+            max_extend_sec=float(os.getenv("SALVAGE_MAX_EXTEND_SEC", "4.0")),
             LOG=logger,
         )
         if salvaged:
@@ -567,7 +572,7 @@ def _unwrap_extended(ext):
     # strings or anything else -> invalid
     return None
 
-def _salvage_pass(candidates: List[Dict], *, fallback=False, tail_close_sec=1.0, LOG=None) -> List[Dict]:
+def _salvage_pass(candidates: List[Dict], *, fallback=False, tail_close_sec=1.0, max_extend_sec=4.0, LOG=None) -> List[Dict]:
     """Salvage pass: auto-extend top hooks to next EOS (≤90s), re-check finished_thought"""
     from services.quality_filters import essential_gates
     
@@ -582,7 +587,7 @@ def _salvage_pass(candidates: List[Dict], *, fallback=False, tail_close_sec=1.0,
         
         # Strategy 1: End-extend to next EOS boundary (≤90s hard cap)
         try:
-            extended_c = _extend_to_eos(c, max_dur=90.0)
+            extended_c = _extend_to_eos(c, max_dur=min(90.0, c.get("end", 0) + max_extend_sec))
         except Exception as e:
             if LOG: LOG.debug("SALVAGE: extend failed: %r", e)
             continue
@@ -2007,6 +2012,14 @@ class ClipScoreService:
             
             logger.info(f"GATE_MODE: fallback={episode_fallback_mode} (authoritative from enhanced pipeline)")
             
+            # Compute gate_mode for adaptive gate
+            gate_mode = {
+                # authoritative from enhanced pipeline; keep your existing signal if set elsewhere
+                "fallback": episode_fallback_mode,
+                # make tail-close more forgiving in fallback/balanced runs
+                "tail_close_sec": float(os.getenv("TAIL_CLOSE_SEC", "0.60")),
+            }
+            
             if "error" in viral_result:
                 logger.error(f"Enhanced viral clips pipeline failed: {viral_result['error']}")
                 return []
@@ -2137,7 +2150,7 @@ class ClipScoreService:
             
             # Apply adaptive gate if we have too few clips (use reserve pool)
             if len(quality_filtered) < 3:
-                quality_filtered = adaptive_gate(reserve_pool, min_count=3)
+                quality_filtered = adaptive_gate(reserve_pool, min_count=3, gate_mode=gate_mode)
                 logger.info(f"POOL: STRICT={len(quality_filtered)} BALANCED(from=reserve)={len(quality_filtered)}")
             
             # Finish polish: extend borderline clips to coherent stops

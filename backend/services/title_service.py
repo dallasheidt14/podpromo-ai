@@ -21,6 +21,18 @@ STOP = {
 
 _STOP = set("a an the and or for to in of with over under on at is are was were be been being it this that".split())
 
+CONTRACTION_FIX = {
+    r"\bweve\b": "we've",
+    r"\btheyre\b": "they're",
+    r"\btheres\b": "there's",
+}
+
+def _normalize_contractions(s: str) -> str:
+    s2 = s
+    for pat, rep in CONTRACTION_FIX.items():
+        s2 = re.sub(pat, rep, s2, flags=re.IGNORECASE)
+    return s2
+
 def _fallback_keywords(txt: str, n=3):
     if not txt:
         return []
@@ -50,6 +62,8 @@ BANNED = re.compile(
     r"(how to(?!\s+\w)|in \d+\s+steps|secrets?|ultimate guide|tips & tricks|hack(s)?|unlock|master(?!\w)|click here)",
     re.I,
 )
+
+BANNED_PHRASES = {"Key Insight", "Key Takeaways", "Inside ", "What It Means"}
 
 BAN_PHRASE = re.compile(
     r"\b(appreciate|honored|thanks?|thank you|enjoyed|great to be here|see you|subscribe|like and subscribe)\b",
@@ -765,6 +779,14 @@ def generate_titles(
             sanitized_title = _deplaceholder(sanitized_title, clean_text)
             # also collapse duplicated patterns
             sanitized_title = sanitized_title.replace(": What It Means", "").replace(": What It Really Means", "")
+            # Normalize contractions
+            sanitized_title = _normalize_contractions(sanitized_title)
+            # Check for banned phrases and rewrite if needed
+            for banned in BANNED_PHRASES:
+                if banned.lower() in sanitized_title.lower():
+                    sanitized_title = sanitized_title.replace(banned, "").strip()
+                    if not sanitized_title:
+                        sanitized_title = "Important Insight"
             sanitized = sanitized_title != title
             
             result.append({
