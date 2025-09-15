@@ -1,6 +1,25 @@
 ﻿import logging
 from typing import Dict, List, Any
 import numpy as np
+import re
+
+_AD_PATTERNS = [
+    r"\b(use code|promo code|enter code)\b",
+    r"\bvisit\s+[a-z0-9\-]+\.(com|io|ai)\b",
+    r"\b(sponsored|sponsor|brought to you by)\b",
+    r"\b(call|text)\s+\d{3}[-\s]\d{3}[-\s]\d{4}\b",
+    r"\b(start your free trial|sign up today|limited time)\b",
+    r"\b(shop now|click (the )?link|learn more)\b",
+    r"\b(our ai agent|24/7 support|money back guarantee)\b",
+]
+_AD_RE = re.compile("|".join(_AD_PATTERNS), re.IGNORECASE)
+
+def _ad_like_score(text: str) -> float:
+    if not text:
+        return 0.0
+    # simple heuristic: matches / (matches + 3) to keep it soft
+    m = len(_AD_RE.findall(text))
+    return m / (m + 3)
 
 logger = logging.getLogger(__name__)
 log = logging.getLogger("services.quality_filters")
@@ -233,16 +252,13 @@ def _scores(cands):
             vals.append(float(v))
     return vals
 
-def filter_low_quality(candidates, mode: str | None = None, **kwargs):
-    """
-    Compat shim: older callers (e.g., pure_topk_pick) may pass 'mode' ('strict'|'balanced').
-    We intentionally ignore it here because gating already happened upstream.
-    """
-    # Future hook for mode-based thresholds
-    if mode in ("strict", "balanced", None):
-        pass  # TODO: optionally map mode to thresholds later
-    
-    # --- existing implementation stays exactly as-is below ---
+def filter_low_quality(candidates, mode=None, **_):
+    """Backwards-compatible wrapper. `mode` is optional hint ('strict'|'balanced')."""
+    # ignore mode for now or map it internally
+    return _filter_low_quality_impl(candidates, {})
+
+def _filter_low_quality_impl(candidates, gate_mode):
+    """Internal implementation of quality filtering"""
     if not candidates:
         return candidates
     
@@ -367,6 +383,15 @@ def filter_low_quality(candidates, mode: str | None = None, **kwargs):
         # Basic length check (keep this as absolute)
         if words < 8:
             reasons.append("too_short")
+        
+        # Ad detection - block sponsor reads
+        ad_like = candidate.get("ad_like", None)
+        if ad_like is None:
+            ad_like = _ad_like_score(text)
+            candidate["ad_like"] = ad_like
+        
+        if ad_like >= 0.60:
+            reasons.append("ad_like")
         
         # Check for bait without payoff
         if hook_score > 0.80 and payoff_score < 0.10:
@@ -535,20 +560,24 @@ def _ends_with_punct(cand) -> bool:
     txt = cand.get("text") or cand.get("preview") or ""
     return str(txt).strip().endswith(_END_PUNCT)
 
-def _is_finished_like(cand, *, fallback: bool, tail_close_sec: float):
+def _is_finished_like(cand: dict, *, fallback: bool, tail_close_sec: float = 0.75):
+    # ft_classifier can be "finished" / "sparse_finished" / "missing"
     ft = (cand.get("ft_classifier") or "").lower()
+    if ft in ("finished", "sparse_finished"):
+        return True, "KEEP_FT"
 
-    if ft in _FINISHED_OK:
-        return True, "KEEP_FINISHED"
+    # explicit finished flag from upstream scoring, if present
+    if cand.get("finished_thought") is True:
+        return True, "KEEP_FLAG_FINISHED"
 
-    if fallback and ft in _SPARSE_OK:
-        return True, "KEEP_FALLBACK_FINISHED"
+    # close-tail acceptance: if we stopped within X sec of an EOS/pause
+    gap = cand.get("tail_gap_sec")
+    if gap is not None and gap <= tail_close_sec:
+        return True, "KEEP_TAIL_CLOSE"
 
-    # "Close enough" tail acceptance (only when unfinished-tail was flagged)
-    caps = set(cand.get("caps") or [])
-    if "unfinished_tail_penalty" in caps:
-        if _get_tail_gap_sec(cand) <= tail_close_sec or _ends_with_punct(cand):
-            return True, "KEEP_TAIL_CLOSE"
+    # strong platform fit can forgive slight unfinishedness on longer clips
+    if cand.get("dur", 0.0) >= 21.0 and cand.get("pl_v2", 0.0) >= 0.90:
+        return True, "KEEP_PLATFORM_FIT"
 
     return False, "DROP_UNFINISHED"
 

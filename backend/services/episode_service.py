@@ -293,8 +293,13 @@ class EpisodeService:
                 seg_words.append(episode_words[j])
                 j += 1
             
-            # Attach words to segment
-            segment.words = seg_words
+            # Attach words to segment with upstream normalization
+            if not seg_words:
+                segment.words = []          # never None
+            elif not isinstance(seg_words, list):
+                segment.words = list(seg_words) # normalize iterables
+            else:
+                segment.words = seg_words
             
         logger.info(f"Attached words to {len(segments)} segments")
 

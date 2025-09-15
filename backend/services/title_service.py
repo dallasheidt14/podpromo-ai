@@ -19,6 +19,32 @@ STOP = {
     "through","again","maybe","say","will","ill","youre","very","answer","two","words"
 }
 
+_STOP = set("a an the and or for to in of with over under on at is are was were be been being it this that".split())
+
+def _fallback_keywords(txt: str, n=3):
+    if not txt:
+        return []
+    # crude nouny tokens: keep capitalized words & 4+ letter lowercase
+    toks = re.findall(r"[A-Za-z][A-Za-z'\-]+", txt)
+    toks = [t for t in toks if t.lower() not in _STOP]
+    # keep order, de-dup
+    seen, out = set(), []
+    for t in toks:
+        k = t.lower()
+        if k not in seen:
+            seen.add(k); out.append(t)
+        if len(out) >= n:
+            break
+    return out
+
+def _deplaceholder(s: str, text: str) -> str:
+    if "This Topic" not in s:
+        return s
+    kws = _fallback_keywords(text, n=3) or ["The Idea"]
+    # simple replacements
+    topic = " ".join(kws[:2]) if len(kws) >= 2 else kws[0]
+    return s.replace("This Topic", topic)
+
 # Patterns we never want in shorts titles
 BANNED = re.compile(
     r"(how to(?!\s+\w)|in \d+\s+steps|secrets?|ultimate guide|tips & tricks|hack(s)?|unlock|master(?!\w)|click here)",
@@ -735,6 +761,10 @@ def generate_titles(
         if title not in avoid_set:
             # Always-on title sanitizer
             sanitized_title = _sanitize_title(title)
+            # Replace "This Topic" placeholders with topicful text
+            sanitized_title = _deplaceholder(sanitized_title, clean_text)
+            # also collapse duplicated patterns
+            sanitized_title = sanitized_title.replace(": What It Means", "").replace(": What It Really Means", "")
             sanitized = sanitized_title != title
             
             result.append({

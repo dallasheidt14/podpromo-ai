@@ -19,6 +19,15 @@ from config.settings import (
     DURATION_TARGET_MIN, DURATION_TARGET_MAX
 )
 
+# --- Feature toggles (safe defaults) ---
+FEATURES = {
+    "VIRALITY_TWEAKS_V1": True,
+    "EXTEND_MAX_5S": True,
+    "DEDUP_TIGHTEN_V1": True,
+    "LONG_UNFINISHED_GATE": True,
+    "SLICE_TRANSCRIPT_TO_AUDIO": True,
+}
+
 # Quality gate thresholds
 THRESHOLDS = {
     "strict": {
@@ -101,6 +110,16 @@ def apply_micro_jitter_to_display(dur: float) -> float:
     jitter = random.uniform(-0.4, 0.4)
     return round(dur + jitter, 1)
 
+def _get_dur(c: dict) -> float:
+    """Get duration from various possible field names"""
+    return float(
+        c.get("duration_sec") or
+        c.get("duration") or
+        c.get("dur") or
+        (c.get("end", 0.0) - c.get("start", 0.0)) or
+        0.0
+    )
+
 def _log_finals_summary(finals: list, logger) -> None:
     """Log structured summary of final clips"""
     if not finals:
@@ -114,7 +133,7 @@ def _log_finals_summary(finals: list, logger) -> None:
     finished_count = 0
     
     for clip in finals:
-        dur = float(clip.get("dur", 0))
+        dur = _get_dur(clip)
         durs.append(dur)
         
         # Bucket classification
@@ -161,7 +180,7 @@ def _log_pick_trace(finals: list, logger) -> None:
         virality = clip.get("display_score", clip.get("score", 0.0))
         payoff = clip.get("payoff_score", 0.0)
         finished = clip.get("finished_thought", False)
-        dur = clip.get("dur", 0)
+        dur = _get_dur(clip)
         
         # Get reasons from meta
         reasons = []
@@ -315,7 +334,12 @@ def adaptive_gate(candidates: List[Dict], min_count: int = 3) -> List[Dict]:
     # Salvage pass when pool==0: auto-extend top hooks to next EOS
     if len(passed) == 0:
         logger.warning("ADAPTIVE_GATE: pool=0, attempting salvage pass")
-        salvaged = _salvage_pass(candidates)
+        salvaged = _salvage_pass(
+            candidates,
+            fallback=bool(gate_mode and gate_mode.get("fallback")),
+            tail_close_sec=1.0,
+            LOG=logger,
+        )
         if salvaged:
             logger.info(f"ADAPTIVE_GATE: salvage recovered {len(salvaged)} clips")
             return salvaged
@@ -323,11 +347,227 @@ def adaptive_gate(candidates: List[Dict], min_count: int = 3) -> List[Dict]:
             logger.warning("ADAPTIVE_GATE: salvage failed, returning empty")
             return []
     
+    # Soft floor: guaranteed minimum when conditions are met
+    SOFT_FLOOR_K = int(os.getenv("SOFT_FLOOR_K", "3"))
+    
+    # Calculate additional conditions for soft floor
+    eos_density = 0.0  # Default, will be calculated if available
+    ft_ratio_sparse_ok = 0.0  # Default, will be calculated if available
+    
+    # Try to get eos_density from candidates metadata
+    for c in candidates:
+        if "eos_density" in c.get("meta", {}):
+            eos_density = c["meta"]["eos_density"]
+            break
+    
+    # Try to get ft_ratio_sparse_ok from candidates metadata  
+    for c in candidates:
+        if "ft_ratio_sparse_ok" in c.get("meta", {}):
+            ft_ratio_sparse_ok = c["meta"]["ft_ratio_sparse_ok"]
+            break
+    
+    should_softfloor = (
+        fallback or 
+        eos_density < 0.015 or 
+        ft_ratio_sparse_ok >= 0.70 or 
+        len(passed) == 0
+    )
+    
+    if should_softfloor and len(passed) < SOFT_FLOOR_K:
+        logger.info(f"ADAPTIVE_GATE: applying soft floor (current={len(passed)}, target={SOFT_FLOOR_K})")
+        
+        # Sort reserve by utility_pre_gate desc, then by hook desc, then stable by id
+        reserve_sorted = sorted(
+            candidates, 
+            key=lambda c: (
+                c.get("utility_pre_gate", c.get("display_score", 0.0)), 
+                c.get("hook", 0.0), 
+                c.get("id", "")
+            ), 
+            reverse=True
+        )
+        
+        # Apply quality guardrails
+        def soft_floor_ok(c):
+            virality = c.get("display_score", c.get("utility_pre_gate", 0.0))
+            hook = c.get("hook", 0.0)
+            payoff_ok = c.get("payoff_ok", False)
+            ad_pen = c.get("ad_pen", 0.0)
+            dur = c.get("dur", c.get("end", 0) - c.get("start", 0))
+            
+            return (
+                (virality >= 0.55 or (hook >= 0.60 and payoff_ok)) and 
+                ad_pen == 0 and 
+                8.0 <= dur <= 30.0
+            )
+        
+        pulled = [c for c in reserve_sorted if soft_floor_ok(c)]
+        need = SOFT_FLOOR_K - len(passed)
+        added = min(len(pulled), need)
+        
+        if added > 0:
+            passed.extend(pulled[:added])
+            logger.info(f"ADAPTIVE_GATE: soft floor added {added} clips (fallback={fallback}, eos_density={eos_density:.3f})")
+    
     # Return fewer rather than auto-fill with failed candidates
-    logger.warning(f"ADAPTIVE_GATE: only {len(passed)} passed gates (target: {min_count}) - returning fewer")
+    if len(passed) < min_count:
+        logger.warning(f"ADAPTIVE_GATE: only {len(passed)} passed gates (target: {min_count}) - returning fewer")
+    
     return passed
 
-def _salvage_pass(candidates: List[Dict]) -> List[Dict]:
+def apply_finish_adjustments(utility: float, dur: float, finished: bool, fallback_mode: bool) -> float:
+    """Apply finish bonuses and penalties to utility score"""
+    # bonus for actually finishing a thought
+    if finished:
+        utility += 0.15
+        return utility
+
+    # unfinished penalties (fallback-aware)
+    if dur >= 18.0:
+        utility += (-0.06 if fallback_mode else -0.12)
+    return utility
+
+def pre_gate_finish_normalization(cands, eos_times, flags, gate_mode, LOG):
+    """Pre-gate extension + long-unfinished guard"""
+    if not flags.get("EXTEND_MAX_5S", False):
+        return
+
+    from services.secret_sauce_pkg.features import extend_to_coherent_end
+
+    for c in cands:
+        dur = float(c.get("dur", 0.0))
+        finished = bool(c.get("finished_thought", False))
+        payoff = float(c.get("features", {}).get("payoff", 0.0))
+
+        # 1) Attempt a single coherent extension for long unfinished
+        if dur >= 22.0 and not finished:
+            seg = {"t1": c["t1"], "t2": c["t2"], "meta": c.setdefault("meta", {})}
+            _, ext = extend_to_coherent_end(seg, eos_times, max_extra=5.0, LOG=LOG)
+            if ext:
+                # update candidate window + duration
+                c["t2"] = seg["t2"]
+                c["dur"] = float(c["t2"]) - float(c["t1"])
+                # mark finished if your classifier re-check says so (cheap heuristic):
+                c["finished_thought"] = True  # or set after a quick tail-check
+
+        # 2) Optional hard-ish gate: still long & unfinished with low payoff? mark reject
+        if flags.get("LONG_UNFINISHED_GATE", False):
+            cutoff = 0.45 if not gate_mode.get("fallback", False) else 0.40
+            if dur >= 22.0 and (not c.get("finished_thought", False)) and payoff < cutoff:
+                c.setdefault("reject_reasons", []).append("LONG_UNFINISHED_LOW_PAYOFF")
+
+def slice_words_to_window(words, t1, t2):
+    """Slice words to audio window to prevent text bleeding past audio"""
+    # words: list of {"t": float, "w": "token"}
+    out = []
+    for w in words or []:
+        tw = float(w.get("t", 0.0))
+        if t1 - 1e-3 <= tw <= t2 + 1e-3:
+            out.append(w.get("w", ""))
+    return out
+
+def _segmentation_preflight(transcript_segments, LOG):
+    """
+    Normalizes transcript segments so dynamic segmentation never sees None.
+    - Ensures: words is a list, text is str (may be ""), and adds derived tokens
+    """
+    norm = []
+    none_word_ids = []
+    coerced_text_ids = []
+    wrong_type_ids = []
+
+    for i, s in enumerate(transcript_segments or []):
+        if not s:
+            continue
+        seg = dict(s)  # shallow copy is enough
+        seg.setdefault("id", i)
+        
+        # words
+        words = seg.get("words")
+        if words is None:
+            none_word_ids.append(seg["id"])
+            words = []
+        elif not isinstance(words, list):
+            wrong_type_ids.append(seg["id"])
+            words = list(words)
+        seg["words"] = words
+
+        # text
+        text = seg.get("text")
+        if text is None:
+            coerced_text_ids.append(seg["id"])
+            # build from words if needed
+            text = " ".join(w.get("w", "") if isinstance(w, dict) else str(w) for w in words) if words else ""
+        elif not isinstance(text, str):
+            coerced_text_ids.append(seg["id"])
+            text = str(text)
+        seg["text"] = text
+
+        # derived tokens (never None)
+        seg["tokens"] = (seg["text"].split() if seg["text"] else [])
+        norm.append(seg)
+
+    # emit compact warnings
+    if none_word_ids:
+        LOG.warning(
+            "DYNSEG: %d segments had words=None; coerced to [] (first few ids=%s)",
+            len(none_word_ids), none_word_ids[:5]
+        )
+    if wrong_type_ids:
+        LOG.warning(
+            "DYNSEG: %d segments had non-list words; coerced via list() (first few ids=%s)",
+            len(wrong_type_ids), wrong_type_ids[:5]
+        )
+    if coerced_text_ids:
+        LOG.warning(
+            "DYNSEG: %d segments had non-str/None text; coerced/synthesized (first few ids=%s)",
+            len(coerced_text_ids), coerced_text_ids[:5]
+        )
+    
+    return norm
+
+def near_time_dedup(cands, LOG):
+    """Tighter duplicate filtering with near-time rule"""
+    DEDUP_BY_TEXT_THRESH = 0.85 if FEATURES.get("DEDUP_TIGHTEN_V1", False) else 0.90
+    NEAR_TIME_WINDOW_S = 12.0
+    NEAR_TIME_OVERLAP = 0.75
+    
+    # assumes each c has t1,t2,utility
+    cands = sorted(cands, key=lambda x: x.get("utility", 0.0), reverse=True)
+    kept = []
+    for c in cands:
+        mid = 0.5 * (float(c["t1"]) + float(c["t2"]))
+        ok = True
+        for k in kept:
+            kmid = 0.5 * (float(k["t1"]) + float(k["t2"]))
+            if abs(mid - kmid) <= NEAR_TIME_WINDOW_S:
+                # temporal overlap ratio
+                a1,a2 = float(c["t1"]), float(c["t2"])
+                b1,b2 = float(k["t1"]), float(k["t2"])
+                inter = max(0.0, min(a2,b2) - max(a1,b1))
+                union = max(a2,a1) - min(b1,a1) if b2>=a2 else (b2 - min(a1,b1))
+                overlap = inter / max(1e-6, (a2-a1))
+                if overlap >= NEAR_TIME_OVERLAP:
+                    ok = False
+                    break
+        if ok:
+            kept.append(c)
+    LOG.info("DEDUP_NEARTIME: %d -> %d kept", len(cands), len(kept))
+    return kept
+
+# --- helper: unwrap outputs from _extend_to_eos ------------------------------
+def _unwrap_extended(ext):
+    # _extend_to_eos might return a dict, or (dict, meta), or a string/None on failure
+    if ext is None:
+        return None
+    if isinstance(ext, dict):
+        return ext
+    if isinstance(ext, (list, tuple)):
+        return ext[0] if ext and isinstance(ext[0], dict) else None
+    # strings or anything else -> invalid
+    return None
+
+def _salvage_pass(candidates: List[Dict], *, fallback=False, tail_close_sec=1.0, LOG=None) -> List[Dict]:
     """Salvage pass: auto-extend top hooks to next EOS (≤90s), re-check finished_thought"""
     from services.quality_filters import essential_gates
     
@@ -341,28 +581,92 @@ def _salvage_pass(candidates: List[Dict]) -> List[Dict]:
         tried += 1
         
         # Strategy 1: End-extend to next EOS boundary (≤90s hard cap)
-        extended_c = _extend_to_eos(c, max_dur=90.0)
-        if extended_c and essential_gates(extended_c)[0]:
-            salvaged.append(extended_c)
-            logger.debug(f"SALVAGE: extended {c.get('id', 'unknown')} to {extended_c.get('dur', 0):.1fs}")
+        try:
+            extended_c = _extend_to_eos(c, max_dur=90.0)
+        except Exception as e:
+            if LOG: LOG.debug("SALVAGE: extend failed: %r", e)
+            continue
+
+        c_ext = _unwrap_extended(extended_c)
+        if not isinstance(c_ext, dict):
+            if LOG: LOG.debug("SALVAGE: extend returned non-candidate (%r)", type(extended_c))
+            continue
+
+        kept, _reasons = essential_gates([c_ext], fallback=fallback, tail_close_sec=tail_close_sec)
+        if kept:
+            salvaged.append(kept[0])
+            if LOG:
+                LOG.info("SALVAGE: rescued id=%s new_end=%.2fs", c_ext.get("id"), c_ext.get("end", 0.0))
             continue
         
         # Strategy 2: If ends with question, try including immediate answer (Q→A join)
         if _ends_with_question(c):
-            qa_c = _join_question_answer(c, max_dur=90.0)
-            if qa_c and essential_gates(qa_c)[0]:
-                salvaged.append(qa_c)
-                logger.debug(f"SALVAGE: Q→A joined {c.get('id', 'unknown')} to {qa_c.get('dur', 0):.1fs}")
+            try:
+                qa_c = _join_question_answer(c, max_dur=90.0)
+            except Exception as e:
+                if LOG: LOG.debug("SALVAGE: Q→A join failed: %r", e)
                 continue
+                
+            if qa_c:
+                kept, _reasons = essential_gates([qa_c], fallback=fallback, tail_close_sec=tail_close_sec)
+                if kept:
+                    salvaged.append(kept[0])
+                    if LOG:
+                        LOG.info("SALVAGE: Q→A rescued id=%s new_end=%.2fs", qa_c.get("id"), qa_c.get("end", 0.0))
+                    continue
         
         # Strategy 3: Start-backoff to previous EOS (trim filler)
-        backoff_c = _backoff_to_previous_eos(c, max_dur=90.0)
-        if backoff_c and essential_gates(backoff_c)[0]:
-            salvaged.append(backoff_c)
-            logger.debug(f"SALVAGE: backoff {c.get('id', 'unknown')} to {backoff_c.get('dur', 0):.1fs}")
+        try:
+            backoff_c = _backoff_to_previous_eos(c, max_dur=90.0)
+        except Exception as e:
+            if LOG: LOG.debug("SALVAGE: backoff failed: %r", e)
+            continue
+            
+        if backoff_c:
+            kept, _reasons = essential_gates([backoff_c], fallback=fallback, tail_close_sec=tail_close_sec)
+            if kept:
+                salvaged.append(kept[0])
+                if LOG:
+                    LOG.info("SALVAGE: backoff rescued id=%s new_end=%.2fs", backoff_c.get("id"), backoff_c.get("end", 0.0))
     
-    logger.info(f"SALVAGE: tried={tried} rescued={len(salvaged)} max_extend=4.0s heuristic=punct_or_boundary")
+    if LOG:
+        LOG.info("SALVAGE: tried=%d rescued=%d max_extend=5.0s heuristic=punct_or_boundary", tried, len(salvaged))
     return salvaged
+
+def _finish_polish(c: dict, LOG=None) -> dict:
+    """If the clip looks unfinished but an EOS/pause is close, extend and re-score."""
+    try:
+        finished = bool(c.get("finished_thought"))
+        ft = (c.get("ft_classifier") or "").lower()
+        if finished or ft in ("finished", "sparse_finished"):
+            return c
+
+        tail_close = float(c.get("tail_close_sec") or 999.0)
+        if tail_close <= 5.0:
+            ext = _extend_to_eos(c, max_dur=90.0)
+            if isinstance(ext, dict) and ext.get("end") != c.get("end"):
+                # re-score just the parts affected (payoff/loop/platform)
+                _rescore_payoff_loop_platform(ext)
+                if LOG:
+                    LOG.info("FINISH_POLISH: +%.1fs → %s",
+                             float(ext.get("end", 0) - c.get("end", 0)), ext.get("id"))
+                return ext
+    except Exception as e:
+        if LOG:
+            LOG.warning("FINISH_POLISH: skipped due to %s", e)
+    return c
+
+def _rescore_payoff_loop_platform(ext: dict):
+    """Re-score only payoff/loop/platform terms after extension"""
+    try:
+        from services.secret_sauce_pkg.features import compute_virality
+        # Recompute virality with updated duration
+        start = ext.get("start", 0)
+        end = ext.get("end", 0)
+        pl_v2 = ext.get("platform_length_score_v2", 0.0)
+        ext["display_score"] = compute_virality(ext, start, end, pl_v2)
+    except Exception:
+        pass
 
 def _extend_to_eos(candidate: Dict, max_dur: float = 90.0) -> Dict:
     """Extend candidate to next EOS boundary or punctuation"""
@@ -1436,19 +1740,38 @@ class ClipScoreService:
             
             logger.info(f"Starting with {len(transcript_dicts)} raw transcript segments")
             
-            # Filter out intro/filler content first
+            # Filter out intro/filler content first, preserving words
             filtered_segments = []
             for seg in transcript_dicts:
                 if not (self._is_intro_content(seg['text']) or self._is_repetitive_content(seg['text'])):
-                    filtered_segments.append(seg)
+                    # Preserve words through filtering
+                    filtered_seg = {
+                        "id": seg.get("id"),
+                        "text": seg.get("text", ""),
+                        "start": seg.get("start"),
+                        "end": seg.get("end"),
+                        "words": (seg.get("words") or []),     # <- preserve; never None
+                        # ... any other fields you rely on
+                    }
+                    filtered_segments.append(filtered_seg)
             
             logger.info(f"Filtered to {len(filtered_segments)} non-intro segments")
             
             # Use dynamic segmentation based on natural content boundaries
             from services.secret_sauce_pkg.features import create_dynamic_segments
             
+            # One-line guard at call site (extra insurance)
+            filtered_segments = [s for s in (filtered_segments or []) if s is not None]
+            
+            # Null-safety preflight for segmentation
+            filtered_segments = _segmentation_preflight(filtered_segments, logger)
+            
             # Note: EOS times will be provided later in the pipeline
-            dynamic_segments = create_dynamic_segments(filtered_segments, platform, eos_times=None)
+            try:
+                dynamic_segments = create_dynamic_segments(filtered_segments, platform, eos_times=None)
+            except Exception as e:
+                logger.exception("Dynamic segmentation failed despite preflight: %s; falling back", e)
+                dynamic_segments = None
             
             logger.info(f"Created {len(dynamic_segments)} dynamic segments based on natural boundaries")
             
@@ -1634,7 +1957,7 @@ class ClipScoreService:
             episode = await self.episode_service.get_episode(episode_id)
             if not episode or not episode.transcript:
                 logger.error(f"Episode {episode_id} not found or has no transcript")
-                return []
+                return [], {"reason": "episode_not_found", "episode_id": episode_id}
 
             # Resolve platform
             backend_platform = resolve_platform(platform)
@@ -1816,6 +2139,18 @@ class ClipScoreService:
             if len(quality_filtered) < 3:
                 quality_filtered = adaptive_gate(reserve_pool, min_count=3)
                 logger.info(f"POOL: STRICT={len(quality_filtered)} BALANCED(from=reserve)={len(quality_filtered)}")
+            
+            # Finish polish: extend borderline clips to coherent stops
+            quality_filtered = [_finish_polish(c, LOG=logger) for c in quality_filtered]
+            
+            # One-line telemetry for monitoring
+            logger.info(
+                "TELEMETRY: eos=%d(%.3f) fallback=%s | seeds=%d → strict=%d → balanced=%d | "
+                "rescued=%d | finals=%d durs=%s",
+                len(eos_times), eos_density, episode_fallback_mode,
+                len(reserve_pool), len(quality_filtered), len(quality_filtered),
+                0, len(quality_filtered), [round(_get_dur(c),1) for c in quality_filtered]
+            )
             
             # Apply temporal deduplication to remove near-duplicate clips
             iou = float(os.getenv("DEDUP_IOU_THRESHOLD", "0.85"))
@@ -2028,11 +2363,30 @@ class ClipScoreService:
                             ft_data["total"], ft_data["finished"], ft_data["sparse_finished"], 
                             ft_data["ratio_strict"], ft_data["ratio_sparse_ok"])
             
-            return ranked_clips, default_clip_id
+            # Build metadata for return
+            meta = {
+                "reason": "ok" if ranked_clips else "no_candidates",
+                "episode_id": episode_id,
+                "platform": platform,
+                "genre": final_genre,
+                "fallback_mode": episode_fallback_mode,
+                "eos_density": eos_density,
+                "candidate_count": len(ranked_clips),
+                "default_clip_id": default_clip_id
+            }
+            
+            return ranked_clips, meta
             
         except Exception as e:
             logger.error(f"Failed to get candidates: {e}", exc_info=True)
-            return [], None
+            meta = {
+                "reason": "exception",
+                "episode_id": episode_id,
+                "error": str(e)[:200],
+                "platform": platform,
+                "genre": genre
+            }
+            return [], meta
 
 async def score_episode(episode, segments):
     """

@@ -6,6 +6,7 @@ Contains feature extraction and computation functions.
 from typing import Dict, List, Tuple, Any, Iterable, Optional, Literal
 from dataclasses import dataclass
 import logging
+from bisect import bisect_left
 
 FTStatus = Literal["finished", "sparse_finished", "unresolved"]
 
@@ -56,7 +57,7 @@ _FILLER_PHRASES = ("you know","i mean","like","sort of","kind of","basically","s
 _MIN_GAP_SEC = 0.30   # treat ≥300ms silence/segment gap as an EOS (lowered from 600ms)
 _EOS_MIN_COUNT = 10   # below this, we synthesize from gaps
 _EOS_MIN_DENSITY = 0.015
-_COHERENCE_MAX_EXTEND = 3.5  # extend tails up to 3.5s to reach next pause/EOS
+_COHERENCE_MAX_EXTEND = 5.0  # extend tails up to 5.0s to reach next pause/EOS
 _FALLBACK_GRID = [14.0, 17.0, 20.0, 23.0, 26.0, 29.0]
 
 # NEW tunables for seed length
@@ -209,13 +210,18 @@ def _compute_effective_weights():
         return EFFECTIVE_WEIGHTS
     
     # Load config weights
-    from config.settings import load_config
-    config = load_config()
+    from config_loader import get_config
+    config = get_config()
     CFG = config.get("weights", {})
     
     # Only use these weights (drop platform_len if gaussian is off)
-    USED = {"hook", "arousal", "payoff", "info", "ql", "q_list", "loop"}
+    USED = {"hook", "arousal", "payoff", "info", "q_or_list", "loop"}
     W = {k: v for k, v in CFG.items() if k in USED}
+    
+    # Map q_or_list to ql for compatibility
+    if "q_or_list" in W:
+        W["ql"] = W["q_or_list"]
+        W["q_list"] = W["q_or_list"] * 0.5  # Split q_or_list between ql and q_list
     
     # Normalize to sum to 1.0
     s = sum(W.values())
@@ -236,16 +242,14 @@ def _compute_effective_weights():
     
     return EFFECTIVE_WEIGHTS
 
-def compute_virality(seg: dict, start_s: float, end_s: float, pl_v2: float) -> float:
+def compute_virality(seg: dict, start_s: float, end_s: float, pl_v2: float, flags: dict = None) -> float:
     """
-    Single source of truth for virality calculation.
+    Single source of truth for virality calculation with rebalance support.
     Uses pre-computed effective weights (no runtime re-normalization).
     """
     dur = max(0.1, end_s - start_s)
     finished = bool(seg.get("finished_thought"))
-    
-    # Get effective weights (computed once)
-    W = _compute_effective_weights()
+    flags = flags or {}
     
     # Guard rails: default to 0.0 if missing
     hook = getattr(seg, "hook", 0.0) or 0.0
@@ -261,12 +265,43 @@ def compute_virality(seg: dict, start_s: float, end_s: float, pl_v2: float) -> f
     q_list_term = 0.03*q_list if payoff_ok else -0.01*q_list
     loop_term = 0.02*loop if finished else 0.0
     
-    # Payoff-first virality using effective weights
+    # Virality rebalance (less hook dominance, more payoff)
+    if flags.get("VIRALITY_TWEAKS_V1", False):
+        w_hook = 0.40
+        w_ar = 0.22
+        w_pay = 0.32 if payoff_ok else 0.20
+        w_info = 0.06
+        # Log active weights once per run to avoid DEBUG spam
+        if not hasattr(compute_virality, '_weights_logged'):
+            log.info("VIRALITY_WEIGHTS: rebalanced v1 active (hook=%.2f, ar=%.2f, pay=%.2f, info=%.2f)", 
+                     w_hook, w_ar, w_pay, w_info)
+            compute_virality._weights_logged = True
+    else:
+        # Legacy behavior - use effective weights
+        W = _compute_effective_weights()
+        w_hook = W["hook"]
+        w_ar = W["arousal"]
+        w_pay = W["payoff"]
+        w_info = W["info"]
+        # Log active weights once per run to avoid DEBUG spam
+        if not hasattr(compute_virality, '_weights_logged'):
+            log.info("VIRALITY_WEIGHTS: legacy active (hook=%.2f, ar=%.2f, pay=%.2f, info=%.2f)", 
+                     w_hook, w_ar, w_pay, w_info)
+            compute_virality._weights_logged = True
+    
+    # Normalize weights to prevent "weights normalized" spam
+    wsum = w_hook + w_ar + w_pay + w_info
+    w_hook, w_ar, w_pay, w_info = (w_hook/wsum, w_ar/wsum, w_pay/wsum, w_info/wsum)
+    
+    # Get ql weight for both paths
+    W = _compute_effective_weights()
+    
+    # Payoff-first virality with rebalanced weights
     virality = (
-        W["hook"] * hook +
-        W["arousal"] * arous +
-        W["payoff"] * payoff +
-        W["info"] * info +
+        w_hook * hook +
+        w_ar * arous +
+        w_pay * payoff +
+        w_info * info +
         W["ql"] * ql +
         q_list_term +
         loop_term
@@ -301,7 +336,14 @@ def _utility_for_end(seg: dict, start_s: float, end_s: float, pl_v2: float) -> f
     # Add non-content terms
     # Platform fit gaussian (disabled for length-agnostic scoring)
     platform_term = 0.0 * platform_gaussian(dur, pl_v2)  # PLATFORM_GAUSSIAN_WEIGHT = 0.0
-    virality += platform_term
+    
+    # Utility nudge: platform coefficient based on finished status
+    finished = bool(seg.get("finished_thought"))
+    platform_coef = 0.4 * (1.0 if finished else 0.6)
+    finish_bonus = 0.15 if finished else 0.0
+    unfinished_pen = -0.12 if (not finished and dur >= 18.0) else 0.0
+    
+    virality += platform_term + platform_coef + finish_bonus + unfinished_pen
     
     # Resolution bonus (claim->reason patterns)
     text = seg.get("text", "") or seg.get("transcript", "")
@@ -309,8 +351,8 @@ def _utility_for_end(seg: dict, start_s: float, end_s: float, pl_v2: float) -> f
     virality += resolution_bonus
     
     # Ad penalty (uncertain cases)
-    from services.quality_filters import _looks_like_ad
-    is_ad, _ = _looks_like_ad(text)
+    from services.title_service import _looks_like_ad
+    is_ad = _looks_like_ad(text)
     if is_ad:
         virality -= 0.60
     
@@ -3143,6 +3185,10 @@ def create_dynamic_segments(segments: List[Dict], platform: str = 'tiktok', eos_
     """
     Create dynamic segments based on natural content boundaries and platform optimization.
     """
+    # Local helper for null-safe length
+    def _safe_len(x):
+        return len(x) if isinstance(x, (list, tuple, str)) else 0
+    
     dynamic_segments = []
     
     # Platform-specific target bins (allow extension to others via grow_to_bins)
@@ -3156,8 +3202,13 @@ def create_dynamic_segments(segments: List[Dict], platform: str = 'tiktok', eos_
     src = "episode"  # or "gap_fallback" if from fallback
     dense = (eos_density >= 0.04 and src != 'gap_fallback') or (src == 'gap_fallback' and eos_density >= 0.05)
     
-    log.info("EOS: {count} markers, density=%.3f, source=%s, fallback=%s", len(eos_times), eos_density, src, eos_source == "gap_fallback")
-    
+    # Only log EOS details if we were actually given eos_times
+    if eos_times is not None:
+        count = len(eos_times)
+        fallback_flag = (src == "gap_fallback")
+        log.info("EOS: %d markers, density=%.3f, source=%s, fallback=%s",
+                 count, eos_density, src, fallback_flag)
+
     platform_lengths = {
         'tiktok': {'min': MIN_SEC, 'max': MAX_SEC, 'targets': TARGETS},
         'instagram': {'min': MIN_SEC, 'max': MAX_SEC, 'targets': TARGETS},
@@ -4544,3 +4595,37 @@ def apply_family_aware_preference(candidates: List[Dict]) -> List[Dict]:
             preferred.append(group[0])
     
     return preferred
+
+
+def extend_to_coherent_end(seg, eos_times, *, max_extra=5.0, min_pause=0.45, LOG=None):
+    """
+    Idempotently extend seg['t2'] to a near EOS/pause within +max_extra.
+    - seg: dict with 't1','t2', optional seg['meta'] dict
+    - eos_times: sorted list[float] of EOS markers (sec)
+    Returns: (updated_seg, extended_bool)
+    """
+    t1 = float(seg.get("t1", 0.0))
+    t2 = float(seg.get("t2", 0.0))
+    meta = seg.setdefault("meta", {})
+    if meta.get("coherent_extended"):  # already extended
+        return seg, False
+
+    if not eos_times:
+        return seg, False
+
+    i = bisect_left(eos_times, t2)
+    # candidate EOS within window
+    nxt = eos_times[i] if i < len(eos_times) else None
+    if nxt is None or (nxt - t2) > max_extra:
+        return seg, False
+
+    # optional: require a minimum pause (if you store pause confidences, you can check them)
+    new_t2 = float(nxt)
+    if new_t2 <= t2:
+        return seg, False
+
+    seg["t2"] = new_t2
+    meta["coherent_extended"] = True
+    if LOG:
+        LOG.info("EXTEND_COHERENT: +%.2fs to t2=%.2f (from %.2f)", new_t2 - t2, new_t2, t2)
+    return seg, True
