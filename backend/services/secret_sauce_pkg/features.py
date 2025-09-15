@@ -41,7 +41,28 @@ from scipy.stats import skew, kurtosis
 from bisect import bisect_left
 from config_loader import get_config
 import logging
+import re
+import hashlib
+from typing import List, Dict, Any
 log = logging.getLogger("services.secret_sauce_pkg.features")
+
+# Terminal punctuation (., !, ?) possibly followed by a closing quote/bracket.
+# Supports straight quotes and common curly quotes.
+_TERMINAL_RE = re.compile(r'[.!?](?:["\'\)\]\u201D\u2019\u00BB\u203A]+)?\s*$')
+_FILLER_SET = {"uh","um"}
+_FILLER_PHRASES = ("you know","i mean","like","sort of","kind of","basically","so")
+
+# When punctuation EOS is sparse, infer "natural" stops from timing gaps between segments.
+_MIN_GAP_SEC = 0.30   # treat ≥300ms silence/segment gap as an EOS (lowered from 600ms)
+_EOS_MIN_COUNT = 10   # below this, we synthesize from gaps
+_EOS_MIN_DENSITY = 0.015
+_COHERENCE_MAX_EXTEND = 3.5  # extend tails up to 3.5s to reach next pause/EOS
+_FALLBACK_GRID = [14.0, 17.0, 20.0, 23.0, 26.0, 29.0]
+
+# NEW tunables for seed length
+_SEED_MIN_DUR = 16.0   # prefer ≥16s seeds when density is high
+_SEED_TARGET_DUR = 18.0
+_SEED_MAX_DUR = 28.0
 
 # --- Helpers ---------------------------------------------------------------
 def _extend_to_eos(start_s: float, end_s: float, eos_times: list[float] | None,
@@ -59,56 +80,410 @@ def _extend_to_eos(start_s: float, end_s: float, eos_times: list[float] | None,
     return end_s
 
 def _looks_finished(text: str) -> bool:
-    # lightweight heuristic: ends with terminal punctuation or "so…" -> false
+    """Lightweight heuristic: ends with ., !, or ? (optionally followed by a closing quote/bracket)."""
     t = (text or "").strip()
     if not t:
         return False
-    return t.endswith((".", "!", "?"", "?"", "'."", "."", "?"")) or t.endswith("?")
+    return bool(_TERMINAL_RE.search(t))
 
-def _choose_target_duration(pl_v2: float, base: float) -> float:
+def _trim_leadin_filler(seg: Dict[str, Any], *, max_trim: float = 1.2) -> float:
     """
-    More assertive length targeting for platforms:
-      - pl_v2 >= 0.60: aim 22–26s
-      - 0.40–0.60: aim ~18–22s
-      - else: 16–18s
+    Trim common start-of-clip fillers (uh/um/you know/…) using word timings (<= max_trim).
+    Returns the new start time, never advancing past end-0.2s.
+    """
+    start_s = float(seg["start"])
+    end_s = float(seg.get("end", start_s + float(seg.get("dur", 8.0))))
+    words: List[Dict[str, Any]] = seg.get("words") or []
+    if not words:
+        return start_s
+    new_start = start_s
+    consumed = 0.0
+    for i, w in enumerate(words):
+        wt = float(w.get("start", new_start))
+        if wt - start_s > max_trim:
+            break
+        raw = (w.get("text") or "").lower().strip(".,!?\"'()")
+        if raw in _FILLER_SET:
+            wdur = float(w.get("dur", w.get("end", wt) - wt))
+            new_start = max(new_start, wt + max(0.0, wdur))
+            consumed = new_start - start_s
+            continue
+        # simple two-word phrases
+        if i + 1 < len(words):
+            two = ((w.get("text","") + " " + words[i+1].get("text","")).lower())
+            if any(two.startswith(p) for p in _FILLER_PHRASES):
+                nxt = words[i+1]
+                nxt_t = float(nxt.get("start", new_start))
+                nxt_d = float(nxt.get("dur", nxt.get("end", nxt_t) - nxt_t))
+                if nxt_t + nxt_d - start_s <= max_trim:
+                    new_start = max(new_start, nxt_t + max(0.0, nxt_d))
+                    consumed = new_start - start_s
+                    continue
+        break
+    # safety headroom
+    if consumed >= 0.2 and new_start < end_s - 0.2:
+        return new_start
+    return start_s
+
+def _hash_jitter(seed: str, scale: float = 2.0) -> float:
+    """Deterministic jitter in [-scale, +scale] seconds based on a string seed."""
+    h = hashlib.md5(seed.encode("utf-8")).digest()
+    val = int.from_bytes(h[:4], "big") / 0xFFFFFFFF
+    return (val * 2.0 - 1.0) * scale
+
+def _candidate_ends(start_s: float, *, min_dur: float, max_dur: float, eos_times: list[float] | None) -> list[float]:
+    """
+    Collect EOS boundaries between [start+min_dur, start+max_dur].
+    If sparse, add a few fallback grid points to avoid empty sets.
+    """
+    ends: list[float] = []
+    lo = start_s + min_dur
+    hi = start_s + max_dur
+    if eos_times:
+        i = bisect_left(eos_times, lo)
+        while i < len(eos_times) and eos_times[i] <= hi:
+            ends.append(eos_times[i])
+            i += 1
+    for g in _FALLBACK_GRID:
+        t = start_s + g
+        if lo <= t <= hi:
+            ends.append(t)
+    return sorted({round(e, 2) for e in ends})
+
+def extend_to_coherent_end(end_s: float, eos: List[float], segs: Optional[List[Dict]] = None) -> float:
+    """Extend tails up to _COHERENCE_MAX_EXTEND sec to the nearest EOS or segment boundary."""
+    target = end_s
+    # Prefer the next EOS if close enough
+    ahead = [t for t in eos if end_s < t <= end_s + _COHERENCE_MAX_EXTEND]
+    if ahead:
+        return min(ahead)
+    if not segs:
+        return end_s
+    # Else, snap to the next segment end if within window
+    seg_ends = [float(s.get("end", 0.0) or 0.0) for s in segs if float(s.get("end", 0.0) or 0.0) >= end_s]
+    seg_ends = [t for t in seg_ends if t - end_s <= _COHERENCE_MAX_EXTEND]
+    if seg_ends:
+        return min(seg_ends)
+    return end_s
+
+def _length_prior(dur: float) -> float:
+    """Neutral inside [8, 45] seconds; smooth penalty outside"""
+    import math
+    lo, hi = 8.0, 45.0
+    if dur < lo:
+        # penalty ramps harder the further below 8s
+        return -1.0 * (1.0 / (1.0 + math.exp(-(lo - dur))))  # ~0 to -1
+    if dur > hi:
+        return -1.0 * (1.0 / (1.0 + math.exp(-(dur - hi))))  # ~0 to -1
+    return 0.0
+
+def platform_gaussian(dur: float, pl_v2: float) -> float:
+    """Platform fit gaussian - disabled for length-agnostic scoring"""
+    return 0.0  # Disabled: PLATFORM_GAUSSIAN_WEIGHT = 0.0
+
+def platform_tiebreaker(dur1: float, dur2: float, target: float = 22.0) -> float:
+    """Tie-breaker only: prefer closer to platform target when virality is within ε=0.03"""
+    dist1 = abs(dur1 - target)
+    dist2 = abs(dur2 - target)
+    return 1.0 if dist1 < dist2 else 0.0
+
+def _detect_resolution_bonus(text: str) -> float:
+    """Detect claim->reason patterns for resolution bonus"""
+    if not text:
+        return 0.0
+    
+    resolution_patterns = r'\b(because|so that|which means|so you can|therefore|as a result|that\'s why)\b'
+    if re.search(resolution_patterns, text.lower()):
+        return 0.08
+    return 0.0
+
+# Module-level effective weights (computed once)
+EFFECTIVE_WEIGHTS = None
+_logged_once = False
+
+def _compute_effective_weights():
+    """Compute effective weights once at module import"""
+    global EFFECTIVE_WEIGHTS, _logged_once
+    
+    if EFFECTIVE_WEIGHTS is not None:
+        return EFFECTIVE_WEIGHTS
+    
+    # Load config weights
+    from config.settings import load_config
+    config = load_config()
+    CFG = config.get("weights", {})
+    
+    # Only use these weights (drop platform_len if gaussian is off)
+    USED = {"hook", "arousal", "payoff", "info", "ql", "q_list", "loop"}
+    W = {k: v for k, v in CFG.items() if k in USED}
+    
+    # Normalize to sum to 1.0
+    s = sum(W.values())
+    if abs(s - 1.0) > 0.005:
+        for k in W:
+            W[k] /= s
+        if not _logged_once:
+            log.debug("Weights normalized from %.2f to 1.00", s)
+            _logged_once = True
+    
+    # Add platform weight as 0.00
+    W["platform"] = 0.00
+    EFFECTIVE_WEIGHTS = W
+    
+    # Log once at startup
+    log.info("Weights: {hook:%.2f, arousal:%.2f, payoff:%.2f, info:%.2f, ql:%.2f, q_list:%.2f, loop:%.2f, platform:0.00}",
+             W["hook"], W["arousal"], W["payoff"], W["info"], W["ql"], W["q_list"], W["loop"])
+    
+    return EFFECTIVE_WEIGHTS
+
+def compute_virality(seg: dict, start_s: float, end_s: float, pl_v2: float) -> float:
+    """
+    Single source of truth for virality calculation.
+    Uses pre-computed effective weights (no runtime re-normalization).
+    """
+    dur = max(0.1, end_s - start_s)
+    finished = bool(seg.get("finished_thought"))
+    
+    # Get effective weights (computed once)
+    W = _compute_effective_weights()
+    
+    # Guard rails: default to 0.0 if missing
+    hook = getattr(seg, "hook", 0.0) or 0.0
+    arous = getattr(seg, "arous", 0.0) or 0.0
+    payoff = getattr(seg, "payoff", 0.0) or 0.0
+    info = getattr(seg, "info", 0.0) or 0.0
+    ql = getattr(seg, "ql", 0.0) or 0.0
+    q_list = getattr(seg, "q_list", 0.0) or 0.0
+    loop = getattr(seg, "loop", 0.0) or 0.0
+    
+    # Conditional terms to prevent clickbait
+    payoff_ok = bool(seg.get("payoff_ok"))
+    q_list_term = 0.03*q_list if payoff_ok else -0.01*q_list
+    loop_term = 0.02*loop if finished else 0.0
+    
+    # Payoff-first virality using effective weights
+    virality = (
+        W["hook"] * hook +
+        W["arousal"] * arous +
+        W["payoff"] * payoff +
+        W["info"] * info +
+        W["ql"] * ql +
+        q_list_term +
+        loop_term
+    )
+    
+    # Demotion for weak medium/long clips
+    if dur >= 16.0 and payoff < 0.30:
+        virality -= 0.15 * (0.30 - payoff)
+    
+    # strong finish bonus, bigger if longer (because long + finished is rare & valuable)
+    virality += 0.12 if dur >= 20.0 and finished else (0.08 if finished else 0.0)
+    
+    # ultra-short guard (don't let weak 7–10s win on hook alone)
+    if dur <= 10.0 and (hook < 0.92 or payoff < 0.60):
+        virality -= 0.50
+    
+    # soft length prior (only penalizes <8s or >45s)
+    virality += 0.40 * _length_prior(dur)
+    
+    return virality
+
+def _utility_for_end(seg: dict, start_s: float, end_s: float, pl_v2: float) -> float:
+    """
+    Utility balances virality, platform fit, and finishing at EOS.
+    Single source of truth: compute_virality() + non-content terms.
+    """
+    dur = max(0.1, end_s - start_s)
+    
+    # Get virality from compute_virality (single source of truth)
+    virality = compute_virality(seg, start_s, end_s, pl_v2)
+    
+    # Add non-content terms
+    # Platform fit gaussian (disabled for length-agnostic scoring)
+    platform_term = 0.0 * platform_gaussian(dur, pl_v2)  # PLATFORM_GAUSSIAN_WEIGHT = 0.0
+    virality += platform_term
+    
+    # Resolution bonus (claim->reason patterns)
+    text = seg.get("text", "") or seg.get("transcript", "")
+    resolution_bonus = _detect_resolution_bonus(text)
+    virality += resolution_bonus
+    
+    # Ad penalty (uncertain cases)
+    from services.quality_filters import _looks_like_ad
+    is_ad, _ = _looks_like_ad(text)
+    if is_ad:
+        virality -= 0.60
+    
+    return virality
+
+def _choose_target_duration(pl_v2: float, base: float, seg_id: str) -> float:
+    """
+    Platform-informed target with deterministic jitter so lengths don't collapse to one number:
+      - pl_v2 >= 0.60: center ~24s
+      - 0.40–0.60:     center ~20s
+      - else:          center ~16–18s (respecting base)
+    Jitter ±2s per clip id.
     """
     if pl_v2 >= 0.60:
-        return 24.0
-    if pl_v2 >= 0.40:
-        return 20.0
-    return max(16.0, min(18.0, base))
+        core = 24.0
+    elif pl_v2 >= 0.40:
+        core = 20.0
+    else:
+        core = max(16.0, min(18.0, base))
+    return max(8.0, core + _hash_jitter(seg_id, scale=2.0))
 
-def _apply_eos_extension(segment: dict, eos_times: list[float] | None, platform: str) -> dict:
+def _neighbor_ends(start: float, eos_idx: list[float], words: list, max_seek: float = 42.0) -> list[float]:
+    """Find natural boundaries (EOS or ≥600ms pause) after start"""
+    ends = []
+    for eos in eos_idx:
+        if eos > start and eos - start <= max_seek:
+            ends.append(eos)
+    
+    # Also check for pauses in words
+    for i, w in enumerate(words):
+        if i > 0:
+            gap = w.get("start", 0) - words[i-1].get("end", 0)
+            if gap >= 0.6:  # 600ms pause
+                ends.append(w.get("start", 0))
+    
+    return sorted(ends)
+
+def _choose_best_boundary(ends: list[float], start: float) -> float:
+    """Choose the last EOS in the bucket (most complete thought)"""
+    return max(ends) if ends else start + 8.0
+
+def _words_to_text(words: list, start: float, end: float) -> str:
+    """Extract text from words within [start, end] time range"""
+    if not words:
+        return ""
+    parts = []
+    for w in words:
+        w_start = w.get("start", 0)
+        w_end = w.get("end", 0)
+        if w_start >= start and w_end <= end:
+            parts.append(w.get("text", ""))
+    return " ".join(parts).strip()
+
+def _greedy_merge_short_seeds(seeds):
+    """Merge consecutive ~8s seeds into 16–28s windows before variantization."""
+    out, cur = [], None
+    for s in seeds:
+        if cur is None:
+            cur = dict(s)
+            continue
+        # same speaker / contiguous window?
+        if s["start"] <= cur["end"] + 0.25 and s.get("spk") == cur.get("spk"):
+            # tentatively extend
+            cur["end"] = s["end"]
+            cur["dur"] = cur["end"] - cur["start"]
+            # if we've hit our target band, flush
+            if _SEED_MIN_DUR <= cur["dur"] <= _SEED_MAX_DUR:
+                out.append(cur); cur = None
+        else:
+            # flush previous
+            if cur:
+                out.append(cur)
+            cur = dict(s)
+    if cur: out.append(cur)
+    return out
+
+# Duration bands for variantization
+_SHORT = (10.0, 14.0)   # still allow short bangers
+_MID   = (16.0, 22.0)
+_LONG  = (24.0, 90.0)   # extend to 90s for long-form content
+
+def _apply_micro_jitter(end_time: float, words: list, start: float) -> float:
+    """Apply ±0.25s micro-jitter to break identical lengths, but preserve finished_thought"""
+    if not words:
+        return end_time
+    
+    # Find micro-pauses within ±0.25s
+    jitter_candidates = []
+    for w in words:
+        w_start = w.get("start", 0)
+        w_end = w.get("end", 0)
+        if w_start >= end_time - 0.25 and w_end <= end_time + 0.25:
+            jitter_candidates.append(w_end)
+    
+    if not jitter_candidates:
+        return end_time
+    
+    # Choose the closest micro-pause that doesn't change finished_thought
+    best_jitter = end_time
+    for candidate in jitter_candidates:
+        if abs(candidate - end_time) <= 0.25:
+            # Check if this preserves finished_thought
+            text = _words_to_text(words, start, candidate)
+            if _looks_finished(text):
+                best_jitter = candidate
+                break
+    
+    return best_jitter
+
+def _variantize_segment(seg, *, pl_v2: float, cap_s: float, eos_times: list[float] | None = None) -> dict:
     """
-    Apply EOS-aware extension to improve coherence and finished_thought status.
+    De-biased variantizer: enumerate real lengths at targets, no platform scoring.
+    Only enumerate EOS-clean ends at specific targets.
     """
-    start_s = float(segment["start"])
-    end_s = float(segment["end"])
-    text = segment.get("text", "")
+    start = seg.get("start", 0.0)
+    words = seg.get("words", [])
     
-    # Calculate platform length score for targeting
-    pl_v2 = segment.get("platform_length_score_v2", 0.5)  # Default to mid-range
+    # Enumerate EOS-clean finishes at targets {12,16,20,24,30,36,44,60,75,90}
+    targets = [12, 16, 20, 24, 30, 36, 44, 60, 75, 90]
+    variants = []
     
-    # Choose target duration based on platform fit
-    target_dur = _choose_target_duration(pl_v2, end_s - start_s)
-    new_end = min(start_s + target_dur, start_s + 30.0)  # Cap at 30s
+    for target in targets:
+        # Find EOS-clean end at this target (skip non-existent ends)
+        cand_ends = _neighbor_ends(start, eos_times or [], words, max_seek=target+3.5)
+        
+        # Find closest end to target that's EOS-clean
+        best_end = None
+        for e in cand_ends:
+            if abs((e - start) - target) <= 2.0:  # Within 2s of target
+                best_end = e
+                break
+        
+        if best_end is None:
+            continue  # Skip impossible ends
+            
+        # Extend to coherent end
+        e = extend_to_coherent_end(best_end, eos_times or [], words, max_extend=3.5)
+        
+        # Apply micro-jitter to break identical lengths
+        e = _apply_micro_jitter(e, words, start)
+        
+        text = _words_to_text(words, start, e)
+        if not _looks_finished(text):   # <- hard requirement here
+            continue
+            
+        variants.append({
+            "start": start, "end": e, "dur": e - start,
+            "text": text, "finished_thought": True,
+            "target": target
+        })
     
-    # If still short or unfinished, extend to next EOS
-    if (new_end - start_s) < 20.0 or not _looks_finished(text):
-        extended_end = _extend_to_eos(start_s, new_end, eos_times, max_extra=8.0, hard_cap=30.0)
-        if extended_end > new_end:
-            new_end = extended_end
-            log.info("COHERENCE_EXTEND: seg=%s dur=%.1fs→%.1fs", segment.get("id","?"), end_s-start_s, new_end-start_s)
+    # Log variant counts by target (DEBUG level to reduce noise)
+    if variants:
+        target_counts = {}
+        for v in variants:
+            t = v.get("target", 0)
+            target_counts[t] = target_counts.get(t, 0) + 1
+        log.debug("VAR_COUNTS: %s", target_counts)
     
-    # Update segment
-    segment["end"] = new_end
-    segment["dur"] = round(new_end - start_s, 2)
+    # Return the best variant by utility (length-agnostic)
+    if not variants:
+        # Fallback to original logic if no natural boundaries
+        return {**seg, "start": start, "end": start + 8.0, "dur": 8.0, "finished_thought": False}
     
-    # Mark as finished if text looks finished or we landed on EOS
-    if _looks_finished(text) or (eos_times and abs(new_end - _extend_to_eos(start_s, new_end-0.1, eos_times)) < 0.11):
-        segment["finished_thought"] = True
-    
-    return segment
+    best_variant = max(variants, key=lambda v: _utility_for_end(seg, v["start"], v["end"], pl_v2))
+    return best_variant
+
+def build_variants(segments, pl_v2, cap_s, eos_times=None, *args, **kwargs):
+    out = []
+    for seg in segments:
+        v = _variantize_segment(seg, pl_v2=pl_v2, cap_s=cap_s, eos_times=eos_times)
+        out.append(v)
+    return out
 
 # Finish-Thought Gate Configuration
 FINISH_THOUGHT_CONFIG = {
@@ -2774,6 +3149,15 @@ def create_dynamic_segments(segments: List[Dict], platform: str = 'tiktok', eos_
     TARGETS = [12.0, 18.0, 24.0, 30.0]
     MIN_SEC, MAX_SEC = 8.0, 60.0
     
+    # Calculate EOS density for seed merging decision
+    eos_density = len(eos_times) / (segments[-1].get("end", 0) - segments[0].get("start", 0)) if segments and eos_times else 0.0
+    
+    # Compute dense flag once after EOS_UNIFIED
+    src = "episode"  # or "gap_fallback" if from fallback
+    dense = (eos_density >= 0.04 and src != 'gap_fallback') or (src == 'gap_fallback' and eos_density >= 0.05)
+    
+    log.info("EOS: {count} markers, density=%.3f, source=%s, fallback=%s", len(eos_times), eos_density, src, eos_source == "gap_fallback")
+    
     platform_lengths = {
         'tiktok': {'min': MIN_SEC, 'max': MAX_SEC, 'targets': TARGETS},
         'instagram': {'min': MIN_SEC, 'max': MAX_SEC, 'targets': TARGETS},
@@ -2800,7 +3184,10 @@ def create_dynamic_segments(segments: List[Dict], platform: str = 'tiktok', eos_
         return segments
     
     # Create segments based on boundaries
-    words = combined_text.split()
+    words = combined_text.split() if combined_text else []
+    if not words:
+        log.warning("DYNSEG: no words found; coercing to [] (ep=%s)", segments[0].get('episode_id', 'unknown') if segments else 'unknown')
+        return segments
     current_start = total_start
     
     # Add start boundary
@@ -2871,7 +3258,8 @@ def create_dynamic_segments(segments: List[Dict], platform: str = 'tiktok', eos_
                 "confidence": boundary["confidence"]
             }
             # Apply EOS extension for coherence
-            segment = _apply_eos_extension(segment, eos_times, platform)
+            pl_v2 = segment.get("platform_length_score_v2", 0.5)
+            segment = _variantize_segment(segment, pl_v2=pl_v2, cap_s=30.0, eos_times=eos_times)
             # Apply caps filtering
             if _keep(segment):
                 dynamic_segments.append(segment)
@@ -2886,12 +3274,53 @@ def create_dynamic_segments(segments: List[Dict], platform: str = 'tiktok', eos_
                 "confidence": boundary["confidence"]
             }
             # Apply EOS extension for coherence
-            segment = _apply_eos_extension(segment, eos_times, platform)
+            pl_v2 = segment.get("platform_length_score_v2", 0.5)
+            segment = _variantize_segment(segment, pl_v2=pl_v2, cap_s=30.0, eos_times=eos_times)
             # Apply caps filtering
             if _keep(segment):
                 dynamic_segments.append(segment)
         
         current_start += segment_duration
+    
+    # Apply seed merging BEFORE variantization using dense flag
+    if dynamic_segments:
+        # Log pre-merge stats
+        pre_durs = [round(seg.get("end", 0) - seg.get("start", 0), 1) for seg in dynamic_segments]
+        pre_hist = {}
+        for d in pre_durs:
+            pre_hist[d] = pre_hist.get(d, 0) + 1
+        log.debug("SEED_STATS_PRE: n=%d, dur_hist=%s", len(dynamic_segments), pre_hist)
+    
+    if dense:
+        # Merge short seeds into 16-28s windows
+        merged_seeds = _greedy_merge_short_seeds(dynamic_segments)
+        dynamic_segments = merged_seeds
+        log.info("SEED_MERGE: merged=%d -> median_len=%.1fs", len(merged_seeds), sorted(pre_durs)[len(pre_durs)//2] if pre_durs else 0)
+    else:
+        # Even for non-dense, merge 8s seeds to get sentence-level chunks
+        if pre_durs and max(pre_durs) <= 10.0:  # All seeds are 8-10s
+            merged_seeds = _greedy_merge_short_seeds(dynamic_segments)
+            dynamic_segments = merged_seeds
+            log.info("SEED_MERGE: merged=%d -> median_len=%.1fs", len(merged_seeds), sorted(pre_durs)[len(pre_durs)//2] if pre_durs else 0)
+    
+    # Log post-merge stats and assert dense requirement
+    if dynamic_segments:
+        post_durs = [round(seg.get("end", 0) - seg.get("start", 0), 1) for seg in dynamic_segments]
+        post_hist = {}
+        for d in post_durs:
+            post_hist[d] = post_hist.get(d, 0) + 1
+        log.debug("SEED_STATS_POST: n=%d, dur_hist=%s", len(dynamic_segments), post_hist)
+        
+        # Assert dense requirement
+        if dense:
+            median_dur = sorted(post_durs)[len(post_durs)//2]
+            if median_dur < 16.0:
+                log.warning("WARN: dense=True but median seed length %.1fs < 16.0s", median_dur)
+            else:
+                log.info("SEEDS: pre={%s} post={%s} median=%.1f", 
+                         {k: v for k, v in pre_hist.items() if v > 0},
+                         {k: v for k, v in post_hist.items() if v > 0},
+                         median_dur)
     
     # If no dynamic segments were created, return original segments
     if not dynamic_segments:
@@ -3785,6 +4214,35 @@ def build_eos_index(segments: List[Dict], episode_words: List[Dict] = None, epis
             eos_times.update(seg_boundary_eos)
             eos_source = "segment_boundary"
             logger.info(f"EOS from segment boundaries: {len(seg_boundary_eos)} markers")
+    
+    # 5) Gap-based fallback: synthesize EOS from timing gaps when punctuation is sparse
+    if len(eos_times) < _EOS_MIN_COUNT or (word_end_times and len(eos_times) / max(len(word_end_times), 1) < _EOS_MIN_DENSITY):
+        gap_eos = []
+        # Walk segment boundaries and add EOS where gaps are large enough
+        for i in range(len(segments) - 1):
+            cur_end = float(segments[i].get("end", 0.0) or 0.0)
+            nxt_start = float(segments[i+1].get("start", cur_end) or cur_end)
+            if nxt_start - cur_end >= _MIN_GAP_SEC:
+                gap_eos.append(cur_end)
+        # Merge and dedupe with any existing markers
+        if gap_eos:
+            # Enforce min_words_between_eos=8-10 to avoid over-splitting
+            filtered_gap_eos = []
+            for eos_time in gap_eos:
+                # Count words between this EOS and the next one
+                words_between = 0
+                for word in all_words:
+                    if word.get('start', 0) > eos_time:
+                        words_between += 1
+                        if words_between >= 8:  # min_words_between_eos
+                            break
+                
+                if words_between >= 8:
+                    filtered_gap_eos.append(eos_time)
+            
+            eos_times.update(filtered_gap_eos)
+            eos_source = "gap_fallback"
+            logger.warning(f"EOS_FALLBACK_GAPS: added {len(filtered_gap_eos)} gap-derived markers (now {len(eos_times)} total)")
     
     # Build word_end_times from available words
     all_words = episode_words or []

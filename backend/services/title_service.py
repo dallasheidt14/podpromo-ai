@@ -141,8 +141,8 @@ def _mine_anchor_phrases(text: str) -> List[str]:
             gram = words[i:i+n]
             if any(len(w) >= 6 for w in gram):
                 phrase = " ".join(gram).title()
-                # drop junk like "Players Anomalies Need"
-                if any(w in ("need","because","there","just") for w in gram):
+                # drop junk like "Players Anomalies Need" (reduces "Players Anomalies Need" style outputs)
+                if any(w in ("need","because","there","just","some","then","also") for w in gram):
                     continue
                 if not BANNED.search(phrase) and not all(w in STOP for w in gram) and not BAN_PHRASE.search(phrase):
                     phrases[phrase] += 1
@@ -153,6 +153,129 @@ def _mine_anchor_phrases(text: str) -> List[str]:
         if p not in out:
             out.append(p)
     return out[:6]
+
+def _title_from_text(text: str) -> str:
+    """Create title from text, avoiding filler and repetition"""
+    if not text:
+        return "Clip"
+
+    # Clean and tokenize
+    toks = [t.strip(".,!?\"'():;").lower() for t in text.split()]
+    toks = [t for t in toks if t and t not in STOP]
+
+    # Collapse duplicates like "think think"
+    dedup = []
+    for t in toks:
+        if not dedup or dedup[-1] != t:
+            dedup.append(t)
+
+    # Take top salient tokens
+    key = dedup[:6]
+    if not key:
+        return "Clip"
+
+    # Prefer descriptive, no "What It Means"
+    return " ".join(w.capitalize() for w in key)
+
+def _extract_noun_phrases(text: str) -> list:
+    """Extract top TF-IDF noun chunks for better fallback titles"""
+    if not text:
+        return []
+    
+    # Simple noun phrase extraction (enhanced version)
+    words = [w.strip(".,!?\"'():;").lower() for w in text.split()]
+    words = [w for w in words if w and w not in STOP and len(w) > 2]
+    
+    # Count frequency for TF-IDF-like scoring
+    word_counts = Counter(words)
+    total_words = len(words)
+    
+    # Score words by frequency and length
+    scored_phrases = []
+    for word, count in word_counts.items():
+        if count >= 2:  # Must appear at least twice
+            score = (count / total_words) * len(word)  # frequency * length
+            scored_phrases.append((word, score))
+    
+    # Return top 3 noun phrases
+    scored_phrases.sort(key=lambda x: x[1], reverse=True)
+    return [phrase for phrase, _ in scored_phrases[:3]]
+
+def _title_fallback(text: str, platform: str) -> str:
+    """Content-aware title fallback with rotation to avoid repetition"""
+    if not text:
+        return "The most overlooked thing about this topic"
+    
+    # Extract content elements for pattern matching
+    noun_phrases = _extract_noun_phrases(text)
+    
+    # Better topic extraction with RAKE-style heuristic
+    if noun_phrases:
+        # Look for meaningful noun phrases (avoid common words)
+        meaningful_phrases = []
+        for phrase in noun_phrases[:3]:
+            if len(phrase.split()) >= 2 and not any(word in phrase.lower() for word in ['thing', 'topic', 'this', 'that', 'what', 'how']):
+                meaningful_phrases.append(phrase)
+        
+        if meaningful_phrases:
+            topic = " ".join(meaningful_phrases[:2]).capitalize()
+        else:
+            # Fallback: use first noun phrase even if generic
+            topic = noun_phrases[0].capitalize()
+    else:
+        # Last resort: extract from filename or use generic
+        topic = "This Topic"
+    
+    # Content-aware pattern matching
+    t = text.lower()
+    
+    # Pattern 1: "don't/stop/avoid/mistake" → "Stop {mistake}. Do {better} instead."
+    if any(word in t for word in ["don't", "stop", "avoid", "mistake", "wrong", "bad"]):
+        mistake = topic if topic != "This Topic" else "This Common Mistake"
+        better = "a Better Approach" if "approach" not in t else "the Right Way"
+        return f"Stop {mistake}. Do {better} instead."
+    
+    # Pattern 2: claim + "because/so/which means" → "{Counterintuitive claim}. Here's why."
+    if any(word in t for word in ["because", "so", "which means", "therefore", "as a result"]):
+        claim = topic if topic != "This Topic" else "This Counterintuitive Truth"
+        return f"{claim}. Here's why."
+    
+    # Pattern 3: instructional verbs ("how/steps/tips") → "How to {outcome} without {pain}"
+    if any(word in t for word in ["how", "steps", "tips", "guide", "learn", "master"]):
+        outcome = topic if topic != "This Topic" else "Success"
+        pain = "the Common Pitfalls" if "pitfall" not in t else "Making Mistakes"
+        return f"How to {outcome} without {pain}"
+    
+    # Pattern 4: default → "The most overlooked {X} about {topic}"
+    # Rotate through variations to avoid repetition
+    variations = [
+        f"The most overlooked {topic} about {topic}",
+        f"Why {topic} actually works",
+        f"The {topic} secret nobody talks about",
+        f"What {topic} really means"
+    ]
+    
+    # Simple rotation based on text hash
+    import hashlib
+    hash_val = int(hashlib.md5(text.encode()).hexdigest()[:8], 16)
+    return variations[hash_val % len(variations)]
+
+def _sanitize_title(title: str) -> str:
+    """Always-on title sanitizer to remove boilerplate and generic content"""
+    if not title:
+        return "The most overlooked thing about this topic"
+    
+    # Check for banned boilerplate patterns
+    boilerplate = re.compile(r'\b(what it means|explained|key takeaways|the truth about|everything you need to know|what it really means|key insight)\b', re.I)
+    if boilerplate.search(title):
+        # Use value-forward fallback
+        return _title_fallback(title, "tiktok")
+    
+    # Check for too generic content
+    if len(title.split()) < 3 or title.lower() in ["clip", "moment", "insight", "key insight"]:
+        return _title_fallback(title, "tiktok")
+    
+    return title
 
 def _extract_keywords(text: str, k: int = 6) -> List[str]:
     """
@@ -513,6 +636,15 @@ def make_titles(text: str) -> List[str]:
     
     return deduped[:6]
 
+# Ad detection markers
+AD_MARKERS = {"sponsored", "brought to you by", "promo code", "use code", "limited time",
+              "shop now", "visit", "link in bio", "terms apply", "free trial", "subscribe",
+              "Wayfair", "NordVPN", "Squarespace", "Raid Shadow Legends"}
+
+def _looks_like_ad(text: str) -> bool:
+    t = text.lower()
+    return any(k.lower() in t for k in AD_MARKERS)
+
 def generate_titles(
     text: str,
     *,
@@ -529,6 +661,10 @@ def generate_titles(
     Deterministic, topic-aware titles from the actual clip text.
     Avoids generic/banned clickbait; returns 6 or a safe fallback.
     """
+    
+    # hard-drop obvious ads from titling
+    if _looks_like_ad(text):
+        return []  # no titles for ads; upstream should already de-prefer these
     
     # Normalize inputs
     clean_text = normalize_text(text)
@@ -554,21 +690,61 @@ def generate_titles(
     variants = _variants_from_keywords(keys, platform=platform)
     
     if not variants:
-        # Safe fallback
-        title_hint = clean_text[:60] if clean_text else "This Moment"
-        variants = _safe_fallback(title_hint, platform)
+        # Check if we need fallback (banned boilerplate or < 3 meaningful tokens)
+        needs_fallback = False
+        if clean_text:
+            # Check for banned boilerplate
+            boilerplate = re.compile(r'\b(what it means|explained|key takeaways|the truth about|everything you need to know)\b', re.I)
+            if boilerplate.search(clean_text):
+                needs_fallback = True
+            
+            # Check for < 3 meaningful tokens
+            meaningful_tokens = [w for w in clean_text.split() if w.lower() not in STOP and len(w) > 2]
+            if len(meaningful_tokens) < 3:
+                needs_fallback = True
+        
+        if needs_fallback and clean_text:
+            base_title = _title_fallback(clean_text, platform)
+            variants = [
+                base_title,
+                f"{base_title}: Key Takeaway",
+                f"Why {base_title}",
+            ]
+        elif clean_text:
+            # Use improved title function
+            base_title = _title_from_text(clean_text)
+            variants = [
+                base_title,
+                f"{base_title}: Key Takeaway",
+                f"Why {base_title}",
+            ]
+        else:
+            # Safe fallback
+            title_hint = clean_text[:60] if clean_text else "This Moment"
+            variants = _safe_fallback(title_hint, platform)
+        
+        # title-case lightly
+        variants = [v[:1].upper() + v[1:] for v in variants if len(v) > 0]
+        variants = variants[:5]
     
     logger.info("TITLES: k=%s variants=%s", keys[:4], variants[:3])
     
-    # Convert to expected format
+    # Convert to expected format with title sanitization
     result = []
     for i, title in enumerate(variants[:n]):
         if title not in avoid_set:
+            # Always-on title sanitizer
+            sanitized_title = _sanitize_title(title)
+            sanitized = sanitized_title != title
+            
             result.append({
-                "title": title,
+                "title": sanitized_title,
                 "score": 1.0 - (i * 0.1),  # Decreasing score
                 "reasons": ["Generated from text analysis"]
             })
+            
+            if sanitized:
+                logger.info("TITLE_SANITIZED=True original='%s' final='%s'", title, sanitized_title)
     
     # Cache the result
     if episode_id and clip_id and platform:

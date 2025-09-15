@@ -233,8 +233,16 @@ def _scores(cands):
             vals.append(float(v))
     return vals
 
-def filter_low_quality(candidates: List[Dict], min_score: int = 20) -> List[Dict]:
-    """Filter out low-quality candidates using episode-relative percentile + rank gating"""
+def filter_low_quality(candidates, mode: str | None = None, **kwargs):
+    """
+    Compat shim: older callers (e.g., pure_topk_pick) may pass 'mode' ('strict'|'balanced').
+    We intentionally ignore it here because gating already happened upstream.
+    """
+    # Future hook for mode-based thresholds
+    if mode in ("strict", "balanced", None):
+        pass  # TODO: optionally map mode to thresholds later
+    
+    # --- existing implementation stays exactly as-is below ---
     if not candidates:
         return candidates
     
@@ -500,3 +508,73 @@ def filter_low_quality(candidates: List[Dict], min_score: int = 20) -> List[Dict
 
     logger.info(f"Quality filter result: {len(candidates)} → {len(text_filtered)} candidates")
     return text_filtered
+
+# --- Fallback-aware gates (drop-in) ------------------------------------------
+from collections import Counter
+import logging
+
+logger = logging.getLogger(__name__)
+
+_FINISHED_OK = {"finished"}
+_SPARSE_OK = {"sparse_finished"}
+_END_PUNCT = (".", "!", "?", "…", '"', "'", '"', "'")
+
+def _get_tail_gap_sec(cand) -> float:
+    meta = cand.get("meta", {}) if isinstance(cand, dict) else {}
+    for k in ("tail_to_next_eos_sec", "tail_gap_sec", "tail_gap_to_next_eos"):
+        v = meta.get(k, cand.get(k) if isinstance(cand, dict) else None)
+        if isinstance(v, (int, float)):
+            return float(v)
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            pass
+    return 1e9  # unknown -> very large
+
+def _ends_with_punct(cand) -> bool:
+    txt = cand.get("text") or cand.get("preview") or ""
+    return str(txt).strip().endswith(_END_PUNCT)
+
+def _is_finished_like(cand, *, fallback: bool, tail_close_sec: float):
+    ft = (cand.get("ft_classifier") or "").lower()
+
+    if ft in _FINISHED_OK:
+        return True, "KEEP_FINISHED"
+
+    if fallback and ft in _SPARSE_OK:
+        return True, "KEEP_FALLBACK_FINISHED"
+
+    # "Close enough" tail acceptance (only when unfinished-tail was flagged)
+    caps = set(cand.get("caps") or [])
+    if "unfinished_tail_penalty" in caps:
+        if _get_tail_gap_sec(cand) <= tail_close_sec or _ends_with_punct(cand):
+            return True, "KEEP_TAIL_CLOSE"
+
+    return False, "DROP_UNFINISHED"
+
+def _apply_quality_gates_fallback_aware(candidates, *, fallback: bool, tail_close_sec: float):
+    kept = []
+    reasons = Counter()
+    for c in candidates:
+        ok, tag = _is_finished_like(c, fallback=fallback, tail_close_sec=tail_close_sec)
+        reasons[tag] += 1
+        if ok:
+            kept.append(c)
+    logger.info("GATES: kept=%d/%d, reasons=%s", len(kept), len(candidates), dict(reasons))
+    return kept, dict(reasons)
+
+# Public API expected by clip_score.py (compat layer)
+def essential_gates(candidates, *, fallback: bool = False, tail_close_sec: float = 1.5):
+    """
+    Fallback-aware replacement for the old gating function.
+    - Accepts 'finished' always.
+    - When fallback=True, also accepts 'sparse_finished'.
+    - Allows 'unfinished_tail_penalty' if very near boundary or strong punctuation.
+    Returns (kept_candidates, reasons_dict).
+    """
+    if not candidates:
+        logger.info("GATES: kept=0/0, reasons=%s", {})
+        return [], {}
+    return _apply_quality_gates_fallback_aware(
+        candidates, fallback=fallback, tail_close_sec=tail_close_sec
+    )

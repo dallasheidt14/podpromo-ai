@@ -622,7 +622,17 @@ class EpisodeService:
                     clip_score_service = ClipScoreService(self)
                     
                     # Generate clips using the scoring service
-                    clips, _ = await clip_score_service.get_candidates(episode_id)
+                    clips: list = []
+                    try:
+                        clips, _ = await clip_score_service.get_candidates(episode_id)
+                    finally:
+                        if clips is None:
+                            clips = []  # ensure variable exists
+                    
+                    # Additional safety: treat empty finals as valid
+                    if not clips:
+                        logger.warning("REASON=EMPTY_AFTER_SALVAGE: episode has 0 clips")
+                    
                     episode.clips = clips  # Store clips in episode
                     logger.info(f"Generated {len(clips)} clips for episode {episode_id}")
                 

@@ -90,33 +90,337 @@ def apply_quality_gate(candidates: List[Dict], mode: str = "strict") -> List[Dic
     
     return passed
 
-def adaptive_gate(candidates: List[Dict], min_count: int = 3) -> List[Dict]:
-    """Adaptive gate that adds clips from remaining pool by score + platform-fit"""
-    base = [c for c in candidates if c.get("quality_ok", False)]
-    if len(base) >= min_count:
-        return base
+def notch_penalty(dur: float, already_at_notch: int) -> float:
+    """Notch penalty disabled for length-agnostic scoring"""
+    return 0.0  # NOTCH_PENALTY_WEIGHT = 0.0
+
+def apply_micro_jitter_to_display(dur: float) -> float:
+    """Apply tiny micro-jitter to displayed duration to break identical lengths"""
+    import random
+    # Add ±0.4s jitter to break identical display durations
+    jitter = random.uniform(-0.4, 0.4)
+    return round(dur + jitter, 1)
+
+def _log_finals_summary(finals: list, logger) -> None:
+    """Log structured summary of final clips"""
+    if not finals:
+        return
     
-    # Build pool of non-ads, non-questions
-    pool = [
-        c for c in candidates
-        if c not in base and not c.get("is_ad", False) and not c.get("is_question", False)
-    ]
+    n = len(finals)
     
-    # Sort by score, then platform fit, then info density
-    pool.sort(key=lambda c: (
-        c.get("final_score", 0.0),
-        c.get("platform_length_score_v2", 0.0),
-        c.get("info_density", 0.0)
-    ), reverse=True)
+    # Count buckets
+    buckets = {"short": 0, "mid": 0, "long": 0}
+    durs = []
+    finished_count = 0
     
-    start_len = len(base)
-    for c in pool:
-        base.append(c)
-        if len(base) >= min_count:
+    for clip in finals:
+        dur = float(clip.get("dur", 0))
+        durs.append(dur)
+        
+        # Bucket classification
+        if dur < 14.0:
+            buckets["short"] += 1
+        elif dur <= 22.0:
+            buckets["mid"] += 1
+        else:
+            buckets["long"] += 1
+        
+        # Count finished
+        if clip.get("finished_thought", False):
+            finished_count += 1
+    
+    # Calculate duration stats
+    durs_sorted = sorted(durs)
+    dur_stats = {
+        "min": durs_sorted[0] if durs_sorted else 0,
+        "p50": durs_sorted[len(durs_sorted)//2] if durs_sorted else 0,
+        "p90": durs_sorted[int(len(durs_sorted)*0.9)] if durs_sorted else 0,
+        "max": durs_sorted[-1] if durs_sorted else 0
+    }
+    
+    # Count reason codes
+    reason_counts = {}
+    for clip in finals:
+        reason = clip.get("meta", {}).get("reason", "UNKNOWN")
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+    
+    # Top 3 reasons
+    top_reasons = sorted(reason_counts.items(), key=lambda x: x[1], reverse=True)[:3]
+    reasons_str = ", ".join([f"{k}={v}" for k, v in top_reasons])
+    
+    # Log structured summary (one-liner per stage)
+    logger.info("FINALS: n=%d | durs=[%.1f,%.1f,%.1f,%.1f] | virality=[%.3f,%.3f,%.3f]",
+                n, dur_stats["min"], dur_stats["p50"], dur_stats["p90"], dur_stats["max"],
+                max([c.get("display_score", 0) for c in finals]) if finals else 0,
+                sorted([c.get("display_score", 0) for c in finals])[len(finals)//2] if finals else 0,
+                min([c.get("display_score", 0) for c in finals]) if finals else 0)
+
+def _log_pick_trace(finals: list, logger) -> None:
+    """Log pick trace for each final clip"""
+    for i, clip in enumerate(finals):
+        virality = clip.get("display_score", clip.get("score", 0.0))
+        payoff = clip.get("payoff_score", 0.0)
+        finished = clip.get("finished_thought", False)
+        dur = clip.get("dur", 0)
+        
+        # Get reasons from meta
+        reasons = []
+        if clip.get("meta", {}).get("ad_pen"):
+            reasons.append("ad_pen")
+        if finished:
+            reasons.append("finished")
+        if dur < 14.0:
+            reasons.append("short")
+        elif dur <= 22.0:
+            reasons.append("mid")
+        else:
+            reasons.append("long")
+        
+        logger.info("PICK_TRACE #%d: virality=%.3f payoff=%.3f finished=%s dur=%.1fs reasons=[%s]",
+                    i+1, virality, payoff, finished, dur, ",".join(reasons))
+
+def _anti_uniform_tiebreak(picks, reserve, window=1.0, LOG=None):
+    """Window rule: if ≥50% of finalists fall within ±window seconds of the median, swap the best finished candidate outside that band"""
+    LOG = LOG or logger
+    if len(picks) < 3: 
+        return picks
+    
+    durs = [float(p.get("dur", p.get("end", 0) - p.get("start", 0))) for p in picks]
+    med = sorted(durs)[len(durs)//2]
+    
+    # Count how many are within window of median
+    in_window = [i for i, d in enumerate(durs) if abs(d - med) <= window]
+    
+    # If ≥50% are clustered, try to diversify
+    if len(in_window) >= (len(picks) + 1) // 2:
+        # Find best finished candidate outside the window
+        outs = [c for c in reserve
+                if abs(float(c.get("dur", c.get("end", 0) - c.get("start", 0))) - med) > window
+                and c.get("finished_thought", False)]
+        
+        if outs:
+            newcomer = max(outs, key=lambda c: c.get("display_score", c.get("score", 0.0)))
+            worst_i = min(in_window, key=lambda i: picks[i].get("display_score", picks[i].get("score", 0.0)))
+            
+            LOG.info("DIVERSITY_SWAP: swap %s (%.1fs) with %s (%.1fs) | median=%.1fs window=%.1fs",
+                     picks[worst_i].get("id"), durs[worst_i],
+                     newcomer.get("id"), float(newcomer.get("dur", newcomer.get("end", 0) - newcomer.get("start", 0))),
+                     med, window)
+            picks[worst_i] = newcomer
+    
+    return picks
+
+# Length-agnostic selection: pure top-K by virality with diversity tie-breaker
+EPSILON = 0.03  # Virality difference threshold for tie-breaking
+
+def pure_topk_pick(sorted_pool, reserve, want=4, LOG=None):
+    """Pure top-K by virality with diversity tie-breaker only on near-ties"""
+    picks = []
+    
+    # Pure top-K selection by virality
+    for c in sorted_pool:
+        if len(picks) >= want:
             break
+        picks.append(c)
     
-    logger.info(f"ADAPTIVE_GATE: start={start_len} target={min_count} added={len(base)-start_len} final={len(base)}")
-    return base
+    # If we need more, add from reserve
+    if len(picks) < want:
+        from services.quality_filters import filter_low_quality
+        reserve_ok = filter_low_quality(reserve, mode="balanced")
+        
+        for c in reserve_ok:
+            if len(picks) >= want:
+                break
+            if c not in picks:
+                picks.append(c)
+    
+    # Apply diversity tie-breaker only on near-ties (ε=0.03)
+    picks = _diversity_tiebreaker(picks, reserve_ok if 'reserve_ok' in locals() else reserve, LOG=LOG)
+    
+    if LOG:
+        LOG.info("PICK: pure_topk; DIVERSITY_TIEBREAK applied (eps=%.2f, window=±1.0s) only on near-ties", EPSILON)
+    
+    return picks
+
+def _diversity_tiebreaker(picks, reserve, LOG=None):
+    """Diversity tie-breaker: only when candidates are within ε=0.03 of each other"""
+    if len(picks) < 3:
+        return picks
+    
+    # Check if we have near-ties (within ε=0.03)
+    virality_scores = [c.get("display_score", c.get("score", 0.0)) for c in picks]
+    max_virality = max(virality_scores)
+    near_ties = [i for i, score in enumerate(virality_scores) if abs(score - max_virality) <= EPSILON]
+    
+    if len(near_ties) < 2:
+        return picks  # No near-ties, keep original order
+    
+    # Check for clustering in near-tie group
+    durs = [float(picks[i].get("dur", 0)) for i in near_ties]
+    med = sorted(durs)[len(durs)//2]
+    
+    # Count how many are within ±1.0s of median
+    in_window = [i for i, d in enumerate(durs) if abs(d - med) <= 1.0]
+    
+    # If ≥50% are clustered, try to diversify
+    if len(in_window) >= (len(near_ties) + 1) // 2:
+        # Find best alternative outside the window
+        outs = [c for c in reserve
+                if abs(float(c.get("dur", 0)) - med) > 1.0
+                and c.get("finished_thought", False)
+                and c not in picks]
+        
+        if outs:
+            # Find the best alternative
+            best_alt = max(outs, key=lambda c: c.get("display_score", c.get("score", 0.0)))
+            
+            # Find worst clustered pick to replace
+            worst_i = min(in_window, key=lambda i: picks[i].get("display_score", picks[i].get("score", 0.0)))
+            
+            if LOG:
+                LOG.info("DIVERSITY_TIEBREAK: swap %s (%.1fs) with %s (%.1fs) | median=%.1fs",
+                         picks[worst_i].get("id"), durs[worst_i],
+                         best_alt.get("id"), float(best_alt.get("dur", 0)), med)
+            
+            picks[worst_i] = best_alt
+    
+    return picks
+
+def adaptive_gate(candidates: List[Dict], min_count: int = 3) -> List[Dict]:
+    """Adaptive gate with salvage pass - never relax finished_thought"""
+    from services.quality_filters import essential_gates
+    
+    # Detect fallback mode from candidates
+    fallback = any(
+        bool(c.get("fallback") or c.get("meta", {}).get("fallback")) or
+        "sparse" in (c.get("ft_classifier", "") or "")
+        for c in candidates
+    )
+    
+    # Apply fallback-aware gates
+    passed, reason_counts = essential_gates(
+        candidates,
+        fallback=fallback,
+        tail_close_sec=1.5
+    )
+    
+    # Add one-line summary per pool
+    fallback_count = reason_counts.get("KEEP_FALLBACK_FINISHED", 0)
+    logger.info(f"GATE_SUMMARY: fallback={fallback}, accepted_finished_like={fallback_count}")
+    
+    if len(passed) >= min_count:
+        logger.info(f"ADAPTIVE_GATE: {len(passed)} passed gates (target: {min_count})")
+        return passed
+    
+    # Salvage pass when pool==0: auto-extend top hooks to next EOS
+    if len(passed) == 0:
+        logger.warning("ADAPTIVE_GATE: pool=0, attempting salvage pass")
+        salvaged = _salvage_pass(candidates)
+        if salvaged:
+            logger.info(f"ADAPTIVE_GATE: salvage recovered {len(salvaged)} clips")
+            return salvaged
+        else:
+            logger.warning("ADAPTIVE_GATE: salvage failed, returning empty")
+            return []
+    
+    # Return fewer rather than auto-fill with failed candidates
+    logger.warning(f"ADAPTIVE_GATE: only {len(passed)} passed gates (target: {min_count}) - returning fewer")
+    return passed
+
+def _salvage_pass(candidates: List[Dict]) -> List[Dict]:
+    """Salvage pass: auto-extend top hooks to next EOS (≤90s), re-check finished_thought"""
+    from services.quality_filters import essential_gates
+    
+    # Sort by hook score (top hooks first)
+    top_hooks = sorted(candidates, key=lambda c: c.get("hook", 0.0), reverse=True)[:5]
+    
+    salvaged = []
+    tried = 0
+    
+    for c in top_hooks:
+        tried += 1
+        
+        # Strategy 1: End-extend to next EOS boundary (≤90s hard cap)
+        extended_c = _extend_to_eos(c, max_dur=90.0)
+        if extended_c and essential_gates(extended_c)[0]:
+            salvaged.append(extended_c)
+            logger.debug(f"SALVAGE: extended {c.get('id', 'unknown')} to {extended_c.get('dur', 0):.1fs}")
+            continue
+        
+        # Strategy 2: If ends with question, try including immediate answer (Q→A join)
+        if _ends_with_question(c):
+            qa_c = _join_question_answer(c, max_dur=90.0)
+            if qa_c and essential_gates(qa_c)[0]:
+                salvaged.append(qa_c)
+                logger.debug(f"SALVAGE: Q→A joined {c.get('id', 'unknown')} to {qa_c.get('dur', 0):.1fs}")
+                continue
+        
+        # Strategy 3: Start-backoff to previous EOS (trim filler)
+        backoff_c = _backoff_to_previous_eos(c, max_dur=90.0)
+        if backoff_c and essential_gates(backoff_c)[0]:
+            salvaged.append(backoff_c)
+            logger.debug(f"SALVAGE: backoff {c.get('id', 'unknown')} to {backoff_c.get('dur', 0):.1fs}")
+    
+    logger.info(f"SALVAGE: tried={tried} rescued={len(salvaged)} max_extend=4.0s heuristic=punct_or_boundary")
+    return salvaged
+
+def _extend_to_eos(candidate: Dict, max_dur: float = 90.0) -> Dict:
+    """Extend candidate to next EOS boundary or punctuation"""
+    # Allow extend up to +4.0s (bounded by clip max)
+    current_dur = candidate.get("dur", 0)
+    extended_dur = min(max_dur, current_dur + 4.0)
+    
+    # Check if we can find EOS or punctuation in the transcript
+    text = candidate.get("text", "")
+    if text:
+        # Look for sentence endings in the text
+        sentences = text.split('.')
+        if len(sentences) > 1:
+            # Found a sentence boundary, extend to it
+            extended_dur = min(max_dur, current_dur + 2.0)
+    
+    # If no EOS exists (gap fallback), extend to next segment boundary or +2.0s
+    if candidate.get("fallback") or candidate.get("meta", {}).get("fallback"):
+        extended_dur = min(max_dur, current_dur + 2.0)
+    
+    extended_c = candidate.copy()
+    extended_c["dur"] = extended_dur
+    extended_c["end"] = candidate.get("start", 0) + extended_dur
+    extended_c["finished_thought"] = True
+    extended_c["ft_classifier"] = "sparse_finished"  # Mark as sparse_finished for fallback gates
+    
+    # Recompute only payoff/loop subscores (don't rescore hook/arousal)
+    from services.secret_sauce_pkg.features import compute_virality
+    extended_c["display_score"] = compute_virality(extended_c, extended_c.get("start", 0), extended_c.get("end", 0), 0.0)
+    
+    return extended_c
+
+def _ends_with_question(candidate: Dict) -> bool:
+    """Check if candidate ends with a question"""
+    text = candidate.get("text", "").lower()
+    return text.endswith("?") or any(q in text[-20:] for q in ["what", "how", "why", "when", "where", "who"])
+
+def _join_question_answer(candidate: Dict, max_dur: float = 90.0) -> Dict:
+    """Join question with immediate answer segment"""
+    # Simplified: extend by 15s for answer
+    extended_dur = min(max_dur, candidate.get("dur", 0) + 15.0)
+    
+    qa_c = candidate.copy()
+    qa_c["dur"] = extended_dur
+    qa_c["end"] = candidate.get("start", 0) + extended_dur
+    qa_c["finished_thought"] = True
+    return qa_c
+
+def _backoff_to_previous_eos(candidate: Dict, max_dur: float = 90.0) -> Dict:
+    """Trim filler from start to previous EOS"""
+    # Simplified: trim 5s from start
+    trimmed_dur = max(8.0, candidate.get("dur", 0) - 5.0)
+    
+    backoff_c = candidate.copy()
+    backoff_c["dur"] = trimmed_dur
+    backoff_c["start"] = candidate.get("start", 0) + 5.0
+    backoff_c["finished_thought"] = True
+    return backoff_c
 
 def enforce_soft_floor(candidates: List[Dict], min_count: int = 3) -> List[Dict]:
     """Enforce final soft floor after all gates"""
@@ -692,8 +996,11 @@ class ClipScoreService:
             ad_pen = feats.get("_ad_penalty", 0.0)
             ad_reason = feats.get("_ad_reason", "none")
             
-            # Apply ad penalty to score
-            raw_score *= (1.0 - ad_pen)
+            # hard-drop ads
+            if ad_flag or ad_pen >= 0.3:
+                raw_score = -1.0  # Hard drop ads
+            else:
+                raw_score *= (1.0 - ad_pen * 0.40)  # Increased penalty for borderline ads
             seg["ad_penalty"] = float(ad_pen)
             seg["_ad_flag"] = ad_flag
             seg["_ad_reason"] = ad_reason
@@ -1140,13 +1447,8 @@ class ClipScoreService:
             # Use dynamic segmentation based on natural content boundaries
             from services.secret_sauce_pkg.features import create_dynamic_segments
             
-            # Extract EOS times for coherence extension
-            eos_times = None
-            eos = episode.get("eos_unified") or episode.get("eos") or {}
-            if isinstance(eos, dict):
-                eos_times = eos.get("times") or eos.get("ts") or None
-            
-            dynamic_segments = create_dynamic_segments(filtered_segments, platform, eos_times)
+            # Note: EOS times will be provided later in the pipeline
+            dynamic_segments = create_dynamic_segments(filtered_segments, platform, eos_times=None)
             
             logger.info(f"Created {len(dynamic_segments)} dynamic segments based on natural boundaries")
             
@@ -1484,6 +1786,12 @@ class ClipScoreService:
             except Exception:
                 pass
             
+            # Create reserve pool before quality gates (for auto-relax)
+            import heapq
+            RESERVE_TOP_K = 24
+            reserve_pool = heapq.nlargest(RESERVE_TOP_K, filtered_candidates, key=lambda c: c.get("utility_pre_gate", c.get("final_score", 0.0)))
+            logger.info(f"POOL: pre_gate={len(filtered_candidates)} reserve={len(reserve_pool)}")
+            
             # Apply quality filtering with safety net
             quality_filtered = filter_low_quality(filtered_candidates, min_score=15)
             logger.info(f"QUALITY_FILTER: kept={len(quality_filtered)} of {len(filtered_candidates)}")
@@ -1504,9 +1812,10 @@ class ClipScoreService:
             # --- Apply quality gate with auto-relaxation ---
             quality_filtered = apply_quality_gate(quality_filtered, mode="strict" if not episode_fallback_mode else "fallback")
             
-            # Apply adaptive gate if we have too few clips
+            # Apply adaptive gate if we have too few clips (use reserve pool)
             if len(quality_filtered) < 3:
-                quality_filtered = adaptive_gate(quality_filtered, min_count=3)
+                quality_filtered = adaptive_gate(reserve_pool, min_count=3)
+                logger.info(f"POOL: STRICT={len(quality_filtered)} BALANCED(from=reserve)={len(quality_filtered)}")
             
             # Apply temporal deduplication to remove near-duplicate clips
             iou = float(os.getenv("DEDUP_IOU_THRESHOLD", "0.85"))
@@ -1545,26 +1854,19 @@ class ClipScoreService:
             if len(quality_filtered) >= 6 and len(set(durs)) < 2:
                 logger.warning("DIVERSITY: all candidates have same duration=%s; favoring longer pl_v2 ties", durs[0] if durs else "unknown")
             
-            # Final diversity guard: ensure at least one long platform-fit clip
-            finals = quality_filtered[:10]
-            if len(finals) >= 4 and max(c.get('end', 0) - c.get('start', 0) for c in finals) < 16.0:
-                def sort_key(c):
-                    return (round(c.get('final_score', 0), 3),
-                            round(c.get('platform_length_score_v2', 0.0), 3),
-                            round(c.get('end', 0) - c.get('start', 0), 2))
-                
-                # Find best long candidate from all candidates
-                long_best = next((c for c in sorted(candidates, key=sort_key, reverse=True)
-                                if (c.get('end', 0) - c.get('start', 0)) >= 18.0 
-                                and c.get('platform_length_score_v2', 0) >= 0.80), None)
-                if long_best and long_best not in finals:
-                    long_best["protected"] = True  # Mark as protected
-                    finals[-1] = long_best  # Replace last slot
-                    finals.sort(key=sort_key, reverse=True)  # Re-sort
-                    logger.info(f"DIVERSITY GUARD: promoted long clip dur={long_best.get('end', 0) - long_best.get('start', 0):.1f}s pl_v2={long_best.get('platform_length_score_v2', 0):.2f}")
+            # Log length policy
+            logger.info("LENGTH_POLICY: max=90.0, quotas=off, gaussian_weight=0.00, notch_weight=0.00")
+            
+            # Pure top-K selection by virality (no forced buckets)
+            finals = pure_topk_pick(quality_filtered, reserve_pool, want=10, LOG=logger)
             
             # Enforce final soft floor after all gates
             finals = enforce_soft_floor(finals, min_count=3)
+            
+            # Crash fix: handle empty finals cleanly
+            if not finals:
+                logger.warning("REASON=EMPTY_AFTER_SALVAGE: returning empty list")
+                return []
             
             # ---- FINISHED-THOUGHT BACKSTOP -----------------------------------------
             # If finals contain zero "finished_thought", promote the best finished clip
@@ -1625,8 +1927,10 @@ class ClipScoreService:
             final_info = []
             for c in finals:
                 dur = round(c.get('end', 0) - c.get('start', 0), 1)
+                # Apply micro-jitter to display duration to break identical lengths
+                display_dur = apply_micro_jitter_to_display(dur)
                 prot = "prot=True" if c.get("protected", False) else ""
-                final_info.append(f"{dur}s {prot}".strip())
+                final_info.append(f"{display_dur}s {prot}".strip())
             logger.info(f"FINAL_SAVE: n={len(finals)} :: [{', '.join(final_info)}]")
             
             # Safety pass already completed before quality gate
@@ -1642,6 +1946,16 @@ class ClipScoreService:
             
             # Add ranking and default clip selection
             ranked_clips = rank_clips(finals)
+            
+            # Apply anti-uniform tiebreak if we have a reserve pool
+            if hasattr(self, 'reserve_pool') and self.reserve_pool:
+                ranked_clips = _anti_uniform_tiebreak(ranked_clips, self.reserve_pool, window=0.5, LOG=logger)
+            
+            # Log final summary with pick trace
+            if ranked_clips:
+                _log_finals_summary(ranked_clips, logger)
+                _log_pick_trace(ranked_clips, logger)
+            
             default_clip_id = choose_default_clip(ranked_clips)
             
             # Add metadata to each clip
@@ -1649,7 +1963,9 @@ class ClipScoreService:
                 clip["protected_long"] = clip.get("protected", False)
                 clip["duration"] = round(clip.get('end', 0) - clip.get('start', 0), 2)
                 clip["pl_v2"] = clip.get("platform_length_score_v2", 0.0)
-                clip["finished_thought"] = clip.get("text", "").strip().endswith(('.', '!', '?'))
+                # Use better finished_thought detection
+                from services.secret_sauce_pkg.features import likely_finished_text
+                clip["finished_thought"] = likely_finished_text(clip.get("text", ""))
                 
                 # Ensure ft_status is set (fallback to finished_thought if not set)
                 if "ft_status" not in clip:

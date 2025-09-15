@@ -14,13 +14,19 @@ SCORING_VERSION = "v4.8-unified-2025-09"
 USE_PL_V2 = True     # read platform_length_score_v2 if present
 USE_Q_LIST = True    # include q_list_score with a small weight
 
+# Module-level flag to log normalization only once
+_NORMALIZE_LOGGED_ONCE = False
+
 def get_clip_weights():
     """Get normalized clip weights (sum to 1.0)"""
+    global _NORMALIZE_LOGGED_ONCE
     weights = dict(get_config()["weights"])
     ws = sum(weights.values()) or 1.0
     if abs(ws - 1.0) > 1e-6:
         weights = {k: v / ws for k, v in weights.items()}
-        logger.warning("Weights normalized from %.2f to 1.00", ws)
+        if not _NORMALIZE_LOGGED_ONCE:
+            logger.debug("Weights normalized from %.2f to 1.00", ws)
+            _NORMALIZE_LOGGED_ONCE = True
     return weights
 
 def score_segment_v4(features: Dict, apply_penalties: bool = True, genre: str = 'general', platform: str = None) -> Dict:

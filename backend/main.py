@@ -1323,7 +1323,23 @@ async def get_episode_clips(episode_id: str, regenerate: bool = False, backgroun
             else:
                 # Fallback: generate clips if not available (shouldn't happen)
                 logger.warning(f"No cached clips found for episode {episode_id}, generating now...")
-                clips, default_clip_id = await clip_score_service.get_candidates(episode_id)
+                result = await clip_score_service.get_candidates(episode_id)
+                if isinstance(result, tuple) and len(result) == 2:
+                    clips, default_clip_id = result
+                else:
+                    clips = result if isinstance(result, list) else []
+                    default_clip_id = None
+            
+            # Handle empty clips gracefully
+            if not clips:
+                logger.warning(f"REASON=EMPTY_AFTER_SALVAGE: episode {episode_id} has 0 clips")
+                return {
+                    "ok": True,
+                    "clips": [],
+                    "count": 0,
+                    "episode_id": episode_id,
+                    "message": "Ready: 0 clips"
+                }
             
             # Import preview service
             from services.preview_service import ensure_preview, get_episode_media_path

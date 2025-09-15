@@ -303,10 +303,15 @@ def format_candidates(
             enhanced_candidate.get("insight_conf", 0.0),
         )
         
+        # Create snippet for card display
+        snippet = full_transcript if len(full_transcript) <= 240 else full_transcript[:240] + "…"
+        
         candidate = {
             "id": f"clip_{episode_id}_{i}",
             "title": title,
             "transcript": full_transcript,  # Full stitched transcript
+            "text": full_transcript,  # Ensure text field is set
+            "snippet": snippet,  # Short snippet for cards
             "features": features,
             "grades": grades,
             "score": seg.get("raw_score", 0.0),

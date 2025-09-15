@@ -818,13 +818,19 @@ class GenreAwareScorer:
         profile = self.genres.get(genre, self.genres['general'])
         return profile.score(features)
 
+# Module-level flag to log normalization only once
+_NORMALIZE_LOGGED_ONCE = False
+
 def get_clip_weights():
     """Get normalized clip weights (sum to 1.0)"""
+    global _NORMALIZE_LOGGED_ONCE
     weights = dict(get_config()["weights"])
     ws = sum(weights.values()) or 1.0
     if abs(ws - 1.0) > 1e-6:
         weights = {k: v / ws for k, v in weights.items()}
-        logger.warning("Weights normalized from %.2f to 1.00", ws)
+        if not _NORMALIZE_LOGGED_ONCE:
+            logger.debug("Weights normalized from %.2f to 1.00", ws)
+            _NORMALIZE_LOGGED_ONCE = True
     return weights
 
 CLIP_WEIGHTS = get_clip_weights()
