@@ -8,12 +8,19 @@ type Clip = {
 };
 
 export function useClipTranscript(clip: Clip) {
-  const [text, setText] = React.useState<string>(clip.transcript ?? "");
-  const [loading, setLoading] = React.useState<boolean>(!clip.transcript);
+  // Priority order: exact transcript -> full_text -> hook text
+  const transcript = 
+    clip?.transcript?.trim() ??
+    clip?.full_text?.trim() ??
+    clip?.text?.trim() ??
+    "";
+    
+  const [text, setText] = React.useState<string>(transcript);
+  const [loading, setLoading] = React.useState<boolean>(!transcript);
   const [error, setError] = React.useState<string>("");
 
   React.useEffect(() => {
-    if (clip.transcript) return;
+    if (transcript) return;
     
     let alive = true;
     setLoading(true);

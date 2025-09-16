@@ -16,13 +16,17 @@ def _extract_text(obj: Any) -> str:
     if isinstance(obj, str):
         return obj
     if isinstance(obj, dict):
-        # common shapes
-        if isinstance(obj.get("text"), str):
-            return obj["text"]
+        # Prioritize exact transcript over other text fields
+        if isinstance(obj.get("transcript"), str) and obj["transcript"].strip():
+            return obj["transcript"]
         if "transcript" in obj and isinstance(obj["transcript"], dict):
             t = obj["transcript"].get("text")
-            if isinstance(t, str):
+            if isinstance(t, str) and t.strip():
                 return t
+        if isinstance(obj.get("segment_text"), str) and obj["segment_text"].strip():
+            return obj["segment_text"]
+        if isinstance(obj.get("text"), str):
+            return obj["text"]
         # try words → join tokens
         if isinstance(obj.get("words"), list):
             toks = []
@@ -70,6 +74,9 @@ STOP = {
     # extra fillers that polluted titles
     "through","again","maybe","say","will","ill","youre","very","answer","two","words"
 }
+
+# Specific ban list for title "topic" words
+BAN_TOPIC = {"this","that","those","there","within","and","because"}
 
 _STOP = set("a an the and or for to in of with over under on at is are was were be been being it this that".split())
 
@@ -393,32 +400,52 @@ def _sanitize_title(title: str) -> str:
 
 def _extract_keywords(text: str, k: int = 6) -> List[str]:
     """
-    Phrase-first extraction (anchors + hyphens + short ngrams).
-    Produces human-friendly phrases like "Salem Restructuring", "Digital-First Company".
+    Lightweight keyword extractor geared for clip transcripts.
+    Prefers proper nouns and short noun-ish phrases. Avoids pronouns and glue words.
     """
-    phrases = _mine_anchor_phrases(text)
-    if phrases:
-        # normalize hyphen case (Digital-First), filter banter
-        cleaned = []
-        for p in phrases:
-            if BAN_PHRASE.search(p):
-                continue
-            cleaned.append(_title_case_hyphen(p))
-        return cleaned[:k]
-    # fallback to unigram frequency if anchors fail
-    clean = _clean_text(text)
-    # Also normalize contractions
-    clean = _normalize_contractions(clean)
-    words = re.findall(r"[A-Za-z][A-Za-z'-]{2,}", clean)
-    freq = Counter(w.lower() for w in words if w.lower() not in STOP)
-    out = []
-    for w, _ in freq.most_common(20):
-        t = w.title()
-        # Filter out contractions and common words that aren't good topics
-        if (BAN_PHRASE.search(t) or 
-            w.lower() in ["they're", "we're", "you're", "it's", "that's", "there's", "here's", "doesn't", "won't", "can't"]):
+    if not text:
+        return []
+    t = re.sub(r"\s+", " ", text.strip())
+    tokens = re.findall(r"[A-Za-z0-9$][A-Za-z0-9\-\.''']*", t)
+
+    # Candidate words with simple scoring
+    scores = {}
+    for i, tok in enumerate(tokens):
+        low = tok.lower()
+        if low in STOP or len(low) < 3:
             continue
-        out.append(t)
+        score = 1.0
+        if tok[:1].isupper() and i not in (0, 1):  # proper-ish noun mid-sentence
+            score += 1.0
+        if re.match(r"^\$?\d", tok):               # numbers/tickers
+            score += 0.6
+        scores[low] = max(scores.get(low, 0), score)
+
+    # Simple phrase pass (bigrams/trigrams) that avoid STOP on the ends
+    phrases = {}
+    L = [w for w in tokens]
+    for n in (3, 2):
+        for i in range(len(L) - n + 1):
+            phrase = " ".join(L[i:i+n])
+            pl = phrase.lower()
+            parts = pl.split()
+            if any(p in STOP for p in (parts[0], parts[-1])):
+                continue
+            if any(len(p) < 3 for p in parts):
+                continue
+            # bump score if most parts have capital letters
+            cap_bonus = sum(1 for p in L[i:i+n] if p[:1].isupper())
+            phrases[pl] = phrases.get(pl, 0) + n + 0.3 * cap_bonus
+
+    # Merge & pick top-k
+    merged = {**scores, **phrases}
+    top = sorted(merged.items(), key=lambda x: (-x[1], x[0]))[: max(k, 6)]
+    out = []
+    seen = set()
+    for term, _ in top:
+        if term not in seen:
+            seen.add(term)
+            out.append(_title_case(term))
         if len(out) >= k:
             break
     return out
@@ -428,9 +455,11 @@ def _title_case(s: str) -> str:
 
 def _variants_from_keywords(keys: List[str], platform: str) -> List[str]:
     # assemble 6 concise variants; prefer 4–8 words; title-case; avoid banned phrases
-    main = " ".join([k.replace("-", " ") for k in keys[:1]]).strip()  # use top phrase only
-    if not main:
+    # Use safer topic selection that avoids BAN_TOPIC words
+    topic = next((kw for kw in keys if kw.lower() not in BAN_TOPIC), None)
+    if not topic:
         return []
+    main = topic.replace("-", " ").strip()
     main_tc = _title_case_hyphen(main)
     alts = []
     if platform == "shorts":

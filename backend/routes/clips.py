@@ -362,7 +362,7 @@ def get_clip_transcript(clip_id: str):
     src = clip.get("transcript_source", "")
     
     if not txt:
-        txt = build_clip_transcript_exact(episode, float(clip["start"]), float(clip["end"]))
+        txt, src, meta = build_clip_transcript_exact(episode, float(clip["start"]), float(clip["end"]))
         src = "rebuilt" if txt else "none"
 
     payload = {

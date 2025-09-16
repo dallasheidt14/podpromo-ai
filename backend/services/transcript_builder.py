@@ -6,15 +6,39 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-def build_clip_transcript_exact(source, start_s: float, end_s: float, eps: float = 0.05) -> tuple[str, str]:
+def slice_items_by_time(items, start: float, end: float, get_start, get_end, pad_s: float = 0.25, eps: float = 0.01):
+    """
+    Return items that OVERLAP the [start-pad, end+pad] window.
+    Overlap check fixes lost head/tail words that straddle boundaries.
+    """
+    s, e = max(0.0, float(start) - pad_s), float(end) + pad_s
+    out = []
+    for it in items:
+        ws, we = float(get_start(it)), float(get_end(it))
+        if we > s - eps and ws < e + eps:  # overlap, not containment
+            out.append(it)
+    return out
+
+def slice_words_by_time(words, start: float, end: float, pad_s: float = 0.25, eps: float = 1e-3):
+    """Slice words using overlap logic with proper boundary handling"""
+    s_p = start - pad_s
+    e_p = end + pad_s
+    return [w for w in words
+            if (w.get("start", 0.0) < e_p - eps) and (w.get("end", 0.0) > s_p + eps)]
+
+def slice_segments_by_time(segments, start: float, end: float, pad_s: float = 0.25):
+    """Slice segments using overlap logic"""
+    return slice_items_by_time(segments, start, end, lambda s: s["start"], lambda s: s["end"], pad_s)
+
+def build_clip_transcript_exact(source, start_s: float, end_s: float, pad_s: float = 0.25) -> tuple[str, str, dict]:
     """
     Build transcript from word timestamps inside the exact clip window.
     source can be episode object or list[dict] of words.
-    Returns (text, source_type)
+    Returns (text, source_type, metadata)
     """
     # Handle None inputs
     if start_s is None or end_s is None:
-        return "", "none"
+        return "", "none", {"start": start_s, "end": end_s, "word_count": 0, "coverage_s": 0.0}
     
     # Get words from source (episode or list)
     words = getattr(source, "words", None) or source or []
@@ -38,24 +62,60 @@ def build_clip_transcript_exact(source, start_s: float, end_s: float, eps: float
             })
     
     if not norm:
-        logger.debug(f"TRANSCRIPT_DEBUG: no valid words found for window [{start_s:.2f}, {end_s:.2f}]")
-        return "", "none"
+        logger.warning(f"CLIP_TRANSCRIPT: episode.words missing, no valid words found for window [{start_s:.2f}, {end_s:.2f}]")
+        return "", "none", {"start": start_s, "end": end_s, "word_count": 0, "coverage_s": 0.0}
     
-    # Include any word that overlaps [start_s, end_s] with epsilon
-    out = []
-    for w in norm:
-        if w["end"] < start_s - eps:
-            continue
-        if w["start"] > end_s + eps:
-            break
-        out.append(w["text"])
+    # Use overlap logic to get words that intersect the window
+    overlapping_words = slice_words_by_time(norm, start_s, end_s, pad_s)
     
-    text = " ".join(out).strip()
-    text = re.sub(r"\s+([,.;:!?])", r"\1", text)
+    if overlapping_words:
+        # Extract text from overlapping words
+        text = " ".join(w["text"] for w in overlapping_words).strip()
+        text = re.sub(r"\s+([,.;:!?])", r"\1", text)
+        
+        # Calculate coverage
+        coverage_s = (overlapping_words[-1]["end"] - overlapping_words[0]["start"]) if overlapping_words else 0.0
+        
+        metadata = {
+            "start": start_s, 
+            "end": end_s, 
+            "pad": pad_s,
+            "word_count": len(overlapping_words),
+            "coverage_s": coverage_s
+        }
+        
+        logger.info(f"CLIP_TRANSCRIPT: src=word_slice ({start_s:.2f}→{end_s:.2f}) words={len(overlapping_words)} chars={len(text)} coverage={coverage_s:.1f}s/{end_s-start_s:.1f}s")
+        return text, "word_slice", metadata
     
-    source_type = "word_slice" if text else "none"
-    logger.debug(f"TRANSCRIPT_DEBUG: found {len(out)} words, text_len={len(text)}")
-    return text, source_type
+    # Fallback A: Try segment-level text
+    logger.warning(f"CLIP_TRANSCRIPT: words=0 using segment_span fallback for window [{start_s:.2f}, {end_s:.2f}]")
+    
+    # Try to get segments from source
+    segments = getattr(source, "segments", None) or []
+    if segments:
+        overlapping_segments = slice_segments_by_time(segments, start_s, end_s, pad_s)
+        if overlapping_segments:
+            text = " ".join(s.get("text", "") for s in overlapping_segments).strip()
+            if text:
+                metadata = {
+                    "start": start_s, 
+                    "end": end_s, 
+                    "pad": pad_s,
+                    "word_count": 0,
+                    "coverage_s": 0.0
+                }
+                return text, "segment_span", metadata
+    
+    # Fallback B: Use candidate snippet as last resort
+    candidate_text = getattr(source, "text", "") or ""
+    metadata = {
+        "start": start_s, 
+        "end": end_s, 
+        "pad": pad_s,
+        "word_count": 0,
+        "coverage_s": 0.0
+    }
+    return candidate_text, "candidate_fallback", metadata
 
 def build_clip_transcript_for_clip(episode, clip):
     """Wrapper for clips that handles the signature confusion"""
@@ -64,10 +124,10 @@ def build_clip_transcript_for_clip(episode, clip):
     
     if start is None or end is None:
         logger.warning(f"TRANSCRIPT_WARN: clip {clip.get('id', 'unknown')} has invalid timing: start={start}, end={end}")
-        return "", "none"
+        return "", "none", {"start": start, "end": end, "word_count": 0, "coverage_s": 0.0}
     
-    txt, src = build_clip_transcript_exact(episode, float(start), float(end))
-    return txt, src
+    txt, src, meta = build_clip_transcript_exact(episode, float(start), float(end))
+    return txt, src, meta
 
 # Legacy function for backward compatibility
 def build_clip_transcript(episode, clip_start: float, clip_end: float):

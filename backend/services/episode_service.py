@@ -771,15 +771,7 @@ class EpisodeService:
                             mock_episode = MockEpisode(episode_words) if episode_words else episode
                             
                             # Build exact transcript for the clip window
-                            clip_text, transcript_source = build_clip_transcript_exact(mock_episode, start, end)
-                            
-                            # Log transcript building
-                            if clip_text:
-                                logger.info("CLIP_TRANSCRIPT: words=%d src=%s (%.2f→%.2f) len=%d id=%s",
-                                           len(clip_text.split()), transcript_source, start, end, len(clip_text), clip.get("id", ""))
-                            else:
-                                logger.debug("CLIP_TRANSCRIPT: source=none (%.2f→%.2f) id=%s",
-                                            start, end, clip.get("id", ""))
+                            clip_text, transcript_source, transcript_meta = build_clip_transcript_exact(mock_episode, start, end)
                             
                             # For backward compatibility, create words array
                             if transcript_source == "word" and episode_words:
@@ -836,10 +828,10 @@ class EpisodeService:
                             "source": transcript_source
                         }
                         
-                        # Add exact transcript for UI (matches audio window precisely)
+                        # Save the exact transcript text (built from words or segments)
                         serializable_clip["transcript"] = clip_text
                         serializable_clip["transcript_source"] = transcript_source
-                        serializable_clip["transcript_char_count"] = len(clip_text)
+                        serializable_clip["transcript_meta"] = transcript_meta
                         serializable_clip["captions"] = caps
                         serializable_clip["vtt"] = vtt
                         

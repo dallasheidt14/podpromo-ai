@@ -48,7 +48,7 @@ def load_episode_payload(folder):
 def build_clip_transcript_from_words(words, start, end):
     """Wrapper function for backfill script that takes words directly"""
     from services.transcript_builder import build_clip_transcript_exact
-    text, source = build_clip_transcript_exact(words, start, end)
+    text, source, meta = build_clip_transcript_exact(words, start, end)
     return text
 
 def backfill_episode(ep_folder):
