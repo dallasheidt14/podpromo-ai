@@ -343,3 +343,22 @@ export async function setClipTitle(clipId: string, request: TitleSetRequest): Pr
   });
   return r;
 }
+
+export async function saveTitles(clipId: string, platform: string, titles: string[]): Promise<ApiResult<{ok: boolean, count: number, platform: string}>> {
+  // Clean and dedupe titles
+  const cleanTitles = [...new Set(titles.filter(t => t && t.trim().length >= 3).map(t => t.trim()))];
+  
+  if (cleanTitles.length === 0) {
+    return { success: false, error: "No valid titles provided" };
+  }
+  
+  const r = await getJson<{ok: boolean, count: number, platform: string}>(apiUrl(`/api/clips/${clipId}/titles/save`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      platform: platform,
+      titles: cleanTitles
+    })
+  });
+  return r;
+}

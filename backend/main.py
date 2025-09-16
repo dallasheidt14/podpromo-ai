@@ -18,6 +18,7 @@ from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, F
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.exceptions import RequestValidationError
 from starlette.middleware.base import BaseHTTPMiddleware
 from urllib.parse import urlparse
 
@@ -55,6 +56,13 @@ app = FastAPI(
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# --- Validation error handler ---
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    logging.error("TITLE_SAVE_422 payload failed: path=%s errors=%s",
+                  request.url.path, exc.errors())
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
 _EMERG = os.getenv("EMERGENCY_RATE_LIMIT", "")
 _YT_LIMIT = os.getenv("YOUTUBE_UPLOAD_RATE", "10/hour")

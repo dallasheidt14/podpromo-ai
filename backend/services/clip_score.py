@@ -572,6 +572,120 @@ def _unwrap_extended(ext):
     # strings or anything else -> invalid
     return None
 
+def unique_by_id(clips):
+    """Remove duplicate clips by ID, preserving order"""
+    seen = set()
+    unique = []
+    for clip in clips:
+        clip_id = clip.get("id")
+        if clip_id and clip_id not in seen:
+            seen.add(clip_id)
+            unique.append(clip)
+    return unique
+
+def dedup_by_timing(clips, time_window=0.15):
+    """Remove clips with similar start/end times within time_window seconds"""
+    if len(clips) <= 1:
+        return clips
+    
+    unique = []
+    for clip in clips:
+        start = float(clip.get("start", 0))
+        end = float(clip.get("end", 0))
+        
+        # Check if this clip overlaps significantly with any already selected clip
+        is_duplicate = False
+        for existing in unique:
+            existing_start = float(existing.get("start", 0))
+            existing_end = float(existing.get("end", 0))
+            
+            # Check for temporal overlap within time_window
+            if (abs(start - existing_start) <= time_window and 
+                abs(end - existing_end) <= time_window):
+                is_duplicate = True
+                break
+        
+        if not is_duplicate:
+            unique.append(clip)
+    
+    return unique
+
+def tighten_selection(clips):
+    """Tighten selection after gating - drop unfinished clips unless they meet quality thresholds"""
+    if not clips:
+        return clips
+    
+    tightened = []
+    for clip in clips:
+        finished = bool(clip.get("finished_thought"))
+        payoff = float(clip.get("payoff", 0.0))
+        hook = float(clip.get("hook", 0.0))
+        tail_gap = float(clip.get("tail_gap_sec", 999.0))
+        
+        # Keep finished clips
+        if finished:
+            tightened.append(clip)
+            continue
+        
+        # For unfinished clips, apply stricter criteria
+        if not finished:
+            # Drop if (hook + payoff) < 0.28
+            if (hook + payoff) < 0.28:
+                continue
+            
+            # Drop unless payoff >= 0.25 and distance_to_next_EOS <= 0.6s
+            if payoff >= 0.25 and tail_gap <= 0.6:
+                tightened.append(clip)
+                continue
+        
+        # If we get here, it's a borderline case - keep it
+        tightened.append(clip)
+    
+    return tightened
+
+def apply_duration_diversity(clips):
+    """Apply soft duration diversity - prefer mix of short/mid/long clips"""
+    if len(clips) <= 3:
+        return clips  # Not enough clips to diversify
+    
+    # Categorize clips by duration
+    short_clips = []  # 6-12s
+    mid_clips = []    # 13-22s  
+    long_clips = []   # 23-30s
+    
+    for clip in clips:
+        dur = float(clip.get("dur", 0.0))
+        if 6 <= dur <= 12:
+            short_clips.append(clip)
+        elif 13 <= dur <= 22:
+            mid_clips.append(clip)
+        elif 23 <= dur <= 30:
+            long_clips.append(clip)
+        else:
+            # Other durations - add to mid by default
+            mid_clips.append(clip)
+    
+    # Soft target mix: Short: 1-2, Mid: 2-3, Long: 0-1
+    # Sort each category by virality score
+    short_clips.sort(key=lambda c: c.get("display_score", c.get("score", 0.0)), reverse=True)
+    mid_clips.sort(key=lambda c: c.get("display_score", c.get("score", 0.0)), reverse=True)
+    long_clips.sort(key=lambda c: c.get("display_score", c.get("score", 0.0)), reverse=True)
+    
+    # Select diverse mix
+    diverse = []
+    diverse.extend(short_clips[:2])  # Up to 2 short clips
+    diverse.extend(mid_clips[:3])    # Up to 3 mid clips
+    diverse.extend(long_clips[:1])   # Up to 1 long clip
+    
+    # If we have fewer than original, add remaining high-scoring clips
+    if len(diverse) < len(clips):
+        all_clips = short_clips + mid_clips + long_clips
+        remaining = [c for c in all_clips if c not in diverse]
+        remaining.sort(key=lambda c: c.get("display_score", c.get("score", 0.0)), reverse=True)
+        diverse.extend(remaining[:len(clips) - len(diverse)])
+    
+    return diverse
+
 def _salvage_pass(candidates: List[Dict], *, fallback=False, tail_close_sec=1.0, max_extend_sec=4.0, LOG=None) -> List[Dict]:
     """Salvage pass: auto-extend top hooks to next EOS (≤90s), re-check finished_thought"""
     from services.quality_filters import essential_gates
@@ -597,11 +711,34 @@ def _salvage_pass(candidates: List[Dict], *, fallback=False, tail_close_sec=1.0,
             if LOG: LOG.debug("SALVAGE: extend returned non-candidate (%r)", type(extended_c))
             continue
 
+        # Check duration after salvage - reject micro-clips
+        dur = float(c_ext.get("dur", 0.0))
+        MIN_FINAL_DUR = 6.0  # Platform-safe minimum duration
+        
+        if dur < MIN_FINAL_DUR:
+            # Try extending again if still too short
+            try:
+                re_extended = _extend_to_eos(c_ext, max_dur=min(90.0, c_ext.get("end", 0) + 4.0))
+                if isinstance(re_extended, dict):
+                    c_ext = re_extended
+                elif isinstance(re_extended, (list, tuple)) and re_extended:
+                    c_ext = re_extended[0]
+                
+                dur = float(c_ext.get("dur", 0.0))
+            except:
+                pass
+            
+            # Reject if still too short
+            if dur < MIN_FINAL_DUR:
+                if LOG:
+                    LOG.debug("SALVAGE: rejected micro-clip dur=%.1fs < %.1fs", dur, MIN_FINAL_DUR)
+                continue
+
         kept, _reasons = essential_gates([c_ext], fallback=fallback, tail_close_sec=tail_close_sec)
         if kept:
             salvaged.append(kept[0])
             if LOG:
-                LOG.info("SALVAGE: rescued id=%s new_end=%.2fs", c_ext.get("id"), c_ext.get("end", 0.0))
+                LOG.info("SALVAGE: rescued id=%s new_end=%.2fs dur=%.1fs", c_ext.get("id"), c_ext.get("end", 0.0), dur)
             continue
         
         # Strategy 2: If ends with question, try including immediate answer (Q→A join)
@@ -936,16 +1073,33 @@ def choose_default_clip(clips: List[Dict[str, Any]]) -> Optional[str]:
     
     return None
 
-def rank_clips(clips: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Rank clips with protected_long clips first"""
-    longs = sorted([c for c in clips if c.get("protected_long")],
-                   key=lambda c: (-c.get("pl_v2", 0), -c.get("duration", 0), -c.get("final_score", 0)))
-    rest = sorted([c for c in clips if not c.get("protected_long")],
-                  key=lambda c: (-c.get("final_score", 0), -c.get("finished_thought", 0), -c.get("pl_v2", 0)))
-    ordered = longs + rest
-    for i, c in enumerate(ordered): 
+def rank_clips(clips: List[Dict[str, Any]], platform_neutral: bool = True) -> List[Dict[str, Any]]:
+    """Rank clips using platform-neutral V_core scoring or traditional scoring"""
+    from services.secret_sauce_pkg.features import compute_v_core
+    
+    if platform_neutral:
+        # Platform-neutral ranking using V_core
+        for clip in clips:
+            start_s = clip.get("start", 0.0)
+            end_s = clip.get("end", 0.0)
+            v_core = compute_v_core(clip, start_s, end_s)
+            clip["v_core_score"] = v_core
+        
+        # Sort by V_core score (highest first)
+        sorted_clips = sorted(clips, key=lambda c: -c.get("v_core_score", 0.0))
+    else:
+        # Traditional ranking with platform bias
+        longs = sorted([c for c in clips if c.get("protected_long")],
+                       key=lambda c: (-c.get("pl_v2", 0), -c.get("duration", 0), -c.get("final_score", 0)))
+        rest = sorted([c for c in clips if not c.get("protected_long")],
+                      key=lambda c: (-c.get("final_score", 0), -c.get("finished_thought", 0), -c.get("pl_v2", 0)))
+        sorted_clips = longs + rest
+    
+    # Add rank to each clip
+    for i, c in enumerate(sorted_clips): 
         c["rank_primary"] = i
-    return ordered
+    
+    return sorted_clips
 
 def final_safety_pass(clips: List[Dict[str, Any]], eos_times: List[float], word_end_times: List[float], platform: str) -> List[Dict[str, Any]]:
     """
@@ -1952,11 +2106,16 @@ class ClipScoreService:
         return selected_moments[:target_count]
 
     async def get_candidates(self, episode_id: str, platform: str = "tiktok_reels", genre: str = None) -> List[Dict]:
-        """Get AI-scored clip candidates for an episode with platform/genre optimization using the complete pipeline"""
+        """Get AI-scored clip candidates for an episode with platform-neutral selection and post-selection platform recommendations"""
         try:
             from services.secret_sauce_pkg import (
                 find_viral_clips_enhanced, resolve_platform, detect_podcast_genre
             )
+            from services.secret_sauce_pkg.features import (
+                compute_v_core, PLATFORM_NEUTRAL_SELECTION, FINISHED_THOUGHT_REQUIRED,
+                LENGTH_SEARCH_BUCKETS, LENGTH_MAX_HARD
+            )
+            from services.platform_recommender import add_platform_recommendations_to_clips
 
             # Get episode
             episode = await self.episode_service.get_episode(episode_id)
@@ -1977,6 +2136,10 @@ class ClipScoreService:
                 final_genre = detected_genre
 
             logger.info(f"Using genre: {final_genre} (detected: {detected_genre}, user_selected: {genre})")
+            
+            # Log length policy
+            logger.info(f"LENGTH_POLICY: search={LENGTH_SEARCH_BUCKETS}, clamp={LENGTH_MAX_HARD}")
+            logger.info(f"QUALITY_GATE: finished_required={FINISHED_THOUGHT_REQUIRED}")
 
             # Convert transcript to segments using intelligent moment detection
             segments = self._transcript_to_segments(episode.transcript, genre=final_genre, platform=platform)
@@ -2180,8 +2343,9 @@ class ClipScoreService:
             after_text = len(quality_filtered)
             logger.info(f"DEDUP_BY_TEXT: {before_text} → {after_text} kept ({before_text-after_text} removed), thresh={text_thresh:.2f}")
             
-            # Apply duration clamping to prevent overlong clips
-            platform_max_sec = float(os.getenv("PLATFORM_MAX_SEC", "30.0"))
+            # Apply duration clamping to prevent overlong clips (platform-neutral)
+            from services.secret_sauce_pkg.features import LENGTH_MAX_HARD
+            platform_max_sec = LENGTH_MAX_HARD  # 90.0s
             clamped_count = 0
             for c in quality_filtered:
                 old_dur = c.get("end", 0) - c.get("start", 0)
@@ -2281,6 +2445,16 @@ class ClipScoreService:
                 final_info.append(f"{display_dur}s {prot}".strip())
             logger.info(f"FINAL_SAVE: n={len(finals)} :: [{', '.join(final_info)}]")
             
+            # Tighten selection after gating
+            finals = tighten_selection(finals)
+            
+            # Apply duration diversity (soft target mix)
+            finals = apply_duration_diversity(finals)
+            
+            # Dedup before saving
+            finals = unique_by_id(finals)  # preserve order
+            finals = dedup_by_timing(finals, time_window=0.15)  # remove clones within ±150ms
+            
             # Safety pass already completed before quality gate
             candidates_after = len(finals)
             
@@ -2292,14 +2466,117 @@ class ClipScoreService:
                 logger.error("NO_CANDIDATES: returning empty set after gating; consider enabling FT_SOFT_RELAX_ON_ZERO=1")
                 return []
             
-            # Add ranking and default clip selection
-            ranked_clips = rank_clips(finals)
+            # Check finished count and apply early salvage if needed
+            pool_finished_count = sum(1 for c in finals if c.get("finished_thought", False))
+            finished_ratio_strict = pool_finished_count / max(len(finals), 1)
+            logger.info(f"FT_COVERAGE: pre_gate_finished={pool_finished_count}/{len(finals)}")
+            logger.info(f"GATE_RESULT: kept={len(finals)} (finished={pool_finished_count}, unfinished={len(finals) - pool_finished_count})")
+            
+            # Early salvage if finished ratio is too low
+            if finished_ratio_strict < 0.15:
+                logger.warning(f"EARLY_SALVAGE: finished_ratio_strict={finished_ratio_strict:.2f} < 0.15, running salvage_to_EOS")
+                from services.secret_sauce_pkg.features import extend_to_coherent_end
+                
+                # Run salvage on top 2×K seeds
+                top_seeds = sorted(finals, key=lambda c: c.get("v_core_score", c.get("final_score", 0)), reverse=True)[:6]
+                early_salvaged = []
+                
+                for seed in top_seeds:
+                    if not seed.get("finished_thought", False):
+                        extended = extend_to_coherent_end(
+                            seed, eos_times, word_end_times, 
+                            max_extend=8.0, platform=backend_platform
+                        )
+                        if extended and extended.get("end", 0) > seed.get("end", 0):
+                            extended["finished_thought"] = True
+                            extended["finish_reason"] = "early_salvage_eos"
+                            # Re-score with V_core
+                            from services.secret_sauce_pkg.features import compute_v_core
+                            start_s = extended.get("start", 0)
+                            end_s = extended.get("end", 0)
+                            extended["v_core_score"] = compute_v_core(extended, start_s, end_s)
+                            early_salvaged.append(extended)
+                            logger.debug(f"EARLY_SALVAGE: extended {seed.get('id', 'unknown')} by {end_s - seed.get('end', 0):.1f}s")
+                
+                # Add early salvaged to finals
+                finals.extend(early_salvaged)
+                pool_finished_count = sum(1 for c in finals if c.get("finished_thought", False))
+                logger.info(f"FT_COVERAGE: post_early_salvage_finished={pool_finished_count}/{len(finals)}")
+            
+            if pool_finished_count == 0:
+                logger.warning("SOFT_RELAX: pool_finished_count=0, running salvage_to_EOS on top seeds")
+                from services.secret_sauce_pkg.features import extend_to_coherent_end
+                
+                # Run salvage on top K seeds
+                top_seeds = sorted(finals, key=lambda c: c.get("v_core_score", c.get("final_score", 0)), reverse=True)[:6]
+                salvaged = []
+                
+                for seed in top_seeds:
+                    if not seed.get("finished_thought", False):
+                        extended = extend_to_coherent_end(
+                            seed, eos_times, word_end_times, 
+                            max_extend=8.0, platform=backend_platform
+                        )
+                        if extended and extended.get("end", 0) > seed.get("end", 0):
+                            extended["finished_thought"] = True
+                            extended["finish_reason"] = "salvage_eos"
+                            # Re-score with V_core
+                            from services.secret_sauce_pkg.features import compute_v_core
+                            start_s = extended.get("start", 0)
+                            end_s = extended.get("end", 0)
+                            extended["v_core_score"] = compute_v_core(extended, start_s, end_s)
+                            salvaged.append(extended)
+                            logger.debug(f"SOFT_RELAX: salvaged {seed.get('id', 'unknown')} by {end_s - seed.get('end', 0):.1f}s")
+                
+                # Add salvaged to finals
+                finals.extend(salvaged)
+                pool_finished_count = sum(1 for c in finals if c.get("finished_thought", False))
+                logger.info(f"FT_COVERAGE: post_salvage_finished={pool_finished_count}/{len(finals)}")
+                
+                # If still 0, apply FT_SOFT_RELAX_ON_ZERO
+                if pool_finished_count == 0:
+                    logger.warning("SOFT_RELAX: still 0 finished, applying FT_SOFT_RELAX_ON_ZERO")
+                    from services.quality_filters import _is_finished_like
+                    finished_like = [c for c in finals if _is_finished_like(c, fallback=True, tail_close_sec=1.5)[0]]
+                    if finished_like:
+                        finals = finished_like[:min(3, len(finished_like))]
+                        logger.info(f"SOFT_RELAX: using {len(finished_like)} finished_like candidates")
+            
+            # Add ranking and default clip selection (platform-neutral)
+            ranked_clips = rank_clips(finals, platform_neutral=PLATFORM_NEUTRAL_SELECTION)
             
             # Apply anti-uniform tiebreak if we have a reserve pool
             if hasattr(self, 'reserve_pool') and self.reserve_pool:
                 ranked_clips = _anti_uniform_tiebreak(ranked_clips, self.reserve_pool, window=0.5, LOG=logger)
             
+            # Add platform recommendations after selection
+            ranked_clips = add_platform_recommendations_to_clips(ranked_clips)
+            
+            # Log platform-neutral selection info
+            logger.info(f"SELECTION: platform_neutral={PLATFORM_NEUTRAL_SELECTION}")
+            logger.info(f"NEUTRAL_MODE: pl_v2_weight=0, platform_protect=False")
+            if ranked_clips:
+                logger.info(f"PLATFORM_REC: {ranked_clips[0].get('platform_recommendations', [])[:3]}")
+            
+            # Save guard - never crash on empty clips
+            if not ranked_clips:
+                logger.warning(f"FINAL_SAVE_EMPTY: episode={episode_id}")
+                meta = {
+                    "reason": "empty_after_salvage",
+                    "episode_id": episode_id,
+                    "platform": platform,
+                    "genre": final_genre,
+                    "fallback_mode": episode_fallback_mode,
+                    "eos_density": eos_density,
+                    "candidate_count": 0,
+                    "default_clip_id": None
+                }
+                return [], meta
+            
             # Log final summary with pick trace
+            finals_finished = sum(1 for c in ranked_clips if c.get("finished_thought", False))
+            logger.info(f"PICK_RESULT: finals={len(ranked_clips)}, finals_finished={finals_finished}")
+            
             if ranked_clips:
                 _log_finals_summary(ranked_clips, logger)
                 _log_pick_trace(ranked_clips, logger)

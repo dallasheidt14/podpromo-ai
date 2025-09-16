@@ -255,9 +255,45 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
       
       if (!response.ok) {
         const errorText = await response.text();
-        if (process.env.NODE_ENV === 'development') {
-          console.error('Title generation failed:', response.status, errorText);
+        console.error('Title generation failed:', response.status, errorText);
+        
+        // Retry once for 422 errors (clip not ready)
+        if (response.status === 422) {
+          console.log('Retrying title generation after 422...');
+          await new Promise(resolve => setTimeout(resolve, 1000)); // 1 second delay
+          
+          const retryResponse = await fetch(`http://localhost:8000/api/clips/${clipId}/titles`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              platform: 'shorts',
+              n: 6,
+              allow_emoji: true
+            }),
+            cache: 'no-store',
+          });
+          
+          if (!retryResponse.ok) {
+            const retryErrorText = await retryResponse.text();
+            console.error('Title generation retry failed:', retryResponse.status, retryErrorText);
+            throw new Error(`Title generation failed after retry: ${retryResponse.status}`);
+          }
+          
+          // Use retry response
+          const retryData = await retryResponse.json();
+          setClipTitles(prev => ({
+            ...prev,
+            [clipId]: retryData.variants
+          }));
+          setGeneratingClips(prev => {
+            const newSet = new Set(prev);
+            newSet.delete(clipId);
+            return newSet;
+          });
+          setGenerating(false);
+          return;
         }
+        
         throw new Error(`HTTP ${response.status}: ${errorText}`);
       }
 

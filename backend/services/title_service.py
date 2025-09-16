@@ -4,10 +4,62 @@
 from __future__ import annotations
 import re, math, itertools, hashlib, time
 from collections import Counter
-from typing import List, Dict, Iterable, Tuple, Optional, Set
+from typing import List, Dict, Iterable, Tuple, Optional, Set, Any
 import logging
 
 logger = logging.getLogger("titles_service")
+
+def _extract_text(obj: Any) -> str:
+    """Extract text from various object types (dict, list, string, etc.)"""
+    if obj is None:
+        return ""
+    if isinstance(obj, str):
+        return obj
+    if isinstance(obj, dict):
+        # common shapes
+        if isinstance(obj.get("text"), str):
+            return obj["text"]
+        if "transcript" in obj and isinstance(obj["transcript"], dict):
+            t = obj["transcript"].get("text")
+            if isinstance(t, str):
+                return t
+        # try words → join tokens
+        if isinstance(obj.get("words"), list):
+            toks = []
+            for w in obj["words"]:
+                if isinstance(w, dict):
+                    toks.append(w.get("word") or w.get("w") or "")
+                else:
+                    toks.append(str(w))
+            return " ".join(t for t in toks if t)
+        # segments fallback
+        if isinstance(obj.get("segments"), list):
+            return " ".join((s.get("text") or "") for s in obj["segments"] if isinstance(s, dict))
+        return str(obj)
+    if isinstance(obj, list):
+        parts = []
+        for item in obj:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+            else:
+                parts.append(str(item))
+        return " ".join(parts)
+    return str(obj)
+
+def _looks_like_ad(text) -> bool:
+    """Check if text looks like an advertisement"""
+    t = _extract_text(text).lower()
+    if not t:
+        return False
+    ad_terms = [
+        "only in theaters", "in theaters", "rated r", "from producer",
+        "sponsored by", "use code", "available now", "link in bio",
+        "promo code", "visit", "shop now", "limited time", "free trial",
+        "subscribe", "wayfair", "nordvpn", "squarespace", "raid shadow legends"
+    ]
+    return any(p in t for p in ad_terms)
 
 # Minimal English stopwords (expand if needed)
 STOP = {
@@ -23,8 +75,20 @@ _STOP = set("a an the and or for to in of with over under on at is are was were 
 
 CONTRACTION_FIX = {
     r"\bweve\b": "we've",
-    r"\btheyre\b": "they're",
+    r"\btheyre\b": "they're", 
     r"\btheres\b": "there's",
+    r"\bdoesnt\b": "doesn't",
+    r"\bwont\b": "won't",
+    r"\bcant\b": "can't",
+    r"\bhavent\b": "haven't",
+    r"\bhasnt\b": "hasn't",
+    r"\bhadnt\b": "hadn't",
+    r"\bwouldnt\b": "wouldn't",
+    r"\bshouldnt\b": "shouldn't",
+    r"\bcouldnt\b": "couldn't",
+    r"\bthat that\b": "that",
+    r"\bthe the\b": "the",
+    r"\band and\b": "and",
 }
 
 def _normalize_contractions(s: str) -> str:
@@ -63,7 +127,7 @@ BANNED = re.compile(
     re.I,
 )
 
-BANNED_PHRASES = {"Key Insight", "Key Takeaways", "Inside ", "What It Means"}
+BANNED_PHRASES = {"Key Insight", "Key Takeaways", "Inside ", "What It Means", "What It Really Means", "Explained", "Understanding"}
 
 BAN_PHRASE = re.compile(
     r"\b(appreciate|honored|thanks?|thank you|enjoyed|great to be here|see you|subscribe|like and subscribe)\b",
@@ -127,6 +191,8 @@ def _mine_anchor_phrases(text: str) -> List[str]:
     Example: "Last year, Salem ... went through some major restructuring" -> "Salem Restructuring"
     """
     clean = _clean_text(text)
+    # Also normalize contractions
+    clean = _normalize_contractions(clean)
     # Tokens with original case for simple "proper noun" detection
     toks = re.findall(r"[A-Za-z][A-Za-z'-]*", clean)
     lowers = [t.lower() for t in toks]
@@ -135,7 +201,9 @@ def _mine_anchor_phrases(text: str) -> List[str]:
 
     # Hyphenated terms are already good candidates (e.g., off-label)
     for h in re.findall(r"[A-Za-z]+-[A-Za-z]+", clean):
-        phrases[h.title()] += 2
+        # Filter out contractions in hyphenated terms
+        if not any(contraction in h.lower() for contraction in ["they're", "we're", "you're", "it's", "that's", "there's", "here's", "doesn't", "won't", "can't"]):
+            phrases[h.title()] += 2
 
     # Scan for each anchor and attach nearest proper noun to the left within a small window
     for rx, canon in ANCHORS:
@@ -184,7 +252,9 @@ def _mine_anchor_phrases(text: str) -> List[str]:
                 # drop junk like "Players Anomalies Need" (reduces "Players Anomalies Need" style outputs)
                 if any(w in ("need","because","there","just","some","then","also") for w in gram):
                     continue
-                if not BANNED.search(phrase) and not all(w in STOP for w in gram) and not BAN_PHRASE.search(phrase):
+                # Filter out contractions and common words that aren't good topics
+                if (not BANNED.search(phrase) and not all(w in STOP for w in gram) and not BAN_PHRASE.search(phrase) and
+                    not any(w in ["they're", "we're", "you're", "it's", "that's", "there's", "here's", "doesn't", "won't", "can't"] for w in gram)):
                     phrases[phrase] += 1
 
     # Return top unique phrases in order
@@ -217,13 +287,15 @@ def _title_from_text(text: str) -> str:
     # Prefer descriptive, no "What It Means"
     return " ".join(w.capitalize() for w in key)
 
-def _extract_noun_phrases(text: str) -> list:
+def _extract_noun_phrases(text) -> list:
     """Extract top TF-IDF noun chunks for better fallback titles"""
-    if not text:
+    # Normalize input to string
+    raw_text = _extract_text(text)
+    if not raw_text:
         return []
     
     # Simple noun phrase extraction (enhanced version)
-    words = [w.strip(".,!?\"'():;").lower() for w in text.split()]
+    words = [w.strip(".,!?\"'():;").lower() for w in raw_text.split()]
     words = [w for w in words if w and w not in STOP and len(w) > 2]
     
     # Count frequency for TF-IDF-like scoring
@@ -241,13 +313,15 @@ def _extract_noun_phrases(text: str) -> list:
     scored_phrases.sort(key=lambda x: x[1], reverse=True)
     return [phrase for phrase, _ in scored_phrases[:3]]
 
-def _title_fallback(text: str, platform: str) -> str:
+def _title_fallback(text, platform: str) -> str:
     """Content-aware title fallback with rotation to avoid repetition"""
-    if not text:
+    # Normalize input to string
+    raw_text = _extract_text(text)
+    if not raw_text:
         return "The most overlooked thing about this topic"
     
     # Extract content elements for pattern matching
-    noun_phrases = _extract_noun_phrases(text)
+    noun_phrases = _extract_noun_phrases(raw_text)
     
     # Better topic extraction with RAKE-style heuristic
     if noun_phrases:
@@ -267,7 +341,7 @@ def _title_fallback(text: str, platform: str) -> str:
         topic = "This Topic"
     
     # Content-aware pattern matching
-    t = text.lower()
+    t = raw_text.lower()
     
     # Pattern 1: "don't/stop/avoid/mistake" → "Stop {mistake}. Do {better} instead."
     if any(word in t for word in ["don't", "stop", "avoid", "mistake", "wrong", "bad"]):
@@ -333,12 +407,16 @@ def _extract_keywords(text: str, k: int = 6) -> List[str]:
         return cleaned[:k]
     # fallback to unigram frequency if anchors fail
     clean = _clean_text(text)
+    # Also normalize contractions
+    clean = _normalize_contractions(clean)
     words = re.findall(r"[A-Za-z][A-Za-z'-]{2,}", clean)
     freq = Counter(w.lower() for w in words if w.lower() not in STOP)
     out = []
     for w, _ in freq.most_common(20):
         t = w.title()
-        if BAN_PHRASE.search(t):
+        # Filter out contractions and common words that aren't good topics
+        if (BAN_PHRASE.search(t) or 
+            w.lower() in ["they're", "we're", "you're", "it's", "that's", "there's", "here's", "doesn't", "won't", "can't"]):
             continue
         out.append(t)
         if len(out) >= k:
@@ -357,20 +435,20 @@ def _variants_from_keywords(keys: List[str], platform: str) -> List[str]:
     alts = []
     if platform == "shorts":
         alts = [
-            f"{main_tc}: What It Really Means",
-            f"{main_tc} Explained",
-            f"Why {main_tc} Matters",
+            f"The Truth About {main_tc}",
+            f"Why {main_tc} Actually Works",
+            f"What Everyone Misses About {main_tc}",
             f"{main_tc}: The Real Story",
             f"{main_tc} — Fast Facts",
             f"{main_tc} In Plain English",
         ]
     else:
         alts = [
-            f"{main_tc}: What It Means",
-            f"{main_tc} Explained",
-            f"Inside {main_tc}",
-            f"Why {main_tc} Matters",
-            f"{main_tc}: Key Takeaways",
+            f"The Counterintuitive Truth About {main_tc}",
+            f"Why {main_tc} Matters More Than You Think",
+            f"The {main_tc} Method That Gets Results",
+            f"What {main_tc} Experts Don't Tell You",
+            f"How {main_tc} Really Works",
             f"Understanding {main_tc}",
         ]
     # filter banned & overly long, dedupe
@@ -389,7 +467,7 @@ def _variants_from_keywords(keys: List[str], platform: str) -> List[str]:
 def _safe_fallback(clip_title: str, platform: str) -> List[str]:
     base = clip_title.strip()[:60] if clip_title else "This Moment"
     base = _title_case(base)
-    tail = "Explained" if platform == "shorts" else "What It Means"
+    tail = "The Real Story" if platform == "shorts" else "What You Need to Know"
     return [f"{base}: {tail}"]
 
 # ---------- Title caching & deduplication ----------
@@ -504,6 +582,8 @@ def key_terms(text: str, max_terms: int = 4) -> List[str]:
     
     # Normalize text first
     text = normalize_text(text)
+    # Also normalize contractions
+    text = _normalize_contractions(text)
     
     # Extract words (letters, hyphens, apostrophes)
     words = [w.lower() for w in re.findall(r"[A-Za-z][A-Za-z'-]{1,}", text)]
@@ -610,45 +690,62 @@ TITLE_TEMPLATES = [
     "Why Your Team Struggles (And How to Fix It)",
     "The Feedback Method That Actually Works",
     
-    # Generic fallbacks
-    "The Strategy That Changes Everything",
-    "What Most People Get Wrong",
-    "The Method That Actually Works",
+    # CFD-first fallbacks (no generic spam)
+    "Why {topic} Actually Works",
+    "The {topic} Method That Saves Time", 
+    "What Everyone Misses About {topic}",
 ]
 
 def extract_topic(text: str) -> str:
     """Extract the main topic from text using improved heuristics"""
     if not text:
-        return "Strategy"
+        return "This Topic"
+    
+    # Normalize contractions first
+    normalized_text = _normalize_contractions(text)
     
     # Get key terms using improved extraction
-    terms = key_terms(text, max_terms=6)
+    terms = key_terms(normalized_text, max_terms=6)
     
     if not terms:
-        return "Strategy"
+        return "This Topic"
     
-    # Look for business/leadership terms
-    business_terms = [
+    # Filter out contractions and common words that aren't good topics
+    filtered_terms = []
+    for term in terms:
+        term_lower = term.lower()
+        if (term_lower not in ["they're", "we're", "you're", "it's", "that's", "there's", "here's", "doesn't", "won't", "can't"] and 
+            term_lower not in _STOP and len(term) > 2):
+            filtered_terms.append(term)
+    
+    if not filtered_terms:
+        return "This Topic"
+    
+    # Look for domain-specific terms first
+    domain_terms = [
+        'off-label', 'prescriptions', 'medications', 'healthcare', 'medical', 'doctors', 'patients',
         'strategy', 'leadership', 'team', 'feedback', 'decision', 'problem', 'solution',
         'management', 'communication', 'culture', 'growth', 'innovation', 'change',
         'planning', 'execution', 'performance', 'collaboration', 'trust', 'vision',
         'practice', 'training', 'coaching', 'development', 'improvement', 'skill'
     ]
     
-    # Find the most relevant business term
-    for term in business_terms:
-        if term in [t.lower() for t in terms]:
+    # Find the most relevant domain term
+    for term in domain_terms:
+        if term in [t.lower() for t in filtered_terms]:
             return term.title()
     
-    # Use the first key term as topic
-    return terms[0].title()
+    # Use the first filtered term as topic
+    return filtered_terms[0].title()
 
 def make_titles(text: str) -> List[str]:
     """Generate titles using improved heuristics with real text"""
     if not text:
         return ["Quick Tip", "Coach's Insight", "One Thing Most Players Miss"]
     
-    terms = key_terms(text, max_terms=4)
+    # Normalize contractions first
+    normalized_text = _normalize_contractions(text)
+    terms = key_terms(normalized_text, max_terms=4)
     options = []
     
     if terms:
@@ -676,17 +773,10 @@ def make_titles(text: str) -> List[str]:
     
     return deduped[:6]
 
-# Ad detection markers
-AD_MARKERS = {"sponsored", "brought to you by", "promo code", "use code", "limited time",
-              "shop now", "visit", "link in bio", "terms apply", "free trial", "subscribe",
-              "Wayfair", "NordVPN", "Squarespace", "Raid Shadow Legends"}
-
-def _looks_like_ad(text: str) -> bool:
-    t = text.lower()
-    return any(k.lower() in t for k in AD_MARKERS)
+# Ad detection markers (moved to _looks_like_ad function)
 
 def generate_titles(
-    text: str,
+    text,
     *,
     platform: Optional[str] = None,
     n: int = 4,
@@ -702,12 +792,53 @@ def generate_titles(
     Avoids generic/banned clickbait; returns 6 or a safe fallback.
     """
     
+    # Normalize input to string early
+    raw = _extract_text(text)
+    if not raw.strip():
+        # upstream bug or empty transcript; fail gracefully instead of 500
+        return []
+    
+    # Check for V2 title engine feature flag (default to true)
+    import os
+    if os.getenv("TITLE_ENGINE_V2", "true").lower() == "true":
+        try:
+            from services.title_engine_v2 import generate_titles_v2
+            clip_attrs = {
+                "payoff_ok": True,  # Default to True, can be overridden
+                "entity": None,
+                "domain_topic": None,
+                "keyword": None,
+            }
+            # Add any additional attrs from episode_vocab if available
+            if episode_vocab:
+                clip_attrs.update(episode_vocab)
+            
+            v2_results = generate_titles_v2(
+                text=text,
+                platform=platform,
+                n=n,
+                avoid_titles=avoid_titles,
+                episode_id=episode_id,
+                clip_id=clip_id,
+                start=start,
+                end=end,
+                clip_attrs=clip_attrs,
+            )
+            
+            if v2_results:
+                logger.info(f"TITLE_ENGINE_V2: generated {len(v2_results)} titles")
+                return v2_results
+            else:
+                logger.info("TITLE_ENGINE_V2: no results, falling back to V1")
+        except Exception as e:
+            logger.warning(f"TITLE_ENGINE_V2: failed with {e}, falling back to V1")
+    
     # hard-drop obvious ads from titling
-    if _looks_like_ad(text):
+    if _looks_like_ad(raw):
         return []  # no titles for ads; upstream should already de-prefer these
     
     # Normalize inputs
-    clean_text = normalize_text(text)
+    clean_text = normalize_text(raw)
     platform = normalize_platform(platform)
     avoid_set = set(avoid_titles or [])
     
@@ -778,9 +909,13 @@ def generate_titles(
             # Replace "This Topic" placeholders with topicful text
             sanitized_title = _deplaceholder(sanitized_title, clean_text)
             # also collapse duplicated patterns
-            sanitized_title = sanitized_title.replace(": What It Means", "").replace(": What It Really Means", "")
-            # Normalize contractions
+            sanitized_title = sanitized_title.replace(": What It Means", "").replace(": What It Really Means", "").replace(": Explained", "").replace(": Understanding", "")
+            # Normalize contractions and fix grammar issues
             sanitized_title = _normalize_contractions(sanitized_title)
+            # Fix common grammar issues
+            sanitized_title = re.sub(r'\bthat that\b', 'that', sanitized_title, flags=re.IGNORECASE)
+            sanitized_title = re.sub(r'\bthe the\b', 'the', sanitized_title, flags=re.IGNORECASE)
+            sanitized_title = re.sub(r'\band and\b', 'and', sanitized_title, flags=re.IGNORECASE)
             # Check for banned phrases and rewrite if needed
             for banned in BANNED_PHRASES:
                 if banned.lower() in sanitized_title.lower():

@@ -4,22 +4,50 @@ import numpy as np
 import re
 
 _AD_PATTERNS = [
-    r"\b(use code|promo code|enter code)\b",
-    r"\bvisit\s+[a-z0-9\-]+\.(com|io|ai)\b",
-    r"\b(sponsored|sponsor|brought to you by)\b",
+    r"\b(visit|go to|use code|promo code|sponsored by|brought to you by)\b",
+    r"\b(dot com|\.com|/pricing|/app)\b",
+    r"\b(terms apply|learn more|sign up|limited time)\b",
     r"\b(call|text)\s+\d{3}[-\s]\d{3}[-\s]\d{4}\b",
-    r"\b(start your free trial|sign up today|limited time)\b",
-    r"\b(shop now|click (the )?link|learn more)\b",
+    r"\b(start your free trial|shop now|click (the )?link)\b",
     r"\b(our ai agent|24/7 support|money back guarantee)\b",
 ]
+
+# Brand list for ad detection
+_AD_BRANDS = {
+    "Mint Mobile", "Granger", "Wise", "Shopify", "BetterHelp", "Squarespace", 
+    "NordVPN", "HelloFresh", "Raycon", "SeatGeek", "Audible", "Cash App"
+}
+
+# Product-y phrases
+_AD_PRODUCT_PHRASES = {
+    "fiber blend", "aromatic spices", "formulation", "subscription", 
+    "workspace", "AI platform"
+}
 _AD_RE = re.compile("|".join(_AD_PATTERNS), re.IGNORECASE)
 
 def _ad_like_score(text: str) -> float:
     if not text:
         return 0.0
-    # simple heuristic: matches / (matches + 3) to keep it soft
+    
+    text_lower = text.lower()
+    score = 0.0
+    
+    # Check regex patterns
     m = len(_AD_RE.findall(text))
-    return m / (m + 3)
+    score += m / (m + 3)
+    
+    # Check for brand names
+    brand_matches = sum(1 for brand in _AD_BRANDS if brand.lower() in text_lower)
+    if brand_matches > 0:
+        score += 0.3 * brand_matches
+    
+    # Check for product-y phrases
+    product_matches = sum(1 for phrase in _AD_PRODUCT_PHRASES if phrase.lower() in text_lower)
+    if product_matches > 0:
+        score += 0.2 * product_matches
+    
+    # Cap at 1.0
+    return min(1.0, score)
 
 logger = logging.getLogger(__name__)
 log = logging.getLogger("services.quality_filters")
@@ -564,36 +592,51 @@ def _is_finished_like(cand: dict, *, fallback: bool, tail_close_sec: float = 0.7
     # ft_classifier can be "finished" / "sparse_finished" / "missing"
     ft = (cand.get("ft_classifier") or "").lower()
     if ft in ("finished", "sparse_finished"):
+        cand["finished_thought"] = True
+        cand["finish_reason"] = "ft_classifier"
         return True, "KEEP_FT"
 
     # explicit finished flag from upstream scoring, if present
     if cand.get("finished_thought") is True:
         return True, "KEEP_FLAG_FINISHED"
 
-    # close-tail acceptance: if we stopped within X sec of an EOS/pause
+    # Enhanced finished thought detection
+    text = cand.get("text", "")
+    dur = cand.get("dur", 0.0)
     gap = cand.get("tail_gap_sec")
+    
+    # Log diagnostic info
+    close_to_eos_ms = int((gap or 999.0) * 1000)
+    pause_at_tail_ms = 0  # Would need actual pause detection
+    ended_with_punct = bool(text and text.strip()[-1] in ".?!")
+    
+    logger.debug(f"CLOSE_TO_EOS_MS={close_to_eos_ms}, PAUSE_AT_TAIL_MS={pause_at_tail_ms}, ENDED_WITH_PUNCT_BOOL={ended_with_punct}")
+    
+    # Accept if end is within ≤0.6–0.8s of a strong EOS or pause≥350ms
     if gap is not None and gap <= tail_close_sec:
+        cand["finished_thought"] = True
+        cand["finish_reason"] = "eos_hit"
         return True, "KEEP_TAIL_CLOSE"
     
-    # compute or recompute tail_close by proximity if not precomputed
-    if not gap and fallback:
-        # Check if end is close to EOS boundary
-        end_time = cand.get("end", 0.0)
-        if end_time > 0:
-            # Simple heuristic: check if we're within threshold of a natural pause
-            # This is a simplified version - in practice you'd check against actual EOS times
-            tail_close = (cand.get("tail_gap_sec", 999.0) <= tail_close_sec)
-            if tail_close:
-                return True, "KEEP_TAIL_CLOSE"
-
-    # strong platform fit can forgive slight unfinishedness on longer clips
-    if cand.get("dur", 0.0) >= 21.0 and cand.get("pl_v2", 0.0) >= 0.90:
-        return True, "KEEP_PLATFORM_FIT"
+    # Accept if last token is terminal punct .?! or discourse closer
+    if ended_with_punct:
+        cand["finished_thought"] = True
+        cand["finish_reason"] = "terminal_punct"
+        return True, "KEEP_TERMINAL_PUNCT"
     
-    # Don't drop strong clips that barely miss EOS
-    if (cand.get("payoff_ok") and 
-        cand.get("platform_length_score_v2", 0) >= 0.8 and 
+    # Check for discourse closers
+    discourse_closers = ["and that's why", "so we", "that's why", "which is why", "this is why"]
+    text_lower = text.lower()
+    if any(closer in text_lower for closer in discourse_closers):
+        cand["finished_thought"] = True
+        cand["finish_reason"] = "discourse_closer"
+        return True, "KEEP_DISCOURSE_CLOSER"
+    
+    # Don't drop strong clips that barely miss EOS (platform-neutral)
+    if (cand.get("payoff_ok") and
         gap is not None and gap <= 0.45):
+        cand["finished_thought"] = True
+        cand["finish_reason"] = "close_eos"
         return True, "KEEP_TAIL_CLOSE"
 
     return False, "DROP_UNFINISHED"

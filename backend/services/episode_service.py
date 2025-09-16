@@ -177,6 +177,9 @@ class EpisodeService:
             self.episodes[episode.id] = episode
             logger.info(f"Episode {episode.id} kept in memory")
             
+            # Persist words to disk for transcript building
+            self._save_words_to_disk(episode)
+            
             # Try to save to file (optional)
             try:
                 filepath = os.path.join(self.storage_dir, f"{episode.id}.json")
@@ -195,6 +198,24 @@ class EpisodeService:
                 logger.warning(f"Failed to save episode {episode.id} to file: {file_error}, but kept in memory")
         except Exception as e:
             logger.error(f"Failed to save episode {episode.id}: {e}")
+    
+    def _save_words_to_disk(self, episode: Episode):
+        """Save words data to disk for transcript building"""
+        try:
+            words_data = {
+                "words": getattr(episode, 'words', []),
+                "words_normalized": getattr(episode, 'words_normalized', []),
+                "episode_id": episode.id,
+                "saved_at": datetime.utcnow().isoformat()
+            }
+            
+            words_file = os.path.join(self.storage_dir, f"{episode.id}_words.json")
+            with open(words_file, 'w', encoding='utf-8') as f:
+                json.dump(words_data, f, ensure_ascii=False, indent=2)
+            
+            logger.debug(f"Saved {len(words_data['words'])} words to {words_file}")
+        except Exception as e:
+            logger.warning(f"Failed to save words for episode {episode.id}: {e}")
     
     def _init_whisper(self):
         """Initialize Whisper model"""
@@ -272,11 +293,18 @@ class EpisodeService:
     
     def _attach_words_to_segments(self, episode_words: List[Dict], segments: List) -> None:
         """Attach episode-level words to each segment for local EOS detection"""
+        from services.word_utils import normalize_word_tokens
+        
         if not episode_words or not segments:
+            return
+        
+        # Normalize all words first
+        normalized_words = normalize_word_tokens(episode_words)
+        if not normalized_words:
             return
             
         by_idx = 0
-        n = len(episode_words)
+        n = len(normalized_words)
         
         for segment in segments:
             s_start = segment.start
@@ -284,22 +312,17 @@ class EpisodeService:
             seg_words = []
             
             # Advance pointer to find first word in this segment
-            while by_idx < n and episode_words[by_idx].get('end', 0) <= s_start:
+            while by_idx < n and normalized_words[by_idx].get('e', 0) <= s_start:
                 by_idx += 1
             
             # Collect all words that overlap with this segment
             j = by_idx
-            while j < n and episode_words[j].get('start', 0) < s_end:
-                seg_words.append(episode_words[j])
+            while j < n and normalized_words[j].get('s', 0) < s_end:
+                seg_words.append(normalized_words[j])
                 j += 1
             
-            # Attach words to segment with upstream normalization
-            if not seg_words:
-                segment.words = []          # never None
-            elif not isinstance(seg_words, list):
-                segment.words = list(seg_words) # normalize iterables
-            else:
-                segment.words = seg_words
+            # Attach normalized words to segment
+            segment.words = seg_words if seg_words else []
             
         logger.info(f"Attached words to {len(segments)} segments")
 
@@ -501,6 +524,42 @@ class EpisodeService:
         self._misses += 1
         return None
     
+    def get_or_load_episode(self, episode_id: str, with_words: bool = False) -> Optional[Episode]:
+        """Get episode from cache or load from storage with optional words data"""
+        # Try cache first
+        episode = self.get_episode(episode_id)
+        if episode and (not with_words or hasattr(episode, 'words')):
+            return episode
+        
+        # Load from storage if not in cache
+        try:
+            episode_file = os.path.join(self.storage_dir, f"{episode_id}.json")
+            if os.path.exists(episode_file):
+                with open(episode_file, 'r', encoding='utf-8') as f:
+                    episode_data = json.load(f)
+                
+                # Convert back to Episode object
+                episode = Episode(**episode_data)
+                self.episodes[episode_id] = episode
+                
+                # Load words if requested
+                if with_words:
+                    words_file = os.path.join(self.storage_dir, f"{episode_id}_words.json")
+                    if os.path.exists(words_file):
+                        with open(words_file, 'r', encoding='utf-8') as f:
+                            words_data = json.load(f)
+                        episode.words = words_data.get('words', [])
+                        episode.words_normalized = words_data.get('words_normalized', [])
+                        logger.debug(f"Loaded {len(episode.words)} words for episode {episode_id}")
+                    else:
+                        logger.warning(f"No words file found for episode {episode_id}")
+                
+                return episode
+        except Exception as e:
+            logger.error(f"Failed to load episode {episode_id}: {e}")
+        
+        return None
+    
     async def get_all_episodes(self) -> List[Episode]:
         """Get all episodes"""
         self._ensure_episodes_loaded()
@@ -545,6 +604,16 @@ class EpisodeService:
             # Get file path
             file_path = os.path.join(UPLOAD_DIR, episode.filename)
             
+            # Validate duration before processing (catches trimming issues)
+            from services.duration_validator import assert_reasonable_duration
+            try:
+                duration = assert_reasonable_duration(file_path, min_sec=60)
+                logger.info(f"Duration validation passed: {duration:.2f}s")
+            except Exception as e:
+                logger.error(f"Duration validation failed: {e}")
+                # Continue processing but log the warning
+                duration = 0.0
+            
             # Convert to audio if needed
             tracker.update_stage("audio_processing", 0, "Converting to audio format...")
             write_progress(episode_id, "converting", 1, "Converting to audio format...")
@@ -560,6 +629,12 @@ class EpisodeService:
             write_progress(episode_id, "transcribing", 1, "Transcribing...")
             duration = await self._get_audio_duration(audio_path)
             episode.duration = duration
+            
+            # Normalize word structure before processing
+            from services.word_normalizer import normalize_words
+            if hasattr(episode, 'words') and episode.words:
+                episode.words = normalize_words(episode.words)
+                logger.info(f"Normalized {len(episode.words)} words for episode {episode_id}")
             tracker.update_stage("audio_processing", 100, f"Audio ready - Duration: {duration:.1f}s")
             
             # Transcribe audio with enhanced progress
@@ -572,6 +647,7 @@ class EpisodeService:
             
             # Store transcript in episode
             episode.transcript = transcript
+            
             tracker.update_stage("transcription", 100, f"Transcription completed: {len(transcript)} segments")
             write_progress(episode_id, "transcribing", 95, f"Transcription completed: {len(transcript)} segments")
             
@@ -647,19 +723,126 @@ class EpisodeService:
                 # Save clips to clips.json file for title generation API
                 try:
                     from pathlib import Path
+                    from services.transcript_utils import words_between, words_to_text, words_to_captions, captions_to_vtt
+                    
                     episode_dir = Path(UPLOAD_DIR) / episode_id
                     episode_dir.mkdir(exist_ok=True)
                     clips_file = episode_dir / "clips.json"
                     
-                    # Convert clips to serializable format
+                    # Convert clips to serializable format with exact transcript slicing
                     serializable_clips = []
                     for clip in clips:
+                        # Build exact transcript from words that fall inside [start, end]
+                        start = float(clip.get("start", 0))
+                        end = float(clip.get("end", 0))
+                        
+                        # Get episode words for slicing
+                        episode_words = getattr(episode, 'words', [])
+                        if not episode_words:
+                            # Fallback: try to get words from segments
+                            episode_words = []
+                            for seg in getattr(episode, 'segments', []):
+                                if 'words' in seg and isinstance(seg['words'], list):
+                                    episode_words.extend(seg['words'])
+                        
+                        # Debug: log word data structure
+                        if episode_words:
+                            logger.debug(f"CLIP_TRANSCRIPT: episode has {len(episode_words)} words")
+                            # Check if words have the expected structure
+                            if episode_words and isinstance(episode_words[0], dict):
+                                sample_word = episode_words[0]
+                                logger.debug(f"CLIP_TRANSCRIPT: sample word keys: {list(sample_word.keys())}")
+                                if 'word' not in sample_word or 'start' not in sample_word or 'end' not in sample_word:
+                                    logger.warning(f"CLIP_TRANSCRIPT: word structure missing required keys, using fallback")
+                                    episode_words = []
+                        else:
+                            logger.warning(f"CLIP_TRANSCRIPT: no episode words found for clip {clip.get('id', 'unknown')}")
+                        
+                        # Use exact transcript builder
+                        from services.transcript_builder import build_clip_transcript_exact
+                        
+                        try:
+                            # Create a mock episode object with words data for transcript building
+                            class MockEpisode:
+                                def __init__(self, words_data):
+                                    self.words = words_data
+                                    self.words_normalized = words_data
+                            
+                            mock_episode = MockEpisode(episode_words) if episode_words else episode
+                            
+                            # Build exact transcript for the clip window
+                            clip_text, transcript_source = build_clip_transcript_exact(mock_episode, start, end)
+                            
+                            # Log transcript building
+                            if clip_text:
+                                logger.info("CLIP_TRANSCRIPT: words=%d src=%s (%.2f→%.2f) len=%d id=%s",
+                                           len(clip_text.split()), transcript_source, start, end, len(clip_text), clip.get("id", ""))
+                            else:
+                                logger.debug("CLIP_TRANSCRIPT: source=none (%.2f→%.2f) id=%s",
+                                            start, end, clip.get("id", ""))
+                            
+                            # For backward compatibility, create words array
+                            if transcript_source == "word" and episode_words:
+                                from services.word_utils import slice_transcript, normalize_word_token
+                                words = slice_transcript(episode_words, start, end)
+                                clip_words = [normalize_word_token(w) for w in words]
+                                has_timestamps = all(w.get("start") is not None and w.get("end") is not None for w in clip_words)
+                            else:
+                                # Fallback: synthesize words array
+                                clip_words = [{"word": t, "start": None, "end": None} for t in clip_text.split()[:50]]
+                                has_timestamps = False
+                            
+                            # Convert to transcript utils format for captions
+                            w = []
+                            for word in clip_words:
+                                if word.get("start") is not None and word.get("end") is not None:
+                                    w.append({
+                                        "word": word.get("word", ""),
+                                        "start": word.get("start"),
+                                        "end": word.get("end")
+                                    })
+                            
+                            caps = words_to_captions(w, clip_start=start)
+                            vtt = captions_to_vtt(caps)
+                            
+                        except Exception as e:
+                            logger.error(f"CLIP_TRANSCRIPT: failed to slice words for clip {clip.get('id', 'unknown')}: {e}")
+                            # Fallback to empty transcript
+                            clip_text = "[Transcript unavailable]"
+                            clip_words = []
+                            has_timestamps = False
+                            transcript_source = "error"
+                            caps = []
+                            vtt = "WEBVTT\n\n"
+                        
+                        # Create serializable clip with exact transcript data
                         serializable_clip = {}
                         for key, value in clip.items():
                             if isinstance(value, (str, int, float, bool, list, dict, type(None))):
                                 serializable_clip[key] = value
                             else:
                                 serializable_clip[key] = str(value)
+                        
+                        # Add exact transcript data (always use actual start/end, never display jitter)
+                        serializable_clip["actual_start"] = start
+                        serializable_clip["actual_end"] = end
+                        serializable_clip["actual_duration"] = round(end - start, 3)
+                        
+                        # Use new transcript structure
+                        serializable_clip["transcript"] = {
+                            "text": clip_text,
+                            "words": clip_words,  # ALWAYS present
+                            "has_timestamps": has_timestamps,
+                            "source": transcript_source
+                        }
+                        
+                        # Add exact transcript for UI (matches audio window precisely)
+                        serializable_clip["transcript"] = clip_text
+                        serializable_clip["transcript_source"] = transcript_source
+                        serializable_clip["transcript_char_count"] = len(clip_text)
+                        serializable_clip["captions"] = caps
+                        serializable_clip["vtt"] = vtt
+                        
                         serializable_clips.append(serializable_clip)
                     
                     with open(clips_file, 'w', encoding='utf-8') as f:
@@ -1096,17 +1279,19 @@ class EpisodeService:
             if word_count < 500:  # short ep threshold; use 1500–3000 for long eps
                 logger.warning(f"EOS_SPARSE: word_count={word_count} too low; enabling fallback mode")
             
-            # Store word data in episode for EOS index building
+            # Store word data in episode for transcript slicing
             episode = await self.get_episode(episode_id)
             if episode:
-                episode.words = all_words
-                episode.word_count = word_count
-                
-                # Store raw episode text with punctuation intact for EOS
+                # Normalize word structure before storing
+                from services.word_normalizer import normalize_words
+                normalized_words = normalize_words(all_words)
+                episode.words = normalized_words
+                episode.word_count = len(normalized_words)
                 episode.raw_text = " ".join([seg.text for seg in segments_list])
                 
-                # Attach words to segments for local EOS detection
-                self._attach_words_to_segments(all_words, segments_list)
+                # Attach normalized words to segments for local EOS detection
+                self._attach_words_to_segments(normalized_words, segments_list)
+                logger.info(f"Normalized {len(normalized_words)} words for episode {episode_id}")
                 
                 self._save_episode(episode)
             

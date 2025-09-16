@@ -2,12 +2,16 @@
 from __future__ import annotations
 
 import time
+import hashlib
+import logging
 from typing import List, Optional, Literal, Dict, Any
 from pathlib import Path
 
 from fastapi import APIRouter, Header, HTTPException, Depends, status
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field, conint, confloat, field_validator, model_validator
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/episodes", tags=["clips"])
 
@@ -324,3 +328,52 @@ def get_clips(ep_id: str):
     
     clips = _load_clips(ep_id)
     return {"ok": True, "ready": True, "clips": clips}
+
+@router.get("/api/clips/{clip_id}/transcript")
+def get_clip_transcript(clip_id: str):
+    """Get exact transcript for a clip, building on-demand if needed"""
+    from services.episode_service import EpisodeService
+    from services.transcript_builder import build_clip_transcript_exact
+    
+    # Get episode service
+    episode_service = EpisodeService()
+    
+    # Find the clip and its episode
+    clip = None
+    episode = None
+    
+    # Search through all episodes to find the clip
+    episodes = episode_service.episodes
+    for ep in episodes.values():
+        if hasattr(ep, 'clips') and ep.clips:
+            for c in ep.clips:
+                if c.get('id') == clip_id:
+                    clip = c
+                    episode = ep
+                    break
+        if clip:
+            break
+    
+    if not clip or not episode:
+        raise HTTPException(404, "Clip not found")
+
+    # Prefer saved transcript; otherwise build on the fly
+    txt = clip.get("transcript", "")
+    src = clip.get("transcript_source", "")
+    
+    if not txt:
+        txt = build_clip_transcript_exact(episode, float(clip["start"]), float(clip["end"]))
+        src = "rebuilt" if txt else "none"
+
+    payload = {
+        "transcript": txt,
+        "source": src or ("persisted" if clip.get("transcript") else ("rebuilt" if txt else "none")),
+        "charCount": len(txt),
+        "start": float(clip["start"]),
+        "end": float(clip["end"]),
+    }
+
+    etag = hashlib.md5(txt.encode("utf-8")).hexdigest()
+    resp = JSONResponse(payload)
+    resp.headers["ETag"] = etag
+    return resp

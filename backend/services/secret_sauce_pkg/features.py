@@ -323,6 +323,53 @@ def compute_virality(seg: dict, start_s: float, end_s: float, pl_v2: float, flag
     
     return virality
 
+def compute_v_core(seg: dict, start_s: float, end_s: float) -> float:
+    """
+    Platform-neutral core virality for selection ranking.
+    V_core = 0.26*hook + 0.20*arousal + 0.17*payoff + 0.11*info + 0.09*ql + 0.05*loop + 0.04*q_list
+    NO platform terms here - used for ranking before platform recommendations.
+    """
+    dur = max(0.1, end_s - start_s)
+    finished = bool(seg.get("finished_thought"))
+    
+    # Guard rails: default to 0.0 if missing
+    hook = getattr(seg, "hook", 0.0) or 0.0
+    arous = getattr(seg, "arous", 0.0) or 0.0
+    payoff = getattr(seg, "payoff", 0.0) or 0.0
+    info = getattr(seg, "info", 0.0) or 0.0
+    ql = getattr(seg, "ql", 0.0) or 0.0
+    q_list = getattr(seg, "q_list", 0.0) or 0.0
+    loop = getattr(seg, "loop", 0.0) or 0.0
+    
+    # Conditional terms to prevent clickbait
+    payoff_ok = bool(seg.get("payoff_ok"))
+    q_list_term = 0.04*q_list if payoff_ok else -0.01*q_list
+    loop_term = 0.05*loop if finished else 0.0
+    
+    # Core virality (platform-agnostic)
+    v_core = (
+        0.26 * hook +
+        0.20 * arous +
+        0.17 * payoff +
+        0.11 * info +
+        0.09 * ql +
+        q_list_term +
+        loop_term
+    )
+    
+    # Demotion for weak medium/long clips
+    if dur >= 16.0 and payoff < 0.30:
+        v_core -= 0.15 * (0.30 - payoff)
+    
+    # Strong finish bonus
+    v_core += 0.12 if dur >= 20.0 and finished else (0.08 if finished else 0.0)
+    
+    # Ultra-short guard
+    if dur <= 10.0 and (hook < 0.92 or payoff < 0.60):
+        v_core -= 0.50
+    
+    return v_core
+
 def _utility_for_end(seg: dict, start_s: float, end_s: float, pl_v2: float) -> float:
     """
     Utility balances virality, platform fit, and finishing at EOS.
@@ -470,8 +517,8 @@ def _variantize_segment(seg, *, pl_v2: float, cap_s: float, eos_times: list[floa
     start = seg.get("start", 0.0)
     words = seg.get("words", [])
     
-    # Enumerate EOS-clean finishes at targets {12,16,20,24,30,36,44,60,75,90}
-    targets = [12, 16, 20, 24, 30, 36, 44, 60, 75, 90]
+    # Enumerate EOS-clean finishes at targets from LENGTH_SEARCH_BUCKETS
+    targets = LENGTH_SEARCH_BUCKETS
     variants = []
     
     for target in targets:
@@ -526,6 +573,14 @@ def build_variants(segments, pl_v2, cap_s, eos_times=None, *args, **kwargs):
         v = _variantize_segment(seg, pl_v2=pl_v2, cap_s=cap_s, eos_times=eos_times)
         out.append(v)
     return out
+
+# Length Search Configuration
+LENGTH_SEARCH_BUCKETS = [8, 12, 18, 23, 30, 35, 45, 60, 75, 90]
+LENGTH_MAX_HARD = 90.0
+PLATFORM_NEUTRAL_SELECTION = True
+FINISHED_THOUGHT_REQUIRED = True
+SALVAGE_MAX_EXTEND_S = 8.0
+SALVAGE_MODE = "punct_or_boundary_to_EOS"
 
 # Finish-Thought Gate Configuration
 FINISH_THOUGHT_CONFIG = {
@@ -1032,10 +1087,10 @@ def finalize_variant_text(v, segments_list):
 def choose_variant(base: dict, variants: list, audio_file: str, genre: str, platform: str, eos_times: list = None, word_end_times: list = None, fallback_mode: bool = None, ft: FTTracker = None) -> dict:
     """Choose the best variant by re-scoring and comparing with payoff-aware selection"""
     
-    # Platform-specific constraints
+    # Platform-neutral constraints (true dynamic discovery)
     MIN_DUR = 7.5  # Hard floor for any short clip
-    MAX_DUR = 59.0 if platform in ["youtube", "youtube_shorts"] else 30.0  # Platform cap
-    ALLOWED_DURS = [8, 12, 18, 21, 30]  # Preferred duration buckets
+    MAX_DUR = LENGTH_MAX_HARD  # 90.0s hard cap for all platforms
+    ALLOWED_DURS = LENGTH_SEARCH_BUCKETS  # Use full search range
     
     # Always have a seed label
     seed = (base.get("id") or base.get("seed_id") or 
@@ -1110,14 +1165,60 @@ def choose_variant(base: dict, variants: list, audio_file: str, genre: str, plat
     # Payoff-aware variant selection
     def pick_best_variant(variants):
         def vscore(v):
-            payoff = v.get('payoff_score', 0.0)
-            pl_v2 = v.get('platform_length_score_v2', v.get('platform_len_match', 0.0))
-            # Payoff-aware scoring: nudge toward variants that actually deliver
-            return pl_v2 + 0.20 * min(payoff, 0.5)  # up to +0.10 bonus
+            if PLATFORM_NEUTRAL_SELECTION:
+                # Platform-neutral scoring using V_core
+                start_s = v.get('start', 0)
+                end_s = v.get('end', 0)
+                return compute_v_core(v, start_s, end_s)
+            else:
+                # Legacy platform-aware scoring
+                payoff = v.get('payoff_score', 0.0)
+                pl_v2 = v.get('platform_length_score_v2', v.get('platform_len_match', 0.0))
+                return pl_v2 + 0.20 * min(payoff, 0.5)
         
-        # Prefer better payoff; tie-break by longer dur (smoother endings)
-        return sorted(variants, key=lambda v: (round(vscore(v), 3),
-                                               round(v.get('end', 0) - v.get('start', 0), 2)))[-1]
+        # Neutral variant policy: prefer longer/EOS, only shorten when clean closure exists
+        def choose_variant_neutral(base_len, variants):
+            # Sort by V_core score first
+            scored_variants = [(v, vscore(v)) for v in variants]
+            scored_variants.sort(key=lambda x: -x[1])
+            
+            # Prefer variants that end at EOS
+            eos_variants = [v for v, score in scored_variants if v.get('finished_thought', False)]
+            if eos_variants:
+                chosen = eos_variants[0]
+                logger.debug(f"VARIANT_DECISION: base={base_len:.1f}, chosen={chosen.get('end', 0) - chosen.get('start', 0):.1f}, reason=EOS")
+                return chosen
+            
+            # Prefer longer variants (round up to next bucket)
+            base_dur = base_len
+            longer_variants = [v for v, score in scored_variants 
+                             if (v.get('end', 0) - v.get('start', 0)) >= base_dur]
+            if longer_variants:
+                chosen = longer_variants[0]
+                logger.debug(f"VARIANT_DECISION: base={base_len:.1f}, chosen={chosen.get('end', 0) - chosen.get('start', 0):.1f}, reason=UP_BUCKET")
+                return chosen
+            
+            # Only shorten if there's a natural sentence end and higher payoff
+            shorter_variants = [v for v, score in scored_variants 
+                              if (v.get('end', 0) - v.get('start', 0)) < base_dur and 
+                                 v.get('finished_thought', False) and
+                                 v.get('payoff_score', 0) > base.get('payoff_score', 0) + 0.1]
+            if shorter_variants:
+                chosen = shorter_variants[0]
+                logger.debug(f"VARIANT_DECISION: base={base_len:.1f}, chosen={chosen.get('end', 0) - chosen.get('start', 0):.1f}, reason=SHORT_EOS")
+                return chosen
+            
+            # Fallback to highest scoring
+            chosen = scored_variants[0][0]
+            logger.debug(f"VARIANT_DECISION: base={base_len:.1f}, chosen={chosen.get('end', 0) - chosen.get('start', 0):.1f}, reason=FALLBACK")
+            return chosen
+        
+        if PLATFORM_NEUTRAL_SELECTION:
+            base_len = base.get('end', 0) - base.get('start', 0)
+            return choose_variant_neutral(base_len, variants)
+        else:
+            # Legacy behavior
+            return sorted(variants, key=lambda v: -vscore(v))[0]
     
     # Apply cliffhanger guard to all variants
     for v in scored:
@@ -4266,8 +4367,16 @@ def build_eos_index(segments: List[Dict], episode_words: List[Dict] = None, epis
             eos_source = "segment_boundary"
             logger.info(f"EOS from segment boundaries: {len(seg_boundary_eos)} markers")
     
+    # Build word_end_times from available words (do this early for gap fallback)
+    all_words = episode_words or []
+    if not all_words:
+        for segment in segments:
+            words = segment.get('words', [])
+            if words:
+                all_words.extend(words)
+    
     # 5) Gap-based fallback: synthesize EOS from timing gaps when punctuation is sparse
-    if len(eos_times) < _EOS_MIN_COUNT or (word_end_times and len(eos_times) / max(len(word_end_times), 1) < _EOS_MIN_DENSITY):
+    if len(eos_times) < _EOS_MIN_COUNT or (all_words and len(eos_times) / max(len(all_words), 1) < _EOS_MIN_DENSITY):
         gap_eos = []
         # Walk segment boundaries and add EOS where gaps are large enough
         for i in range(len(segments) - 1):
@@ -4294,14 +4403,6 @@ def build_eos_index(segments: List[Dict], episode_words: List[Dict] = None, epis
             eos_times.update(filtered_gap_eos)
             eos_source = "gap_fallback"
             logger.warning(f"EOS_FALLBACK_GAPS: added {len(filtered_gap_eos)} gap-derived markers (now {len(eos_times)} total)")
-    
-    # Build word_end_times from available words
-    all_words = episode_words or []
-    if not all_words:
-        for segment in segments:
-            words = segment.get('words', [])
-            if words:
-                all_words.extend(words)
     
     for word in all_words:
         word_end_times.append(word.get('end', 0))
