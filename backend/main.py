@@ -98,33 +98,15 @@ async def global_exception_handler(request: Request, exc: Exception):
         }
     )
 
-# ---- CORS (dev-friendly, strict in prod) -------------------------------------
-def _normalize_origins(csv: str):
-    raw = [o.strip() for o in (csv or "").split(",") if o.strip()]
-    ok = []
-    for o in raw:
-        if o.startswith(("http://", "https://")) and urlparse(o).netloc:
-            ok.append(o.rstrip("/"))
-    return ok
-
-ENV = os.getenv("ENVIRONMENT", "development").lower()
-cors = _normalize_origins(os.getenv("CORS_ORIGINS", ""))
-if ENV != "production":
-    # sensible defaults for local dev if nothing provided
-    if not cors:
-        cors = [
-            "http://localhost:3000", "http://127.0.0.1:3000",
-            "http://localhost:5173", "http://127.0.0.1:5173",
-        ]
-elif not cors:
-    cors = ["https://yourdomain.com"]  # TODO: set your real prod origin(s)
+# ---- CORS (environment-driven, strict in prod) -------------------------------------
+from config.settings import CORS_ORIGINS, MAX_FILE_SIZE
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=cors,
-    allow_credentials=False,  # set True only if you actually use cookies
-    allow_methods=["GET", "POST", "OPTIONS", "HEAD"],
-    allow_headers=["content-type", "authorization"],
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=True,  # Enable for JWT auth
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
+    allow_headers=["*"],
 )
 
 # Add content-type validation middleware (scoped to /api/upload only)
@@ -180,10 +162,15 @@ async def preview_cache_headers(request, call_next):
     
     return resp
 
-# Mount static directories using config
-from config.settings import UPLOAD_DIR, OUTPUT_DIR, MAX_FILE_SIZE
-app.mount("/files", StaticFiles(directory=UPLOAD_DIR), name="files")
-app.mount("/clips", StaticFiles(directory=OUTPUT_DIR), name="clips")
+# Import secure routers
+from routes.downloads import router as downloads_router
+from routes.secure_uploads import router as uploads_router
+
+app.include_router(downloads_router)
+app.include_router(uploads_router)
+
+# Note: Removed public static file mounts for security
+# Use /api/signed-download and /api/download/ endpoints with authentication instead
 
 # Process pool for CPU-intensive scoring (feature flag)
 USE_POOL = bool(int(os.getenv("SCORING_PROCESS_POOL", "0")))
@@ -629,7 +616,13 @@ async def log_choice(choice_data: Dict):
 # Main API endpoints
 @app.post("/api/upload")
 @limiter.limit(_FILE_LIMIT)
-async def upload_episode(file: UploadFile = File(...), background_tasks: BackgroundTasks = None, request: Request = None):
+async def upload_episode(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...), 
+    request: Request = None
+    # TODO: Add auth dependency when JWT is configured
+    # user = Depends(require_user_dev)
+):
     """Upload and process a podcast episode"""
     try:
         # Import progress writer
@@ -673,9 +666,11 @@ async def upload_episode(file: UploadFile = File(...), background_tasks: Backgro
                 if not validation_result["valid"]:
                     raise HTTPException(status_code=400, detail=validation_result["error"])
             except Exception as e:
-                logger.warning(f"File validation failed, continuing anyway: {e}")
+                logger.error(f"File validation failed: {e}")
+                raise HTTPException(status_code=400, detail=f"File validation failed: {str(e)}")
         else:
-            logger.warning("FileManager not available, skipping file validation")
+            logger.error("FileManager not available - file validation required")
+            raise HTTPException(status_code=503, detail="File validation service not available")
         
         # Create episode and start processing
         episode_id = str(uuid.uuid4())
@@ -728,8 +723,8 @@ class UploadYouTubeResponse(BaseModel):
 @app.post("/api/upload-youtube", response_model=UploadYouTubeResponse)
 @limiter.limit(_YT_LIMIT)
 async def upload_youtube_episode(
+    background_tasks: BackgroundTasks,
     url: str = Form(...),
-    background_tasks: BackgroundTasks = None,
     request: Request = None
 ):
     """Upload and process a YouTube video as a podcast episode"""

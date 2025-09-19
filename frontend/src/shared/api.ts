@@ -29,6 +29,12 @@ export interface TitleSetRequest {
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE || 'http://localhost:8000';
 export const apiUrl = (path: string) => `${API_BASE}${path}`;
 
+// Get auth token from localStorage (for signed URLs)
+const getAuthToken = (): string => {
+  if (typeof window === 'undefined') return '';
+  return localStorage.getItem('token') || '';
+};
+
 // =============================
 // Safe Fetch Utilities (global)
 // =============================
@@ -361,4 +367,43 @@ export async function saveTitles(clipId: string, platform: string, titles: strin
     })
   });
   return r;
+}
+
+// =============================
+// Signed URL Functions (Security)
+// =============================
+
+export interface SignedUrlResponse {
+  url: string;
+  expires_at: number;
+  expires_in: number;
+}
+
+export async function getSignedDownload(
+  area: "uploads" | "clips", 
+  name: string, 
+  ttl: number = 300
+): Promise<ApiResult<SignedUrlResponse>> {
+  const token = getAuthToken();
+  const r = await getJson<SignedUrlResponse>(apiUrl(`/api/signed-download?area=${area}&name=${encodeURIComponent(name)}&ttl=${ttl}`), {
+    headers: { 
+      'Authorization': `Bearer ${token}`,
+      'Cache-Control': 'no-store'
+    }
+  });
+  return r;
+}
+
+export function downloadFile(signedUrl: string): void {
+  // Open the signed URL in a new tab/window for download
+  window.open(`${API_BASE}${signedUrl}`, '_blank');
+}
+
+export async function downloadFileWithSignedUrl(area: "uploads" | "clips", name: string): Promise<void> {
+  const result = await getSignedDownload(area, name);
+  if (result.success) {
+    downloadFile(result.data.url);
+  } else {
+    throw new Error(`Failed to get signed URL: ${result.error}`);
+  }
 }

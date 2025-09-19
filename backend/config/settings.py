@@ -20,9 +20,9 @@ CLIPS_DIR = os.getenv("CLIPS_DIR", str(Path(OUTPUT_DIR) / "clips"))
 SAMPLE_RATE = 16000  # Hz
 WHISPER_LANGUAGE = "en"  # Language for Whisper transcription
 
-# File settings
-MAX_FILE_SIZE = 500 * 1024 * 1024  # 500MB
-ALLOWED_EXTENSIONS = {".mp3", ".wav", ".m4a", ".flac", ".aac"}
+# File settings - now configurable via environment
+MAX_FILE_SIZE = int(os.getenv("MAX_FILE_BYTES", "524288000"))  # 500MB default
+ALLOWED_EXTENSIONS = {".mp3", ".wav", ".m4a", ".flac", ".aac", ".mp4"}
 
 # Progress tracking settings
 PROGRESS_TRACKER_TTL = 300  # 5 minutes in seconds
@@ -33,9 +33,19 @@ WHISPER_MODEL = "base"  # Model size: tiny, base, small, medium, large
 # Database settings
 DATABASE_URL = os.getenv("DATABASE_URL", "supabase")
 
+# Security settings
+SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-key-change-in-production")
+
 # API settings
 API_PREFIX = "/api"
-CORS_ORIGINS = ["http://localhost:3000", "http://127.0.0.1:3000"]
+
+# CORS settings - environment-driven
+import json
+ENV = os.getenv("ENV", "dev")
+if ENV == "production":
+    CORS_ORIGINS = json.loads(os.getenv("CORS_ORIGINS_JSON", '["https://app.yourdomain.com"]'))
+else:
+    CORS_ORIGINS = json.loads(os.getenv("CORS_ORIGINS_JSON", '["http://localhost:3000", "http://127.0.0.1:3000"]'))
 
 # Monitoring settings
 METRICS_INTERVAL = 60  # seconds

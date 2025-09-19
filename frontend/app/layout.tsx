@@ -1,6 +1,7 @@
 import type { Metadata } from 'next';
 import { Inter } from 'next/font/google';
 import './globals.css';
+import ErrorBoundary from '../src/components/ErrorBoundary';
 
 const inter = Inter({ subsets: ['latin'] });
 
@@ -16,7 +17,9 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   return (
     <html lang="en">
       <body className="min-h-screen bg-gradient-to-b from-slate-50 to-white text-neutral-900 antialiased">
-        <main className="mx-auto max-w-6xl px-4 py-8">{children}</main>
+        <ErrorBoundary>
+          <main className="mx-auto max-w-6xl px-4 py-8">{children}</main>
+        </ErrorBoundary>
       </body>
     </html>
   );
