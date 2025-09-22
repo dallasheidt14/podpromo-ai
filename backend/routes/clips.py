@@ -386,7 +386,7 @@ def get_clip_words(clip_id: str, format: str = "duration"):
     Use ?format=range for {t0, t1, w} compatibility
     """
     from services.episode_service import EpisodeService
-    from services.transcript_builder import slice_words_by_time
+    from services.transcript_builder import build_words_for_clip
 
     svc = EpisodeService()
     clip, episode = None, None
@@ -402,22 +402,34 @@ def get_clip_words(clip_id: str, format: str = "duration"):
         raise HTTPException(404, "Clip or words not found")
 
     start, end = float(clip["start"]), float(clip["end"])
-    words = slice_words_by_time(episode.words, start, end, pad_s=0.25)
+    words = build_words_for_clip(episode.words, start, end)
     
     if format == "range":
-        # Legacy format for compatibility
+        # Legacy format for compatibility, clip-relative
         payload = {
-            "start": int(round(start * 1000)),
-            "end": int(round(end * 1000)),
-            "words": [{"t0": int(round(w.get("start",0.0) * 1000)), "t1": int(round(w.get("end",0.0) * 1000)), "w": w.get("text","")} for w in words]
+            "start": 0,
+            "end": int(round((end - start) * 1000)),
+            "words": [
+                {
+                    "t0": int(round(w["t"] * 1000)),
+                    "t1": int(round((w["t"] + w["d"]) * 1000)),
+                    "w": w["w"]
+                }
+                for w in words
+            ]
         }
     else:
-        # Default format: {t, d, w}
+        # Default format: {t, d, w} with clip-relative, clipped durations
         payload = {
             "clipId": clip_id,
-            "start": start, "end": end,
+            "start": start,
+            "end": end,
             "words": [
-                {"t": float(w.get("start",0.0)), "d": float(w.get("dur", w.get("end",0.0)-w.get("start",0.0))), "w": w.get("text","")}
+                {
+                    "t": w["t"],
+                    "d": w["d"],
+                    "w": w["w"]
+                }
                 for w in words
             ]
         }

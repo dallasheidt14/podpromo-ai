@@ -8,6 +8,108 @@ from services.title_service import generate_titles
 
 logger = logging.getLogger(__name__)
 
+def _as_strings(variants):
+    """Convert variants to list of strings, handling both str and dict formats"""
+    out = []
+    for v in variants or []:
+        if isinstance(v, str):
+            out.append(v)
+        elif isinstance(v, dict) and v.get("title"):
+            out.append(v["title"])
+    return out
+
+def _normalize_variants(variants):
+    """Normalize variants to list of strings, handling both str and dict formats"""
+    if not variants:
+        return []
+    if isinstance(variants, list) and variants and isinstance(variants[0], dict) and "title" in variants[0]:
+        return [d["title"] for d in variants if isinstance(d, dict) and "title" in d]
+    return [str(x) for x in variants]
+
+def _normalize_title_variants(variants):
+    """
+    Accepts list[str] or list[dict], returns list[dict] with {"title": str}.
+    Ignores empty/None items.
+    """
+    out = []
+    if not variants:
+        return out
+    for v in variants:
+        if isinstance(v, str):
+            t = v.strip()
+            if t:
+                out.append({"title": t})
+        elif isinstance(v, dict):
+            t = v.get("title") or v.get("text") or v.get("t")
+            if t:
+                out.append({"title": str(t).strip()})
+    # de-dup case-insensitively
+    seen = set()
+    deduped = []
+    for d in out:
+        k = "".join(ch for ch in d["title"].lower() if ch.isalnum())
+        if k in seen:
+            continue
+        seen.add(k)
+        deduped.append(d)
+    return deduped
+
+def _fallback_title(txt: str) -> str:
+    """Safe fallback title when generation fails"""
+    t = " ".join(txt.split())
+    # keep it punchy
+    if len(t) > 80:
+        t = t[:80].rstrip(" ,;:.!-")
+    return t or "Untitled Clip"
+
+def _tfidf_embed(texts):
+    """Create TF-IDF embeddings for semantic similarity"""
+    from collections import Counter
+    import math, re
+    docs = [Counter(re.findall(r"[a-z0-9]+", t.lower())) for t in texts]
+    df = Counter()
+    for d in docs: df.update(d.keys())
+    N = len(texts)
+    vecs = []
+    for d in docs:
+        denom = float(sum(d.values()) or 1)
+        v = {}
+        for w,c in d.items():
+            idf = math.log((N+1)/(1+df[w])) + 1.0
+            v[w] = (c/denom) * idf
+        vecs.append(v)
+    return vecs
+
+def _cos(a,b):
+    """Cosine similarity between two vectors"""
+    from math import sqrt
+    common = set(a) & set(b)
+    num = sum(a[w]*b[w] for w in common)
+    da = sqrt(sum(x*x for x in a.values())); db = sqrt(sum(x*x for x in b.values()))
+    return 0.0 if da==0 or db==0 else (num/(da*db))
+
+def diversify_titles_across_episode(cands: list[dict], lam: float = 0.75):
+    """
+    cands: finalists with 'title' and 'rank_score' (or display_score)
+    Reorder to maximize diversity of titles across the set.
+    """
+    if len(cands) < 2: return cands
+    titles = [c.get("title","") for c in cands]
+    E = _tfidf_embed(titles)
+    selected = [0]  # assume the list is already relevance-sorted
+    remain = list(range(1, len(cands)))
+    while remain:
+        best_i, best_val = None, -1e9
+        for i in remain:
+            rel = cands[i].get("rank_score", cands[i].get("display_score", 0.0))
+            sim = max(_cos(E[i], E[j]) for j in selected) if selected else 0.0
+            mmr = lam*rel - (1.0-lam)*sim
+            if mmr > best_val:
+                best_i, best_val = i, mmr
+        selected.append(best_i)
+        remain.remove(best_i)
+    return [cands[i] for i in selected]
+
 # helper to read numeric fields safely
 def _num(d, key, default=0.0):
     v = d.get(key)
@@ -209,6 +311,8 @@ def format_candidates(
             episode_id=episode_id,
             clip_id=clip_id
         )
+        # Normalize variants to handle both List[str] and List[dict] returns
+        variants = _normalize_title_variants(variants)
         title = variants[0]["title"] if variants else "Most Leaders Solve the Wrong Problem"
         # remember to avoid repeats for later clips in the same episode
         key = re.sub(r"[^a-z0-9]+","", title.lower())
@@ -238,13 +342,17 @@ def format_candidates(
         logger.debug(f"DEBUG: backend_platform={backend_platform}, type={type(backend_platform)}")
         logger.debug(f"DEBUG: start_time={start_time}, end_time={end_time}, type(start)={type(start_time)}")
         
-        title = _pick_title_for_candidate(
-            txt=display_text, 
-            platform=backend_platform, 
-            clip_id=clip_id, 
-            start=start_time, 
-            end=end_time
-        )
+        try:
+            title = _pick_title_for_candidate(
+                txt=display_text, 
+                platform=backend_platform, 
+                clip_id=clip_id, 
+                start=start_time, 
+                end=end_time
+            )
+        except Exception as e:
+            logger.exception("TITLE_PICK_FAIL: %s", e)
+            title = _fallback_title(display_text)
         
         # Optional: attach variants for UI (if needed later)
         # candidate["title_variants"] = titles
@@ -277,13 +385,17 @@ def format_candidates(
         # Debug: Log what text is being used for title generation
         logger.debug(f"TITLE_GEN_DEBUG: episode={episode_id}, clip={clip_id}, using_transcript={bool(full_transcript)}, text_len={len(title_text)}, text_preview='{title_text[:100]}...'")
         
-        title = _pick_title_for_candidate(
-            txt=title_text, 
-            platform=backend_platform, 
-            clip_id=clip_id, 
-            start=start_time, 
-            end=end_time
-        )
+        try:
+            title = _pick_title_for_candidate(
+                txt=title_text, 
+                platform=backend_platform, 
+                clip_id=clip_id, 
+                start=start_time, 
+                end=end_time
+            )
+        except Exception as e:
+            logger.exception("TITLE_PICK_FAIL: %s", e)
+            title = _fallback_title(title_text)
         
         # Apply hook honesty cap in fallback mode
         # Check if we're in fallback mode and if this clip has unfinished_tail_penalty
@@ -346,4 +458,8 @@ def format_candidates(
             "Platform Match": enhanced_candidate.get("platform_length_score_v2", enhanced_candidate.get("platform_len_match", 0.0)) * 100,
         }
         candidates.append(candidate)
+    
+    # Apply title diversity across the episode to break repeats
+    candidates = diversify_titles_across_episode(candidates, lam=0.75)
+    
     return candidates

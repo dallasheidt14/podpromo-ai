@@ -41,6 +41,48 @@ PREVIEW_FS_DIR = os.getenv("PREVIEW_FS_DIR", str(Path(OUTPUT_DIR) / "previews"))
 PREVIEW_SIGNING_KEY = os.getenv("PREVIEW_SIGNING_KEY", SECRET_KEY)  # Use SECRET_KEY as fallback
 PREVIEW_URL_TTL_SECONDS = int(os.getenv("PREVIEW_URL_TTL_SECONDS", "600"))  # 10 minutes
 
+# Clip length bounds (hard limits)
+CLIP_LEN_MIN = float(os.getenv("CLIP_LEN_MIN", "8.0"))
+CLIP_LEN_MAX = float(os.getenv("CLIP_LEN_MAX", "90.0"))
+
+# Soft relax settings for empty results
+FT_SOFT_RELAX_ON_ZERO = int(os.getenv("FT_SOFT_RELAX_ON_ZERO", "1"))
+FT_SOFT_RELAX_TOPK = int(os.getenv("FT_SOFT_RELAX_TOPK", "3"))
+
+# Ad detection and filtering
+ALLOW_ADS = int(os.getenv("ALLOW_ADS", "0"))  # block ads by default
+AD_SIG_MIN = float(os.getenv("AD_SIG_MIN", "0.50"))  # >= 0.50 → ad=True
+
+# Hook score clamping
+HOOK_AD_CLAMP_MIN = float(os.getenv("HOOK_AD_CLAMP_MIN", "0.40"))  # if ad_likelihood >= this, clamp hook
+HOOK_AD_CLAMP = float(os.getenv("HOOK_AD_CLAMP", "0.30"))  # clamp hook to this max
+REP_WINDOW_CHARS = int(os.getenv("REP_WINDOW_CHARS", "200"))  # opener window for repetition ratio
+HOOK_REP_MIN_RATIO = float(os.getenv("HOOK_REP_MIN_RATIO", "0.30"))  # if repetition >= this, penalize
+HOOK_REP_PENALTY_MULT = float(os.getenv("HOOK_REP_PENALTY_MULT", "0.70"))  # multiply hook by this when penalizing
+
+# Question-only rule
+Q_ONLY_MIN_Q = float(os.getenv("Q_ONLY_MIN_Q", "0.50"))  # treat as Q/list if >=
+Q_ONLY_MAX_PAYOFF = float(os.getenv("Q_ONLY_MAX_PAYOFF", "0.15"))  # drop if payoff below this
+
+# Logging flags
+LOG_AD_SIGNALS = int(os.getenv("LOG_AD_SIGNALS", "1"))
+
+# Trail padding and refinement settings
+HEAD_PAD_SEC = float(os.getenv("HEAD_PAD_SEC", "0.05"))
+TRAIL_PAD_SEC = float(os.getenv("TRAIL_PAD_SEC", "0.25"))
+REFINE_SNAP_MAX_NUDGE = float(os.getenv("REFINE_SNAP_MAX_NUDGE", "0.35"))
+REFINE_MIN_TAIL_SILENCE = float(os.getenv("REFINE_MIN_TAIL_SILENCE", "0.12"))
+
+# Title generation settings
+PLAT_LIMITS = {
+    "shorts": 80,
+    "reels": 80,
+    "tiktok": 80,
+    "neutral": 80,
+    "default": 80,
+}
+TITLE_ENGINE_V2 = os.getenv("TITLE_ENGINE_V2", "true").lower() == "true"
+
 # API settings
 API_PREFIX = "/api"
 

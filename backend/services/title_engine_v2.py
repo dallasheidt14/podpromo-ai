@@ -578,7 +578,7 @@ def generate_titles_v2(
     end: Optional[float] = None,
     clip_attrs: Optional[Dict] = None,
     persona: Optional[str] = None,
-) -> List[Dict[str, object]]:
+) -> List[str]:
     """
     Generate CFD-first titles using archetype classification and template registry
     """
@@ -662,9 +662,9 @@ def generate_titles_v2(
             seen_titles.add(candidate["title"])
             unique_candidates.append(candidate)
     
-    return unique_candidates[:n]
+    return [c["title"] for c in unique_candidates[:n]]
 
-def _generate_fallback_titles(text: str, platform: str, n: int, avoid_set: Set[str]) -> List[Dict]:
+def _generate_fallback_titles(text: str, platform: str, n: int, avoid_set: Set[str]) -> List[str]:
     """Fallback title generation for low-confidence cases"""
     topic = cheap_topic(text)
     
@@ -687,7 +687,7 @@ def _generate_fallback_titles(text: str, platform: str, n: int, avoid_set: Set[s
                 "archetype": "Generic"
             })
     
-    return candidates
+    return [c["title"] for c in candidates]
 
 # ============================================================================
 # TEST CASES

@@ -30,6 +30,34 @@ def slice_segments_by_time(segments, start: float, end: float, pad_s: float = 0.
     """Slice segments using overlap logic"""
     return slice_items_by_time(segments, start, end, lambda s: s["start"], lambda s: s["end"], pad_s)
 
+def build_words_for_clip(words, clip_start, clip_end):
+    """Build words for clip with hard clamping to prevent overshoot"""
+    eps = 1e-3
+    out = []
+    for w in words:
+        w_t0 = float(w.get("t", w.get("start", 0.0)))
+        w_d  = float(w.get("d", w.get("end", 0.0) - w_t0))
+        w_t1 = w_t0 + max(0.0, w_d)
+
+        t0 = max(clip_start, w_t0)
+        t1 = min(clip_end,   w_t1)
+        if t1 - t0 <= eps:
+            continue
+
+        out.append({
+            "w": w.get("w", w.get("text", w.get("word", ""))),
+            "t": round(t0 - clip_start, 2),               # relative time
+            "d": round(max(0.0, t1 - t0), 2)
+        })
+
+    # make sure last token never spills past clip length
+    if out:
+        L = round(clip_end - clip_start, 2)
+        last = out[-1]
+        if last["t"] + last["d"] > L + eps:
+            last["d"] = round(max(0.0, L - last["t"]), 2)
+    return out
+
 def build_clip_transcript_exact(source, start_s: float, end_s: float, pad_s: float = 0.25) -> tuple[str, str, dict]:
     """
     Build transcript from word timestamps inside the exact clip window.

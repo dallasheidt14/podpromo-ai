@@ -6,8 +6,120 @@ import re, math, itertools, hashlib, time
 from collections import Counter
 from typing import List, Dict, Iterable, Tuple, Optional, Set, Any
 import logging
+from config.settings import PLAT_LIMITS, TITLE_ENGINE_V2
 
 logger = logging.getLogger("titles_service")
+
+def _normalize_to_list_of_str(variants) -> list[str]:
+    """Normalize variants to list of strings, handling both str and dict formats"""
+    out = []
+    if not variants:
+        return out
+    for v in variants:
+        if isinstance(v, str):
+            s = v.strip()
+            if s:
+                out.append(s)
+        elif isinstance(v, dict):
+            # accept common keys
+            s = v.get("title") or v.get("text") or v.get("name")
+            if s:
+                s = str(s).strip()
+                if s:
+                    out.append(s)
+        else:
+            s = str(v).strip()
+            if s:
+                out.append(s)
+    # de-dup case-insensitively
+    seen = set()
+    uniq = []
+    for s in out:
+        k = s.lower()
+        if k not in seen:
+            seen.add(k)
+            uniq.append(s)
+    return uniq
+
+def generate_titles_v2(text: str, platform: str) -> list[str]:
+    """V2 title engine wrapper that always returns list[str]"""
+    try:
+        from services.title_engine_v2 import generate_titles_v2 as _generate_titles_v2_raw
+        raw = _generate_titles_v2_raw(text=text, platform=platform)
+    except Exception as e:
+        logger.warning("TITLE_ENGINE_V2: failed %s, falling back to V1", e)
+        return []
+    titles = _normalize_to_list_of_str(raw)
+    # hard caps (80 chars typical)
+    cap = 80
+    trimmed = [t[:cap].rstrip() for t in titles if t]
+    return trimmed[:6]
+
+# Generic scaffold patterns to penalize
+GENERIC_SCAFFOLD_RE = re.compile(
+    r"\b(what you need to know|everything you need to know|the truth about|all about|ultimate guide|complete guide)\b",
+    re.I
+)
+
+def _soft_clean(s: str) -> str:
+    """Clean title text: normalize whitespace, remove double punctuation, trim trailing spam"""
+    s = re.sub(r"\s+", " ", s).strip()
+    # remove double punctuation like "!!" or "??"
+    s = re.sub(r"([!?.,:;])\1+", r"\1", s)
+    # remove trailing punctuation spam
+    s = re.sub(r"[!?.,:;]+$", "", s)
+    return s
+
+def _score_social(title: str, platform: str) -> float:
+    """Score title for social media appeal: hook words + specificity + length sweet spot"""
+    t = title.lower()
+    score = 0.0
+    
+    # Hook words bonus
+    if re.search(r"\b(why|how|stop|the secret|truth|mistake|don[']?t|you|this)\b", t):
+        score += 0.6
+    
+    # Numbers / quantified claims bonus
+    if re.search(r"(^|\s)(\d+[%$kKmMbB]?|#\d+)\b", title):
+        score += 0.1
+    
+    # Named entities bonus (two proper-case tokens)
+    if re.search(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b", title):
+        score += 0.06
+    
+    # Length sweet spot
+    n_words = len(title.split())
+    if 5 <= n_words <= 12:
+        score += 0.2
+    
+    # Penalize generic scaffolds so they don't dominate
+    if GENERIC_SCAFFOLD_RE.search(title):
+        score -= 0.25  # solid penalty for generic patterns
+    
+    # Tiny penalty for too generic
+    if len(set(w for w in re.findall(r"[A-Za-z]+", t) if w not in {"the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by"})) < 3:
+        score -= 0.3
+    
+    return round(score, 3)
+
+def _coherence(title: str, clip_text: str) -> float:
+    """Score how well the title matches the clip content"""
+    t = set(re.findall(r"[a-z0-9]+", title.lower()))
+    c = set(re.findall(r"[a-z0-9]+", clip_text[:200].lower()))
+    if not t or not c: return 0.0
+    inter = len(t & c)
+    return inter / max(1, min(len(t), len(c)))
+
+def _dedup_ci(titles: list[str]) -> list[str]:
+    """Case-insensitive deduplication of titles"""
+    seen = set()
+    out = []
+    for tt in titles:
+        k = re.sub(r"[\s\W_]+", "", tt).lower()
+        if k not in seen:
+            seen.add(k)
+            out.append(tt)
+    return out
 
 def _extract_text(obj: Any) -> str:
     """Extract text from various object types (dict, list, string, etc.)"""
@@ -828,10 +940,9 @@ def generate_titles(
         return []
     
     # Check for V2 title engine feature flag (default to true)
-    import os
-    if os.getenv("TITLE_ENGINE_V2", "true").lower() == "true":
+    if TITLE_ENGINE_V2:
         try:
-            from services.title_engine_v2 import generate_titles_v2
+            from services.title_engine_v2 import generate_titles_v2 as _generate_titles_v2_raw
             clip_attrs = {
                 "payoff_ok": True,  # Default to True, can be overridden
                 "entity": None,
@@ -842,21 +953,23 @@ def generate_titles(
             if episode_vocab:
                 clip_attrs.update(episode_vocab)
             
-            v2_results = generate_titles_v2(
-                text=text,
-                platform=platform,
-                n=n,
-                avoid_titles=avoid_titles,
-                episode_id=episode_id,
-                clip_id=clip_id,
-                start=start,
-                end=end,
-                clip_attrs=clip_attrs,
-            )
+            v2_results = generate_titles_v2(text, platform)
             
             if v2_results:
                 logger.info(f"TITLE_ENGINE_V2: generated {len(v2_results)} titles")
-                return v2_results
+                # Apply enhanced scoring, cleaning, and deduplication
+                platform = normalize_platform(platform)
+                limit = PLAT_LIMITS.get(platform, PLAT_LIMITS["default"])
+                cleaned = [_soft_clean(x["title"] if isinstance(x, dict) else str(x)) for x in v2_results]
+                cleaned = [t[:limit].rstrip(" .,!?;:") for t in cleaned]  # hard clip to limit
+                # Rank by social score + coherence with clip content
+                ranked = sorted(
+                    cleaned,
+                    key=lambda t: 0.85*_score_social(t, platform) + 0.15*_coherence(t, text),
+                    reverse=True
+                )
+                ranked = _dedup_ci(ranked)
+                return [{"title": t} for t in ranked[:6]]
             else:
                 logger.info("TITLE_ENGINE_V2: no results, falling back to V1")
         except Exception as e:

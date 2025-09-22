@@ -11,12 +11,14 @@ import math
 import os
 import json
 from typing import List, Dict, Tuple, Any, Optional
+from collections import Counter
+from math import sqrt
 from models import AudioFeatures, TranscriptSegment, MomentScore
 from config.settings import (
     UPLOAD_DIR, OUTPUT_DIR, MAX_FILE_SIZE, ALLOWED_EXTENSIONS,
     PRERANK_ENABLED, TOP_K_RATIO, TOP_K_MIN, TOP_K_MAX, STRATIFY_ENABLED, 
     SAFETY_KEEP_ENABLED, COMPARE_SCORING_MODES, PRERANK_WEIGHTS,
-    DURATION_TARGET_MIN, DURATION_TARGET_MAX
+    DURATION_TARGET_MIN, DURATION_TARGET_MAX, CLIP_LEN_MIN, CLIP_LEN_MAX
 )
 
 # --- Feature toggles (safe defaults) ---
@@ -32,12 +34,441 @@ FEATURES = {
 # Target bands for fair scoring & normalization
 BANDS = [(8, 12), (12, 20), (20, 35), (35, 60), (60, 90)]
 
+# --- Boundary refinement ---
+BOUNDARY_OFFSETS = (-0.6, -0.3, 0.0, 0.3, 0.6)
+
+# Keyword patterns for boundary objective
+START_HOOK_RE = re.compile(r"\b(why|how|stop|don['']?t|listen|watch|the truth|truth about|the secret|secrets|what no one|what nobody|this is why|here(?:'|')?s why|mistake|warning|avoid|if you|before you)\b", re.I)
+END_CURIOSITY_RE = re.compile(r"(but|however|the catch|what you don't|what nobody|no one tells you|here(?:'|')?s why|until you|unless you|\?$|\.{3}$)", re.I)
+
 def _band_for(dur: float) -> tuple[float, float]:
     """Get the length band for a given duration."""
     for lo, hi in BANDS:
         if lo <= dur <= hi:
             return (lo, hi)
     return BANDS[-1]
+
+def _ep_get(ep, key, default=None):
+    """Safe accessor for episode data - works with dict, Pydantic v1, and v2"""
+    if isinstance(ep, dict):
+        return ep.get(key, default)
+    try:
+        val = getattr(ep, key)
+        return val if val is not None else default
+    except AttributeError:
+        pass
+    try:
+        d = ep.model_dump()  # pydantic v2
+        return d.get(key, default)
+    except Exception:
+        try:
+            d = ep.dict()  # pydantic v1
+            return d.get(key, default)
+        except Exception:
+            return default
+
+# ---- word helpers ------------------------------------------------------------
+
+from bisect import bisect_right
+import bisect
+import math
+
+def _episode_words(episode):
+    """
+    Returns a normalized list of words each shaped as {t, d, w}.
+    Works for dict episodes and pydantic Episode models.
+    """
+    words = None
+    if hasattr(episode, "words"):
+        words = getattr(episode, "words")
+    elif isinstance(episode, dict):
+        words = episode.get("words")
+    if not words:
+        return []
+
+    out = []
+    for w in words:
+        # Format A: {t, d, w}
+        if "t" in w:
+            t = float(w["t"])
+            d = float(w.get("d", 0.0))
+            text = w.get("w") or w.get("text", "")
+            out.append({"t": t, "d": max(0.0, d), "w": text})
+        # Format B: {t0, t1, w}
+        elif "t0" in w and "t1" in w:
+            t0 = float(w["t0"]); t1 = float(w["t1"])
+            text = w.get("w") or w.get("text", "")
+            out.append({"t": t0, "d": max(0.0, t1 - t0), "w": text})
+        # Unknown shape → skip
+    return out
+
+def _episode_words_or_empty(ep):
+    """Try common attachment points in order; adjust to your schema."""
+    return (
+        getattr(ep, "normalized_words", None)
+        or getattr(ep, "words", None)
+        or ep.get("normalized_words") if isinstance(ep, dict) else None
+        or ep.get("words")            if isinstance(ep, dict) else None
+        or []
+    )
+
+def _word_starts(words):
+    return [w["t"] for w in words]
+
+def _idx_at_or_before(words, t):
+    starts = _word_starts(words)
+    i = bisect_right(starts, t) - 1
+    return max(-1, min(i, len(words) - 1))
+
+def _slice_words_text(words, t0, t1):
+    if not words:
+        return ""
+    i = max(0, _idx_at_or_before(words, t0))
+    acc = []
+    for j in range(i, len(words)):
+        wt = words[j]["t"]
+        if wt > t1:
+            break
+        acc.append(words[j].get("w", ""))
+    return " ".join(acc).strip()
+
+# Back-compat shims (only if other modules still import these)
+def _normalized_words_for_refine(ep): 
+    return _episode_words(ep)
+
+def _w_text(w): 
+    return w.get("w", "")
+
+def _w_start(w): 
+    return float(w.get("t", w.get("t0", 0.0)))
+
+def _w_end(w):
+    t0 = _w_start(w)
+    if "d" in w: 
+        return t0 + float(w["d"])
+    if "t1" in w: 
+        return float(w["t1"])
+    return t0
+
+def _w_has_times(w): 
+    return ("t" in w) or ("t0" in w and "t1" in w)
+
+# ---- boundary cues -----------------------------------------------------------
+
+_TERMINAL = (".", "!", "?", "…")
+_CURIOSITY_PHRASES = (
+    "but", "however", "here's why", "the catch", "what you don't", "what no one", "?", "…"
+)
+
+def _has_terminal_near(words, t, radius=0.25):
+    """Is there a word ending with terminal punctuation within ±radius?"""
+    if not words:
+        return False
+    i = _idx_at_or_before(words, t)
+    for j in range(max(0, i-2), min(len(words), i+3)):
+        w = words[j].get("w", "").strip().lower()
+        if not w:
+            continue
+        if any(w.endswith(p) for p in _TERMINAL):
+            wt_end = words[j]["t"] + words[j].get("d", 0.0)
+            if abs(wt_end - t) <= radius:
+                return True
+    return False
+
+def _gap_ms_around(words, t):
+    """Return the local inter-word gap in seconds around t."""
+    if not words:
+        return 0.0
+    i = _idx_at_or_before(words, t)
+    prev_end = words[i]["t"] + words[i].get("d", 0.0) if i >= 0 else 0.0
+    next_start = words[i+1]["t"] if i+1 < len(words) else prev_end
+    return max(0.0, next_start - prev_end)
+
+def _ends_on_curiosity_text(text_tail: str) -> bool:
+    tl = text_tail.strip().lower()
+    return any(k in tl for k in _CURIOSITY_PHRASES)
+
+def _looks_like_boundary(t, episode):
+    """Simple heuristic: big gap or terminal punctuation near t."""
+    words = _episode_words(episode)
+    if not words:
+        return True  # be permissive if we don't have words
+    if _gap_ms_around(words, t) >= 0.22:
+        return True
+    return _has_terminal_near(words, t, radius=0.25)
+
+# ---- hill climb --------------------------------------------------------------
+
+try:
+    # reuse your centralized constants
+    from backend.config.settings import CLIP_LEN_MIN, CLIP_LEN_MAX
+except Exception:
+    CLIP_LEN_MIN, CLIP_LEN_MAX = 8.0, 90.0
+
+def _boundary_score_start(t, t0_orig, words, window):
+    """Score a candidate START time."""
+    # gap bonus (favor natural silence)
+    gap = _gap_ms_around(words, t)
+    gap_bonus = min(1.0, gap / 0.22)  # 0..1 once >=220ms
+
+    # punctuation bonus
+    punct = 1.0 if _has_terminal_near(words, t, 0.25) else 0.0
+
+    # small lexical hook bonus in first 2s if we land right before a strong word
+    first2 = _slice_words_text(words, t, t + 2.0)[:120].lower()
+    hookish = any(h in first2 for h in ("why", "how", "stop", "the secret", "here's", "watch", "don't", "never"))
+    hook_bonus = 0.25 if hookish else 0.0
+
+    # distance penalty (don't drift too far from original)
+    dist_pen = min(0.35, 0.35 * abs(t - t0_orig) / max(0.001, window))
+
+    return 0.6 * gap_bonus + 0.3 * punct + 0.2 * hook_bonus - dist_pen
+
+def _boundary_score_end(t, t1_orig, words, window, start_t):
+    """Score a candidate END time."""
+    gap = _gap_ms_around(words, t)
+    gap_bonus = min(1.0, gap / 0.22)
+
+    punct = 1.0 if _has_terminal_near(words, t, 0.25) else 0.0
+
+    tail_text = _slice_words_text(words, max(start_t, t - 4.0), t)[-120:]
+    curiosity_bonus = 0.25 if _ends_on_curiosity_text(tail_text) else 0.0
+
+    dist_pen = min(0.35, 0.35 * abs(t - t1_orig) / max(0.001, window))
+
+    return 0.55 * gap_bonus + 0.35 * punct + 0.25 * curiosity_bonus - dist_pen
+
+def refine_bounds_with_hill_climb(clip, episode, max_nudge=1.0, step=0.05):
+    """
+    Locally search ±max_nudge around start and end to snap to nicer word boundaries.
+    Returns (new_start, new_end). Never throws; falls back to original.
+    """
+    try:
+        s0 = float(clip["start"]); e0 = float(clip["end"])
+        dur0 = max(0.0, e0 - s0)
+        if dur0 < CLIP_LEN_MIN:
+            return s0, e0
+
+        words = _episode_words(episode)
+        if not words:
+            return s0, e0
+
+        # --- search start
+        best_s, best_sscore = s0, -1e9
+        s_lo = max(0.0, s0 - max_nudge)
+        s_hi = min(e0 - CLIP_LEN_MIN, s0 + max_nudge)
+        t = s_lo
+        while t <= s_hi + 1e-9:
+            sc = _boundary_score_start(t, s0, words, max_nudge)
+            if sc > best_sscore:
+                best_sscore = sc
+                best_s = t
+            t += step
+
+        # --- search end (respect clamped duration limits)
+        best_e, best_escore = e0, -1e9
+        e_lo = max(best_s + CLIP_LEN_MIN, e0 - max_nudge)
+        e_hi = min(best_s + CLIP_LEN_MAX, e0 + max_nudge)
+        t = e_lo
+        while t <= e_hi + 1e-9:
+            sc = _boundary_score_end(t, e0, words, max_nudge, best_s)
+            if sc > best_escore:
+                best_escore = sc
+                best_e = t
+            t += step
+
+        # final clamp + rounding
+        new_s = round(max(0.0, min(best_s, best_e - CLIP_LEN_MIN)), 2)
+        new_e = round(min(best_s + CLIP_LEN_MAX, max(best_e, new_s + CLIP_LEN_MIN)), 2)
+        return new_s, new_e
+    except Exception:
+        # absolutely never break the pipeline
+        return clip["start"], clip["end"]
+
+# ---- clean start/end guards -------------------------------------------------
+
+_TERMINALS = {'.','!','?','…'}
+_START_DANGLERS = {'and','but','so','or','because','which','that','like','um','uh'}
+
+def _is_terminal_char(ch: str) -> bool:
+    return ch and ch[-1] in _TERMINALS
+
+def _gap_after(words, i) -> float:
+    """gap from end of words[i] to start of words[i+1]"""
+    if i < 0 or i+1 >= len(words): return 9999.0
+    end_i = words[i]['t'] + words[i].get('d', 0.0)
+    return max(0.0, words[i+1]['t'] - end_i)
+
+def _gap_before(words, i) -> float:
+    """gap from end of words[i-1] to start of words[i]"""
+    if i <= 0 or i >= len(words): return 9999.0
+    end_prev = words[i-1]['t'] + words[i-1].get('d', 0.0)
+    return max(0.0, words[i]['t'] - end_prev)
+
+def _nearest_boundary_backward(words, t, max_seek=1.5, min_gap=0.35):
+    """walk left to an EOS char or a long enough gap"""
+    i = max(0, max(range(len(words)), key=lambda k: words[k]['t'] <= t and words[k]['t'] or -1))
+    best = t
+    anchor = t
+    while i > 0 and (anchor - words[i]['t']) <= max_seek:
+        token = words[i].get('w','')
+        if _is_terminal_char(token.strip()[-1:]) or _gap_before(words, i) >= min_gap:
+            best = words[i]['t']
+            break
+        i -= 1
+    return best
+
+def _nearest_boundary_forward(words, t, max_seek=2.0, min_gap=0.40):
+    """walk right to an EOS char or a long enough gap"""
+    i = min(len(words)-1, min(range(len(words)), key=lambda k: words[k]['t'] >= t and words[k]['t'] or 10**9))
+    best = t
+    anchor = t
+    while i < len(words)-1 and (words[i]['t'] - anchor) <= max_seek:
+        token = words[i].get('w','')
+        if _is_terminal_char(token.strip()[-1:]) or _gap_after(words, i) >= min_gap:
+            end_i = words[i]['t'] + words[i].get('d', 0.0)
+            best = end_i
+            break
+        i += 1
+    return best
+
+def _word_start(w):
+    return float(w.get("t", w.get("start", math.nan)))
+
+def _word_end(w):
+    if "end" in w:
+        return float(w["end"])
+    t = w.get("t", w.get("start"))
+    if t is None:
+        return math.nan
+    d = w.get("d", w.get("duration"))
+    return float(t) + float(d) if d is not None else float(t)
+
+def _extract_sorted_times(words):
+    ts = []
+    for w in words or []:
+        t = _word_start(w)
+        if not math.isnan(t):
+            ts.append(t)
+    ts.sort()
+    return ts
+
+def _clean_start_end(bounds, words, *, head_pad=0.05, tail_pad=0.25):
+    """Return (start, end) refined against word boundaries. Safe on empty words."""
+    try:
+        s = float(bounds["start"]); e = float(bounds["end"])
+    except Exception:
+        return bounds.get("start", 0.0), bounds.get("end", 0.0)
+
+    if not words:
+        # Nothing to refine against; keep as-is.
+        return s, e
+
+    times = _extract_sorted_times(words)
+    if not times:
+        return s, e
+
+    # START → previous word start (then tiny head pad)
+    i = bisect.bisect_right(times, s) - 1
+    if i >= 0:
+        s = max(0.0, times[i] - head_pad)
+
+    # END → next word end (then tiny tail pad)
+    j = bisect.bisect_left(times, e)  # first word starting at/after e
+    if j >= len(times):
+        j = len(times) - 1
+    end_word_end = _word_end(words[j]) if j >= 0 else math.nan
+    if math.isnan(end_word_end):
+        # Fallback: use the last word's start if end is missing
+        end_word_end = times[min(j, len(times)-1)]
+    e = max(e, end_word_end) + tail_pad
+
+    # Ensure we maintain a positive duration
+    if e <= s:
+        e = s + 0.5
+
+    # Small rounding is OK for UI / storage
+    return round(s, 2), round(e, 2)
+
+def _fmt_tc(seconds: float) -> str:
+    """Format seconds as timecode (M:SS or H:MM:SS)"""
+    s = int(round(max(0.0, seconds)))
+    h, m = divmod(s // 60, 60)
+    ss = s % 60
+    return f"{h}:{m:02d}:{ss:02d}" if h else f"{m}:{ss:02d}"
+
+def _fmt_ts(sec: float) -> str:
+    """Format seconds as simple timestamp (M:SS)"""
+    m = int(sec // 60)
+    s = int(round(sec % 60))
+    return f"{m}:{s:02d}"
+
+def _nudge_to_punct_or_gap(end_time: float, words: list, max_nudge: float, min_silence: float) -> float:
+    """Nudge end time to nearest punctuation or word gap within max_nudge"""
+    if not words:
+        return end_time
+    
+    # Find the word that contains or is closest to end_time
+    best_end = end_time
+    best_score = 0.0
+    
+    for i, word in enumerate(words):
+        word_start = word.get("t", 0.0)
+        word_end = word_start + word.get("d", 0.0)
+        
+        # Check if this word is within nudge range
+        if abs(word_end - end_time) <= max_nudge:
+            # Check for terminal punctuation
+            text = word.get("w", "").strip()
+            if text and text[-1] in ".!?":
+                # Prefer punctuation endings
+                if abs(word_end - end_time) <= max_nudge:
+                    best_end = word_end
+                    best_score = 1.0
+                    break
+            
+            # Check for word gaps (silence between words)
+            if i < len(words) - 1:
+                next_start = words[i + 1].get("t", word_end)
+                gap = next_start - word_end
+                if gap >= min_silence and abs(word_end - end_time) <= max_nudge:
+                    if gap > best_score:
+                        best_end = word_end
+                        best_score = gap
+    
+    return best_end
+
+def _compute_total_duration(episode, base_segments, clips) -> float:
+    """Compute total duration robustly from multiple sources."""
+    # 1) Prefer explicit episode.duration if you have it
+    dur = float(getattr(episode, "duration", 0.0) or 0.0)
+
+    # 2) Fallback to words max end
+    if dur <= 0.0:
+        words = getattr(episode, "words", None) or []
+        if words:
+            try:
+                dur = max(float(w.get("end", 0.0)) for w in words)
+            except Exception:
+                pass
+
+    # 3) Fallback to base segments max end
+    if dur <= 0.0 and base_segments:
+        try:
+            dur = max(float(s["end"]) for s in base_segments if "end" in s)
+        except Exception:
+            pass
+
+    # 4) Fallback to clips max end (last resort)
+    if dur <= 0.0 and clips:
+        try:
+            dur = max(float(c["end"]) for c in clips if "end" in c)
+        except Exception:
+            pass
+
+    return max(0.0, dur)
+
+
 
 def _robust_center(vals: list[float]) -> tuple[float, float]:
     """median + IQR, safe for tiny sets"""
@@ -57,6 +488,17 @@ def _get_dur(c: dict) -> float:
         return float(c["duration"])
     return float(c.get("end", 0) - c.get("start", 0))
 
+def _norm_or_sigmoid(raw: float, lo: float, hi: float, floor: float = 0.05) -> float:
+    """Normalize with sigmoid fallback when variance is too low"""
+    import math
+    span = hi - lo
+    if span < 1e-6:
+        # Calibrated around a typical raw hook mean (tweak 0.35/0.08 to your corpus)
+        sig = 1.0 / (1.0 + math.exp(-(raw - 0.35) / 0.08))
+        return max(floor, min(1.0, sig))
+    norm = (raw - lo) / span
+    return max(floor, min(1.0, norm))
+
 def _normalize_display_by_band(cands: list[dict]) -> list[dict]:
     """Normalize display_score within length bands to remove short-clip bias."""
     if not cands:
@@ -71,10 +513,11 @@ def _normalize_display_by_band(cands: list[dict]) -> list[dict]:
         vals = [float(c.get("display_score", c.get("final_score", 0.0))*100.0) for c in group]
         med, iqr = _robust_center(vals)
         for c in group:
-            v = float(c.get("display_score", c.get("final_score", 0.0))*100.0)
-            z = 0.5 + 0.4 * ((v - med) / (iqr or 1.0))  # squashed into ~[0.1..0.9]
+            v = float(c.get("display_score", c.get("final_score", 0.0)))*100.0
+            # Use sigmoid fallback for low variance
+            z = _norm_or_sigmoid(v, med - iqr, med + iqr, floor=0.05)
             c["_band"] = list(band)
-            c["_band_norm_display"] = max(0.0, min(1.0, z))  # 0..1
+            c["_band_norm_display"] = z
     # prefer normalized score for ranking, but keep originals for debugging
     for c in cands:
         if "_band_norm_display" in c:
@@ -398,10 +841,12 @@ def adaptive_gate(candidates: List[Dict], min_count: int = 3, gate_mode=None) ->
         )
     
     # Apply fallback-aware gates
+    from config import settings
     passed, reason_counts = essential_gates(
         candidates,
         fallback=fallback,
-        tail_close_sec=1.5
+        tail_close_sec=1.5,
+        cfg=settings
     )
     
     # Add one-line summary per pool
@@ -811,7 +1256,8 @@ def _salvage_pass(candidates: List[Dict], *, fallback=False, tail_close_sec=1.0,
                     LOG.debug("SALVAGE: rejected micro-clip dur=%.1fs < %.1fs", dur, MIN_FINAL_DUR)
                 continue
 
-        kept, _reasons = essential_gates([c_ext], fallback=fallback, tail_close_sec=tail_close_sec)
+        from config import settings
+        kept, _reasons = essential_gates([c_ext], fallback=fallback, tail_close_sec=tail_close_sec, cfg=settings)
         if kept:
             salvaged.append(kept[0])
             if LOG:
@@ -827,7 +1273,7 @@ def _salvage_pass(candidates: List[Dict], *, fallback=False, tail_close_sec=1.0,
                 continue
                 
             if qa_c:
-                kept, _reasons = essential_gates([qa_c], fallback=fallback, tail_close_sec=tail_close_sec)
+                kept, _reasons = essential_gates([qa_c], fallback=fallback, tail_close_sec=tail_close_sec, cfg=settings)
                 if kept:
                     salvaged.append(kept[0])
                     if LOG:
@@ -842,7 +1288,7 @@ def _salvage_pass(candidates: List[Dict], *, fallback=False, tail_close_sec=1.0,
             continue
             
         if backoff_c:
-            kept, _reasons = essential_gates([backoff_c], fallback=fallback, tail_close_sec=tail_close_sec)
+            kept, _reasons = essential_gates([backoff_c], fallback=fallback, tail_close_sec=tail_close_sec, cfg=settings)
             if kept:
                 salvaged.append(kept[0])
                 if LOG:
@@ -1477,15 +1923,24 @@ class ClipScoreService:
             # Use enhanced V4 feature computation with all Phase 1-3 features
             feats = None
             try:
+                from config import settings
                 feats = _compute_features(
                     segment=seg,
                     audio_file=audio_file,
                     y_sr=y_sr,
+                    cfg=settings,
                     platform=platform,
                     genre=genre,
                     segments=segments_to_score,  # give enhanced fn episode context
                 )
                 _log_feature_coverage(logger, feats)
+                
+                # Apply low-activity first-second hook nudge
+                hook = feats.get("hook_score", 0.0)
+                if hook > 0.15 and self._low_activity_first_second(segments_to_score, seg["start"], seg["end"]):
+                    hook = max(0.0, hook - 0.08)
+                    feats["hook_score"] = hook
+                
                 seg["features"] = feats
                 
                 # Debug: log what features we got
@@ -1497,8 +1952,16 @@ class ClipScoreService:
             except Exception as e:
                 logger.warning(f"Enhanced features failed for segment {seg.get('id', i)}: {e}; falling back to v4")
                 try:
-                    feats = compute_features_v4(seg, audio_file, y_sr=y_sr, platform=platform, genre=genre)
+                    from config import settings
+                    feats = compute_features_v4(seg, audio_file, y_sr=y_sr, platform=platform, genre=genre, cfg=settings)
                     _log_feature_coverage(logger, feats)
+                    
+                    # Apply low-activity first-second hook nudge
+                    hook = feats.get("hook_score", 0.0)
+                    if hook > 0.15 and self._low_activity_first_second(segments_to_score, seg["start"], seg["end"]):
+                        hook = max(0.0, hook - 0.08)
+                        feats["hook_score"] = hook
+                    
                     seg["features"] = feats
                     
                     # Debug: log what features we got
@@ -1618,6 +2081,16 @@ class ClipScoreService:
                 raw_score *= energy_dampener
                 seg["energy_dampener"] = f"low_energy_{energy_dampener}"
                 logger.info(f"Applied energy dampener: {energy_dampener}x for arousal={arousal:.3f}, final score: {raw_score:.3f}")
+            
+            # Apply platform blend for neutral mode (small platform influence)
+            pl_v2 = feats.get("platform_length_score_v2", 0.0)
+            if platform in ["shorts", "tiktok", "reels"] or platform is None:
+                # Small platform blend: 90% core + 10% platform
+                raw_score = raw_score * 0.9 + 0.1 * pl_v2
+                seg["platform_blend"] = f"neutral_{0.1}"
+            
+            # Set final_score field for consistency
+            seg["final_score"] = raw_score
             
             # Calibrate score for better user experience with wider range
             calibrated_score = self._calibrate_score_for_ui(raw_score)
@@ -2083,8 +2556,136 @@ class ClipScoreService:
         return ' '.join(segment_texts)
     
     def _snap_to_sentence_or_pause(self, t: float, prefer: str = "start") -> float:
-        """Placeholder: returns input unchanged until a smarter snapper is implemented"""
-        return t
+        """
+        Snap a timestamp toward a nearby 'good' boundary:
+        - prefer punctuation end/start in the nearest transcript segment
+        - else prefer a local word gap >= 220ms within ±1.0s window
+        """
+        ep = getattr(self, "_current_episode", None)
+        words = getattr(ep, "words", None) or []
+        if not words:
+            return t
+
+        # 1) word-gap snap
+        win = 1.0
+        nearest = t
+        best_gap = 0.0
+        for i in range(1, len(words)):
+            a, b = words[i-1], words[i]
+            ta = float(a.get("t", 0.0)); tb = float(b.get("t", 0.0))
+            if ta < t - win or tb > t + win:
+                continue
+            gap = tb - ta
+            if gap >= 0.22 and abs(((ta+tb)/2.0) - t) < abs(nearest - t):
+                nearest = (ta+tb)/2.0
+                best_gap = gap
+
+        # 2) punctuation bias (if we have segment text nearby)
+        # Optional: look up transcript segment spanning nearest and bias to its end '.' '!' '?'
+        return nearest
+
+    def _is_sentence_boundary(self, t: float, radius: float = 0.35) -> bool:
+        """
+        Heuristic: boundary if there is a word gap >= 220ms or the previous word ends with [.?!]
+        within ±radius of t.
+        """
+        ep = getattr(self, "_current_episode", None)
+        words = (getattr(ep, "words", None) or [])
+        if not words: return False
+        prev = None
+        for w in words:
+            ws, we = float(w.get("start",0.0)), float(w.get("end",0.0))
+            if we <= t - radius: prev = w; continue
+            if ws >= t + radius: break
+            # if there is a big gap across t
+            if prev:
+                gap = ws - float(prev.get("end", ws))
+                if gap >= 0.22: return True
+                if re.search(r"[\.!\?]$", str(prev.get("text") or prev.get("word") or "")): 
+                    return True
+            prev = w
+        return False
+
+    def _low_rms_valley_near(self, t: float, radius: float = 0.25) -> bool:
+        """
+        Proxy for low RMS: no words (or tiny coverage) in a ±radius window around t,
+        or a single inter-word gap ≥ 220ms overlapping t.
+        """
+        ep = getattr(self, "_current_episode", None)
+        words = (getattr(ep, "words", None) or [])
+        if not words: return False
+        win_s, win_e = t - radius, t + radius
+        covered = 0.0
+        last_end = None
+        for w in words:
+            ws, we = float(w.get("start",0.0)), float(w.get("end",0.0))
+            if we < win_s: last_end = we; continue
+            if ws > win_e: break
+            # gap check
+            if last_end is not None and ws > last_end and ws < win_e and last_end > win_s:
+                if (ws - last_end) >= 0.22: 
+                    return True
+            last_end = we
+            # coverage
+            overlap = max(0.0, min(we, win_e) - max(ws, win_s))
+            covered += overlap
+        return covered <= (2*radius) * 0.35  # <=35% of the window has speech
+
+    def _low_activity_first_second(self, base, s: float, e: float) -> bool:
+        """Check if first second has low speech activity (dead air)"""
+        end = min(s + 1.0, e)
+        span = end - s
+        if span <= 0.05: return True
+        covered = 0.0
+        for seg in base:
+            xs, xe = float(seg["start"]), float(seg["end"])
+            if xe <= s: continue
+            if xs >= end: break
+            covered += max(0.0, min(xe, end) - max(xs, s))
+        return (span - covered) >= 0.6
+
+    def _base_from_words(self):
+        """Fallback: rebuild base segments from episode words"""
+        ep = getattr(self, "_current_episode", None)
+        words = (getattr(ep, "words", None) or [])
+        # Treat words as micro-segments; _get_transcript_segment_text works fine on these
+        return [{"start": float(w.get("start", 0.0)),
+                 "end":   float(w.get("end",   0.0)),
+                 "text":  str(w.get("text") or w.get("word") or "")}
+                for w in words]
+
+    def _local_boundary_objective(self, base, s: float, e: float) -> float:
+        """Lightweight: favor clean boundary + hook @ start + payoff/curiosity @ end"""
+        text_start = self._get_transcript_segment_text(base, s, min(s+2.0, e))
+        text_end   = self._get_transcript_segment_text(base, max(e-2.0, s), e)
+        score = 0.0
+        # boundary bonuses
+        if self._is_sentence_boundary(s): score += 0.04
+        if self._is_sentence_boundary(e): score += 0.04
+        if self._low_rms_valley_near(s, radius=0.25): score += 0.02
+        if self._low_rms_valley_near(e, radius=0.25): score += 0.02
+        # start hookiness
+        if START_HOOK_RE.search(text_start):
+            score += 0.06
+        # end payoff/curiosity
+        if END_CURIOSITY_RE.search(text_end) or re.search(r"[.!?]$", text_end.strip()):
+            score += 0.06
+        return score
+
+    def _refine_boundaries(self, base, start: float, end: float, total: float) -> tuple[float,float]:
+        """Hill-climb around winner to find better boundaries"""
+        best_s, best_e = start, end
+        best = self._local_boundary_objective(base, start, end)
+        for ds in BOUNDARY_OFFSETS:
+            for de in BOUNDARY_OFFSETS:
+                s = max(0.0, start + ds)
+                e = min(total,  end   + de)
+                if e - s < CLIP_LEN_MIN or e - s > CLIP_LEN_MAX: 
+                    continue
+                val = self._local_boundary_objective(base, s, e)
+                if val > best:
+                    best, best_s, best_e = val, s, e
+        return round(best_s, 2), round(best_e, 2)
     
     def _generate_multiscale_candidates(self, source: list, *, step_frac: float = 0.6) -> list[dict]:
         """
@@ -2124,15 +2725,21 @@ class ClipScoreService:
         BANDS = [(8,12),(12,20),(20,35),(35,60),(60,90)]
         for (lo, hi) in BANDS:
             win = (lo + hi) / 2.0
+            # Denser sweep for longer bands to reduce missed 45-75s spans
+            step_frac = 0.5 if hi >= 35 else 0.6
             step = max(2.0, win * step_frac)
             t = 0.0
             while t < total - lo + 1e-6:
                 start = t
                 end = min(t + win, total)
-                if end - start >= 8.0:
-                    text = self._get_transcript_segment_text(base, start, end)  # works on [{start,end,text}]
-                    if text.strip():
-                        out.append({"start": start, "end": end, "text": text, "type": f"multiscale_{lo}-{hi}"})
+                dur = end - start
+                # Apply hard length clamps during generation
+                if dur < CLIP_LEN_MIN or dur > CLIP_LEN_MAX:
+                    t += step
+                    continue
+                text = self._get_transcript_segment_text(base, start, end)  # works on [{start,end,text}]
+                if text.strip():
+                    out.append({"start": start, "end": end, "text": text, "type": f"multiscale_{lo}-{hi}"})
                 t += step
         return self._dedup_by_timing(out, time_window=0.15)
     
@@ -2286,6 +2893,9 @@ class ClipScoreService:
             if not episode or not episode.transcript:
                 logger.error(f"Episode {episode_id} not found or has no transcript")
                 return [], {"reason": "episode_not_found", "episode_id": episode_id}
+            
+            # Set current episode for boundary snapper
+            self._current_episode = episode
 
             # Resolve platform
             backend_platform = resolve_platform(platform)
@@ -2307,6 +2917,9 @@ class ClipScoreService:
 
             # Convert transcript to segments using intelligent moment detection
             segments = self._transcript_to_segments(episode.transcript, genre=final_genre, platform=platform)
+            
+            # Store base segments for boundary refinement
+            self._base_segments = segments.copy() if segments else []
             
             # Store original segments as fallback
             original_segments = segments.copy() if segments else []
@@ -2386,8 +2999,18 @@ class ClipScoreService:
                 clip["meta"] = clip_meta
             
             # Convert to candidate format with title generation and grades
-            candidates = format_candidates(clips, final_genre, backend_platform, episode_id, full_episode_transcript, episode)
-            logger.info(f"Formatted {len(candidates)} candidates")
+            try:
+                candidates = format_candidates(clips, final_genre, backend_platform, episode_id, full_episode_transcript, episode)
+                logger.info(f"Formatted {len(candidates)} candidates")
+            except Exception as e:
+                logger.exception("FORMAT_CANDIDATES_ERROR: %s", e)
+                # Fallback: persist clips with safe titles
+                candidates = []
+                for c in clips:
+                    text = c.get("text") or c.get("display_text") or ""
+                    from services.candidate_formatter import _fallback_title
+                    candidates.append({**c, "title": _fallback_title(text)})
+                logger.warning(f"Used fallback titles for {len(candidates)} clips due to formatting error")
             
             # PRE-NMS: Log top 10 before NMS with proper tie-breaking
             def sort_key(c):
@@ -2552,10 +3175,26 @@ class ClipScoreService:
             # Enforce final soft floor after all gates
             finals = enforce_soft_floor(finals, min_count=3)
             
-            # Crash fix: handle empty finals cleanly
+            # Soft relax for empty results
             if not finals:
-                logger.warning("REASON=EMPTY_AFTER_SALVAGE: returning empty list")
-                return []
+                from config.settings import FT_SOFT_RELAX_ON_ZERO, FT_SOFT_RELAX_TOPK
+                if FT_SOFT_RELAX_ON_ZERO:
+                    # Get all candidates that passed initial filtering
+                    pool = sorted(
+                        quality_filtered,
+                        key=lambda c: (
+                            c.get("rank_score", c.get("display_score", 0.0)),
+                            c.get("features", {}).get("payoff_score", 0.0)
+                        ),
+                        reverse=True,
+                    )
+                    # Filter out ads from salvage pool
+                    pool = [c for c in pool if not c.get("features", {}).get("ad", False)]
+                    finals = pool[:FT_SOFT_RELAX_TOPK]
+                    logger.warning("SOFT_SALVAGE: rescued %d clips", len(finals))
+                else:
+                    logger.warning("REASON=EMPTY_AFTER_SALVAGE: returning empty list")
+                    return []
             
             # ---- FINISHED-THOUGHT BACKSTOP -----------------------------------------
             # If finals contain zero "finished_thought", promote the best finished clip
@@ -2715,6 +3354,8 @@ class ClipScoreService:
                     logger.warning("SOFT_RELAX: still 0 finished, applying FT_SOFT_RELAX_ON_ZERO")
                     from services.quality_filters import _is_finished_like
                     finished_like = [c for c in finals if _is_finished_like(c, fallback=True, tail_close_sec=1.5)[0]]
+                    # Filter out ads from finished_like
+                    finished_like = [c for c in finished_like if not c.get("features", {}).get("ad", False)]
                     if finished_like:
                         finals = finished_like[:min(3, len(finished_like))]
                         logger.info(f"SOFT_RELAX: using {len(finished_like)} finished_like candidates")
@@ -2728,6 +3369,11 @@ class ClipScoreService:
             
             # Add platform recommendations after selection
             ranked_clips = add_platform_recommendations_to_clips(ranked_clips)
+            
+            # Apply semantic MMR for diversity
+            from services.quality_filters import mmr_select_semantic
+            ranked_clips = mmr_select_semantic(ranked_clips, K=min(6, len(ranked_clips)), lam=0.7)
+            
             
             # Log platform-neutral selection info
             logger.info(f"SELECTION: platform_neutral={PLATFORM_NEUTRAL_SELECTION}")
@@ -2760,10 +3406,70 @@ class ClipScoreService:
             
             default_clip_id = choose_default_clip(ranked_clips)
             
-            # Add metadata to each clip
+            
+            # --- boundary refinement pass (safe, best-effort) -----------------------------
+            refined = []
+            episode_words = _episode_words_or_empty(episode)
+            logger.info("BOUNDARY_REFINEMENT: using %d episode words", len(episode_words or []))
+            
+            for clip in ranked_clips:
+                try:
+                    # Step 1: Hill-climb refinement
+                    s1, e1 = refine_bounds_with_hill_climb(clip, episode, max_nudge=1.0, step=0.05)
+                    # Step 2: Clean start/end guards
+                    if not episode_words:
+                        logger.warning("BOUNDARY_REFINEMENT: no episode words; skipping clean for this clip")
+                        s2, e2 = s1, e1
+                    else:
+                        s2, e2 = _clean_start_end({'start': s1, 'end': e1}, episode_words)
+                    clip["start"], clip["end"] = s2, e2
+                    clip["duration"] = round(max(0.0, e2 - s2), 2)
+                    # Add timecode formatting
+                    clip["start_tc"] = _fmt_tc(s2)
+                    clip["end_tc"] = _fmt_tc(e2)
+                    clip["start_sec"] = s2
+                    clip["end_sec"] = e2
+                    clip["display_range"] = f"{_fmt_ts(s2)}–{_fmt_ts(e2)}"
+                    refined.append(clip["id"])
+                except Exception as ex:
+                    logger.exception("REFINE_BOUNDS_ERROR: %s", ex)
+                    # keep original clip untouched
+            logger.info("BOUNDARY_REFINEMENT: refined=%d/%d", len(refined), len(ranked_clips))
+            
+            # Apply trail padding and nudge to punctuation
+            from config.settings import HEAD_PAD_SEC, TRAIL_PAD_SEC, REFINE_SNAP_MAX_NUDGE, REFINE_MIN_TAIL_SILENCE
+            episode_words = _episode_words(episode)
+            base = getattr(self, "_base_segments", None) or self._base_from_words()
+            total_duration = _compute_total_duration(episode, base, ranked_clips)
+            
+            for clip in ranked_clips:
+                # Nudge to punctuation or gap
+                end_time = _nudge_to_punct_or_gap(
+                    clip["end"], 
+                    episode_words, 
+                    REFINE_SNAP_MAX_NUDGE, 
+                    REFINE_MIN_TAIL_SILENCE
+                )
+                
+                # Apply padding
+                start = max(0.0, clip["start"] - HEAD_PAD_SEC)
+                end = min(total_duration, end_time + TRAIL_PAD_SEC)
+                
+                clip["start"] = round(start, 2)
+                clip["end"] = round(end, 2)
+                clip["duration"] = round(end - start, 2)
+            
+            # Add metadata to each clip and apply final length clamps
+            final_clips = []
             for clip in ranked_clips:
                 clip["protected_long"] = clip.get("protected", False)
-                clip["duration"] = round(clip.get('end', 0) - clip.get('start', 0), 2)
+                # Round and clamp timing
+                clip["start"] = round(max(0.0, clip["start"]), 2)
+                clip["end"] = round(max(clip["start"], clip["end"]), 2)
+                clip["duration"] = round(clip["end"] - clip["start"], 2)
+                # Enforce hard length policy
+                if clip["duration"] < CLIP_LEN_MIN or clip["duration"] > CLIP_LEN_MAX:
+                    continue  # Skip clips outside bounds
                 clip["pl_v2"] = clip.get("platform_length_score_v2", 0.0)
                 # Use better finished_thought detection
                 from services.secret_sauce_pkg.features import likely_finished_text
@@ -2775,12 +3481,14 @@ class ClipScoreService:
                         clip["ft_status"] = "finished"
                     else:
                         clip["ft_status"] = "unresolved"
+                
+                final_clips.append(clip)
             
             # Final sanity check before save
-            assert len(ranked_clips) > 0, "Should have at least one clip"
+            assert len(final_clips) > 0, "Should have at least one clip"
             
             # Calculate longest clip duration
-            longest_dur = max((c.get("end", 0) - c.get("start", 0)) for c in ranked_clips) if ranked_clips else 0.0
+            longest_dur = max((c.get("end", 0) - c.get("start", 0)) for c in final_clips) if final_clips else 0.0
             
             # Use the authoritative FT summary returned from the enhanced pipeline when available
             if viral_result and "ft" in viral_result:
@@ -2838,11 +3546,11 @@ class ClipScoreService:
                 "genre": final_genre,
                 "fallback_mode": episode_fallback_mode,
                 "eos_density": eos_density,
-                "candidate_count": len(ranked_clips),
+                "candidate_count": len(final_clips),
                 "default_clip_id": default_clip_id
             }
             
-            return ranked_clips, meta
+            return final_clips, meta
             
         except Exception as e:
             logger.error(f"Failed to get candidates: {e}", exc_info=True)

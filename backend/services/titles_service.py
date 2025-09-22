@@ -98,8 +98,18 @@ class TitlesService:
         return variants, chosen, meta
     
     def save_titles(self, clip_id: str, platform: str, variants: List[str], chosen: str, meta: Dict[str, Any]) -> bool:
-        """Save generated titles - simplified implementation"""
+        """Save generated titles - simplified implementation with idempotent guard"""
         logger.info(f"TitlesService.save_titles({clip_id}, {platform}, {len(variants)} variants)")
+        
+        # Idempotent guard: check if we already have the same titles
+        key = f"{clip_id}:{platform}"
+        latest = self._load_existing(key) if hasattr(self, '_load_existing') else None
+        new = [{"title": v} if isinstance(v, str) else v for v in variants]
+        
+        if latest and [d.get("title", "") for d in latest] == [d.get("title", "") for d in new]:
+            logger.info(f"TitlesService.save_titles({clip_id}) - no change, skipping save")
+            return True
+        
         # In a real app, this would save to database
         return True
     

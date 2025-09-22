@@ -28,6 +28,12 @@ def _aha_density(txt: str, dur: float) -> float:
     ents = len(set(re.findall(r"\b[A-Z][a-zA-Z]{2,}\b", txt)))
     nums = len(re.findall(r"\b\d+(\.\d+)?\b|%|percent|x\s*times", txt, re.I))
     return min(1.0, (causal + ents + nums)/max(1.0, dur))
+
+def _ends_on_curiosity(text: str) -> bool:
+    """Check if text ends on curiosity-raising patterns that create loops"""
+    t = text.strip().lower()
+    return any(kw in t[-80:] for kw in ["but", "however", "what you don't", "here's why", "the catch"]) \
+        or t.endswith("?") or t.endswith("...")
 # -----------------------------------------
 
 FTStatus = Literal["finished", "sparse_finished", "unresolved"]
@@ -637,12 +643,12 @@ logger = logging.getLogger(__name__)
 from .scoring import get_clip_weights
 from .genres import GenreAwareScorer
 
-def compute_features_v4(segment: Dict, audio_file: str, y_sr=None, genre: str = 'general', platform: str = 'tiktok') -> Dict:
+def compute_features_v4(segment: Dict, audio_file: str, y_sr=None, genre: str = 'general', platform: str = 'tiktok', cfg=None) -> Dict:
     """Enhanced feature computation with genre awareness"""
     text = segment.get("text", "")
     
     # CRITICAL: Check for ads FIRST, before any feature computation
-    ad_result = _ad_penalty(text)
+    ad_result = _ad_penalty(text, cfg=cfg)
     
     if ad_result["flag"]:
         # Return a clip that will be filtered out entirely
@@ -753,6 +759,7 @@ def compute_features_v4(segment: Dict, audio_file: str, y_sr=None, genre: str = 
         "_ad_flag": ad_result["flag"],
         "_ad_penalty": ad_result["penalty"],
         "_ad_reason": ad_result["reason"],
+        "ad_likelihood": ad_result["penalty"],  # Use penalty as likelihood score
         "_niche_penalty": niche_penalty,
         "_niche_reason": niche_reason,
         "type": segment.get("type", "general"),  # Preserve moment type for bonuses
@@ -795,6 +802,21 @@ def compute_features_v4(segment: Dict, audio_file: str, y_sr=None, genre: str = 
         feats["hook_score"] = float(h_cal)
         feats.setdefault("_debug", {})
         feats["_debug"]["hook_v5"] = h_dbg
+    
+    # Apply hook clamping for ad-like content and repetition
+    hook = feats.get("hook_score", 0.0)
+    ad_like = feats.get("ad_likelihood", 0.0)
+    
+    # Clamp hook for ad-like content
+    if ad_like >= _cfg(cfg, "HOOK_AD_CLAMP_MIN"):
+        hook = min(hook, _cfg(cfg, "HOOK_AD_CLAMP"))
+    
+    # Penalize repetition at the open
+    opener = text[:_cfg(cfg, "REP_WINDOW_CHARS")]
+    if _repetition_ratio(opener) >= _cfg(cfg, "HOOK_REP_MIN_RATIO"):
+        hook *= _cfg(cfg, "HOOK_REP_PENALTY_MULT")
+    
+    feats["hook_score"] = hook
     
     # Add missing fields that enhanced version returns (set to zeros for compatibility)
     feats.update({
@@ -910,6 +932,10 @@ def _loopability_heuristic(text: str) -> float:
     
     # Curiosity enders - questions or incomplete thoughts
     if t.endswith('?') or t.endswith('...') or t.endswith('but'):
+        score += 0.15
+    
+    # End-on-curiosity bonus - check final 1-2s for curiosity-raising patterns
+    if _ends_on_curiosity(text):
         score += 0.15
     
     # Short, punchy statements
@@ -1350,72 +1376,97 @@ def grow_to_bins(segment: dict, audio_file: str, genre: str, platform: str, eos_
 
 # payoff_guard is imported from scoring_utils
 
-def _ad_penalty(text: str) -> dict:
-    """Enhanced ad detection with comprehensive patterns"""
+# Ad detection patterns and helpers
+AD_PHRASES = {
+    "brought to you by", "sponsored by", "use code", "limited time",
+    "shop now", "link in bio", "link in description", "free shipping",
+    "visit", "learn more", "order today", "act now", "save", "discount"
+}
+
+DOMAIN_RE = re.compile(r'\b(?:https?://|www\.)?[a-z0-9-]+\.(?:com|net|org|io|co)\b', re.I)
+SPELLOUT_RE = re.compile(
+    r'\b(?:[a-z](?:\s*-\s*|\.?\s*)){3,}[a-z]\s*(?:dot|\.)\s*(?:com|net|org|io|co)\b', re.I
+)
+
+CTA_TOKENS = {"shop", "buy", "save", "order", "visit", "subscribe", "download", "sign", "sign up"}
+
+# Safe defaults for when config is not passed
+_DEFAULTS = dict(
+    ALLOW_ADS=0,
+    AD_SIG_MIN=0.50,
+    HOOK_AD_CLAMP_MIN=0.40,
+    HOOK_AD_CLAMP=0.30,
+    REP_WINDOW_CHARS=200,
+    HOOK_REP_MIN_RATIO=0.30,
+    HOOK_REP_PENALTY_MULT=0.70,
+    Q_ONLY_MIN_Q=0.50,
+    Q_ONLY_MAX_PAYOFF=0.15,
+    LOG_AD_SIGNALS=1,
+)
+
+def _cfg(cfg, key):
+    """Get config value with safe defaults"""
+    return getattr(cfg, key, _DEFAULTS[key]) if cfg else _DEFAULTS[key]
+
+def _ad_likelihood(text: str, cfg=None) -> float:
+    """Comprehensive ad likelihood scoring"""
     t = text.lower()
+    score = 0.0
+    reasons = []
     
-    # Critical ad phrases that should trigger immediate filtering
-    if any(phrase in t for phrase in [
-        "sponsored by", "brought to you by", "visit our", "check out",
-        "use code", "promo code", "discount code", "click the link",
-        "in the description", "link in bio", "follow us on",
-        "limited time offer", "special offer", "exclusive deal",
-        # New additions for your test data
-        "flu shots", "wellness event", "applicable state law",
-        "at cox", "cox.com", "blocks online threats", "advanced security",
-        "age restrictions", "availability and applicable",
-        # Additional promotional patterns
-        "code", "off your order", "fuel smarter", "play harder",
-        "visit", "website", "promo", "discount", "save", "deal",
-        "offer", "special", "limited time", "exclusive", "free",
-        "subscribe", "follow", "like and subscribe", "link in bio",
-        # Enhanced finance promo detection
-        "chase sapphire", "amex platinum", "gold card", "credit card",
-        "points per dollar", "sign up bonus", "annual fee", "membership rewards",
-        "tap to apply", "apply now", "exclusive offer", "preferred", "reserve",
-        # Additional promo patterns from user feedback
-        "day pass", "instant access", "starting at", "subscribe now",
-        "watch live on", "sign up", "apply now", "terms apply", "/month",
-        # Expanded patterns to catch trace examples
-        "join the", "million customers", "thousand customers", "call 1-800",
-        "visit", "grainger", "just $", "customers who choose",
-        # Additional patterns from user feedback
-        "balance of nature", "supplement", "fiberns spice", "call 1-800-grainger",
-        "starting at just $", "day pass", "instant access", "terms apply"
-    ]):
-        return {"flag": True, "penalty": 0.95, "reason": "obvious_promotion"}
+    # URLs / domains
+    if DOMAIN_RE.search(t):
+        score += 0.45
+        reasons.append("domain")
+    if SPELLOUT_RE.search(t):  # catches "wayfair dot com", "w-a-y-f-a-i-r dot com"
+        score += 0.45
+        reasons.append("spellout")
     
-    # Corporate/brand language
-    if any(phrase in t for phrase in [
-        "we're always", "like your", "before there's trouble",
-        "that blocks", "knows when the", "step ahead"
-    ]):
-        return {"flag": True, "penalty": 0.85, "reason": "corporate_language"}
+    # Sponsor phrases / CTAs
+    if any(p in t for p in AD_PHRASES):
+        score += 0.25
+        reasons.append("ad_phrases")
     
-    # Promotional language
-    if any(phrase in t for phrase in [
-        "just ask", "visit", "learn more", "call now", "get your",
-        "for a buck", "no contracts", "no hassle", "pure unfiltered",
-        "sports extra", "game day", "slain.com"
-    ]):
-        return {"flag": True, "penalty": 0.30, "reason": "promotional_language"}
+    cta_hits = sum(tok in t for tok in CTA_TOKENS)
+    if cta_hits >= 2:
+        score += 0.15
+        reasons.append("cta")
     
-    # Self-promotion
-    if any(phrase in t for phrase in [
-        "my company", "our product", "my book", "my course",
-        "subscribe to", "follow me", "my website", "my podcast",
-        "my business", "my startup", "my team"
-    ]):
-        return {"flag": True, "penalty": 0.20, "reason": "self_promotion"}
+    # Brand repetition (proper-nounish token repeated 2–3x in short span)
+    properish = re.findall(r'\b([A-Z][a-zA-Z]{2,})\b', text)
+    if properish:
+        from collections import Counter
+        rep = max(Counter(properish).values())
+        if rep >= 3:
+            score += 0.20
+            reasons.append("repetition")
+        elif rep == 2:
+            score += 0.10
+            reasons.append("repetition")
     
-    # Subtle promotion
-    if any(phrase in t for phrase in [
-        "i wrote", "i created", "i built", "i founded",
-        "i developed", "i designed", "i launched"
-    ]):
-        return {"flag": True, "penalty": 0.10, "reason": "subtle_promotion"}
+    # Log ad signals if enabled
+    if reasons and _cfg(cfg, "LOG_AD_SIGNALS"):
+        logging.getLogger(__name__).debug(f"AD_SCAN: like={score:.2f} reasons={reasons}")
     
-    return {"flag": False, "penalty": 0.0, "reason": "no_promotion"}
+    return min(1.0, score)
+
+def _repetition_ratio(snippet: str) -> float:
+    """Calculate repetition ratio in text snippet"""
+    toks = re.findall(r"[a-zA-Z']+", snippet.lower())
+    if not toks: return 0.0
+    uniq = len(set(toks))
+    return 1.0 - (uniq / max(1, len(toks)))
+
+def _ad_penalty(text: str, cfg=None) -> dict:
+    """Enhanced ad detection with comprehensive patterns"""
+    ad_like = _ad_likelihood(text, cfg=cfg)
+    is_ad = ad_like >= _cfg(cfg, "AD_SIG_MIN")
+    
+    return {
+        "flag": is_ad,
+        "penalty": ad_like,
+        "reason": "ad_likelihood" if is_ad else "no_promotion"
+    }
 
 def _platform_length_match(duration: float, platform: str = 'tiktok') -> float:
     """Calculate how well the duration matches platform preferences"""
@@ -1634,10 +1685,14 @@ def _detect_payoff(text: str, genre: str = 'general') -> tuple[float, str]:
     if n >= 12:
         a = " ".join(words[:int(n*0.40)])
         b = " ".join(words[int(n*0.40):int(n*0.70)])
-        d = _uncertainty_score(a) - _uncertainty_score(b)
-        if d <= 0.0:
+        uncertainty_before = _uncertainty_score(a)
+        uncertainty_after = _uncertainty_score(b)
+        d = uncertainty_before - uncertainty_after
+        THRESH = 0.02  # was 0.0; require actual uncertainty reduction
+        if d <= THRESH:
             # disable payoff unless other strong markers redeem it
             score -= 0.2  # pushes final clip toward penalties if no resolution
+            reasons.append(f"unfinished_tail_penalty(unc_before={uncertainty_before:.3f},unc_after={uncertainty_after:.3f},delta={d:.3f})")
     
     # Resolution patterns
     resolution_patterns = [

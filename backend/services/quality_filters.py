@@ -2,6 +2,9 @@
 from typing import Dict, List, Any
 import numpy as np
 import re
+import math
+from collections import Counter
+from math import sqrt
 
 _AD_PATTERNS = [
     r"\b(visit|go to|use code|promo code|sponsored by|brought to you by)\b",
@@ -51,6 +54,35 @@ def _ad_like_score(text: str) -> float:
 
 logger = logging.getLogger(__name__)
 log = logging.getLogger("services.quality_filters")
+
+# Safe defaults for when config is not passed
+_DEFAULTS = {
+    # finish/terminal detection helpers
+    "REFINE_MIN_TAIL_SILENCE": 0.12,  # seconds of (near) silence to consider "finished"
+    "REFINE_SNAP_MAX_NUDGE":   0.35,  # max nudge when snapping to punct/boundary
+
+    # "question-only" drop rule (no payoff, mostly question/list)
+    "DROP_Q_ONLY_QMIN":       0.50,   # q_or_list >= 0.5
+    "DROP_Q_ONLY_PAYOFF_MAX": 0.15,   # AND payoff < 0.15
+
+    # hook repetition clamp (only if you're clamping hook for repeated openers)
+    "REP_HOOK_FIRST_N_CHARS": 200,
+    "REP_HOOK_CLAMP_MAX":     0.65,   # cap normalized hook if repetition is high
+
+    # ad gating (quality gates compare against ad_likelihood computed in features)
+    "ALLOW_ADS":   False,     # default: block ads
+    "AD_SIG_MIN":  0.60,      # treat >= 0.60 as ad-ish; tune as you like
+}
+
+_warned_cfg_none = False
+def _cfg(cfg, key, default=None):
+    global _warned_cfg_none
+    if cfg is None and not _warned_cfg_none:
+        logger.warning("quality_filters: cfg=None; using built-in defaults")
+        _warned_cfg_none = True
+    if default is None:
+        default = _DEFAULTS.get(key)
+    return getattr(cfg, key, default) if cfg is not None else default
 
 # Tunables
 _LONG_SEC_1 = 20.0   # minimum for "long"
@@ -479,10 +511,15 @@ def _filter_low_quality_impl(candidates, gate_mode):
         reason_summary = ", ".join([f"{reason}: {count}" for reason, count in drop_reasons.items()])
         logger.info(f"Quality filter rejections: {reason_summary}")
     
-    # Enforce minimum keep
+    # Enforce minimum keep with payoff preference
     if len(text_filtered) < 3:
-        text_filtered = sorted(candidates, key=lambda x: x.get("final_score", 0.0), reverse=True)[:3]
-        logger.warning(f"No candidates passed text quality gates, keeping top {len(text_filtered)} candidates")
+        # Prioritize clips with payoff > 0 when falling back
+        survivors = sorted(candidates, key=lambda c: (
+            -(c.get("features", {}).get("payoff_score", 0.0) > 0.0),
+            -c.get("final_score", c.get("display_score", 0.0))
+        ))
+        text_filtered = survivors[:3]
+        logger.warning(f"No candidates passed text quality gates, keeping top {len(text_filtered)} candidates (payoff-prioritized)")
     
     # Dynamic soft floor based on episode size
     min_keep = 3  # Default minimum
@@ -496,9 +533,14 @@ def _filter_low_quality_impl(candidates, gate_mode):
     # Check if we need to add more candidates
     if len(text_filtered) < min_keep:
         additional_needed = min_keep - len(text_filtered)
-        additional_candidates = [c for c in sorted(candidates, key=lambda x: x.get("final_score", 0.0), reverse=True) if c not in text_filtered][:additional_needed]
+        # Use same payoff-prioritized sorting for additional candidates
+        remaining = [c for c in candidates if c not in text_filtered]
+        additional_candidates = sorted(remaining, key=lambda c: (
+            -(c.get("features", {}).get("payoff_score", 0.0) > 0.0),
+            -c.get("final_score", c.get("display_score", 0.0))
+        ))[:additional_needed]
         text_filtered.extend(additional_candidates)
-        logger.info(f"Applied soft floor: added {len(additional_candidates)} candidates to reach minimum {min_keep}")
+        logger.info(f"Applied soft floor: added {len(additional_candidates)} candidates to reach minimum {min_keep} (payoff-prioritized)")
     
     # Helpful debug - log a compact sample of the actual numbers we used
     try:
@@ -588,7 +630,23 @@ def _ends_with_punct(cand) -> bool:
     txt = cand.get("text") or cand.get("preview") or ""
     return str(txt).strip().endswith(_END_PUNCT)
 
-def _is_finished_like(cand: dict, *, fallback: bool, tail_close_sec: float = 0.75):
+def _is_finished_like(cand: dict, *, fallback: bool, tail_close_sec: float = 0.75, cfg=None):
+    # 1) Hard-drop ads unless explicitly allowed
+    allow_ads = _cfg(cfg, "ALLOW_ADS", False)
+    if cand.get("ad") and not allow_ads:
+        return False, "DROP_AD"
+    
+    # 2) Drop question-only bait (configurable threshold)
+    qmin = _cfg(cfg, "DROP_Q_ONLY_QMIN", 0.50)
+    pmax = _cfg(cfg, "DROP_Q_ONLY_PAYOFF_MAX", 0.15)
+    if (cand.get("q_list", 0.0) >= qmin and
+        cand.get("payoff", 0.0)  <  pmax):
+        return False, "DROP_Q_ONLY"
+    
+    # 3) Classic bait: huge hook, no payoff
+    if cand.get("hook", 0.0) >= 0.80 and cand.get("payoff", 0.0) < 0.10:
+        return False, "DROP_BAIT_NO_PAYOFF"
+    
     # ft_classifier can be "finished" / "sparse_finished" / "missing"
     ft = (cand.get("ft_classifier") or "").lower()
     if ft in ("finished", "sparse_finished"):
@@ -641,11 +699,11 @@ def _is_finished_like(cand: dict, *, fallback: bool, tail_close_sec: float = 0.7
 
     return False, "DROP_UNFINISHED"
 
-def _apply_quality_gates_fallback_aware(candidates, *, fallback: bool, tail_close_sec: float):
+def _apply_quality_gates_fallback_aware(candidates, *, fallback: bool, tail_close_sec: float, cfg=None):
     kept = []
     reasons = Counter()
     for c in candidates:
-        ok, tag = _is_finished_like(c, fallback=fallback, tail_close_sec=tail_close_sec)
+        ok, tag = _is_finished_like(c, fallback=fallback, tail_close_sec=tail_close_sec, cfg=cfg)
         reasons[tag] += 1
         if ok:
             kept.append(c)
@@ -653,7 +711,7 @@ def _apply_quality_gates_fallback_aware(candidates, *, fallback: bool, tail_clos
     return kept, dict(reasons)
 
 # Public API expected by clip_score.py (compat layer)
-def essential_gates(candidates, *, fallback: bool = False, tail_close_sec: float = 1.5):
+def essential_gates(candidates, *, fallback: bool = False, tail_close_sec: float = 1.5, cfg=None):
     """
     Fallback-aware replacement for the old gating function.
     - Accepts 'finished' always.
@@ -665,5 +723,46 @@ def essential_gates(candidates, *, fallback: bool = False, tail_close_sec: float
         logger.info("GATES: kept=0/0, reasons=%s", {})
         return [], {}
     return _apply_quality_gates_fallback_aware(
-        candidates, fallback=fallback, tail_close_sec=tail_close_sec
+        candidates, fallback=fallback, tail_close_sec=tail_close_sec, cfg=cfg
     )
+
+def _tfidf_embed(texts: list[str]) -> list[dict[str,float]]:
+    """Create TF-IDF embeddings for semantic similarity"""
+    docs = [Counter(re.findall(r"[a-z0-9]+", t.lower())) for t in texts]
+    df = Counter()
+    for d in docs: df.update(d.keys())
+    N = len(texts)
+    vecs = []
+    for d in docs:
+        denom = float(sum(d.values()) or 1)
+        v = {}
+        for w,c in d.items():
+            idf = math.log((N+1)/(1+df[w])) + 1.0
+            v[w] = (c/denom) * idf
+        vecs.append(v)
+    return vecs
+
+def _cos(a: dict, b: dict) -> float:
+    """Cosine similarity between two TF-IDF vectors"""
+    common = set(a) & set(b)
+    num = sum(a[w]*b[w] for w in common)
+    da = sqrt(sum(x*x for x in a.values())); db = sqrt(sum(x*x for x in b.values()))
+    return 0.0 if da==0 or db==0 else (num/(da*db))
+
+def mmr_select_semantic(cands: list[dict], K: int, lam: float = 0.7) -> list[dict]:
+    """Semantic MMR selection using TF-IDF embeddings"""
+    if not cands: return []
+    texts = [c["text"] for c in cands]
+    E = _tfidf_embed(texts)
+    selected = [0]  # assume input is relevance-sorted
+    while len(selected) < min(K, len(cands)):
+        best_idx, best_score = None, -1e9
+        for i in range(len(cands)):
+            if i in selected: continue
+            rel = cands[i].get("rank_score", cands[i].get("display_score", 0.0))
+            div = max(_cos(E[i], E[j]) for j in selected) if selected else 0.0
+            mmr_val = lam*rel - (1.0-lam)*div
+            if mmr_val > best_score:
+                best_idx, best_score = i, mmr_val
+        selected.append(best_idx)
+    return [cands[i] for i in selected]
