@@ -7,6 +7,28 @@ from typing import Dict, List, Tuple, Any, Iterable, Optional, Literal
 from dataclasses import dataclass
 import logging
 from bisect import bisect_left
+import re
+
+# --- precision helpers ---
+_UNCERTAINTY = ["maybe","might","could","kinda","sort of","somewhat","probably","possibly","perhaps","i think","i guess","i feel like"]
+_CAUSAL = ["because","therefore","thus","which means","that means","as a result","here's why","the reason"]
+_CONTRA_OPEN = re.compile(r"\b(most|many|people|everyone|they)\s+(think|say|assume)\b", re.I)
+_CONTRA_FLIP = re.compile(r"\bbut\s+actually\b|\bhowever\b|\bbut\s+(it|this)\s+isn'?t\b", re.I)
+
+def _uncertainty_score(txt: str) -> float:
+    t = txt.lower()
+    hits = sum(t.count(w) for w in _UNCERTAINTY)
+    tokens = max(1, len(re.findall(r"[A-Za-z0-9']+", txt)))
+    return hits/tokens
+
+def _aha_density(txt: str, dur: float) -> float:
+    if dur <= 0: return 0.0
+    t = txt or ""
+    causal = sum(1 for w in _CAUSAL if w in t.lower())
+    ents = len(set(re.findall(r"\b[A-Z][a-zA-Z]{2,}\b", txt)))
+    nums = len(re.findall(r"\b\d+(\.\d+)?\b|%|percent|x\s*times", txt, re.I))
+    return min(1.0, (causal + ents + nums)/max(1.0, dur))
+# -----------------------------------------
 
 FTStatus = Literal["finished", "sparse_finished", "unresolved"]
 
@@ -1605,6 +1627,18 @@ def _detect_payoff(text: str, genre: str = 'general') -> tuple[float, str]:
     score = 0.0
     reasons = []
     
+    # Guard: require uncertainty to drop from tease→resolution
+    # Split 40/30/30 across the text as a proxy for time.
+    words = text.split()
+    n = len(words)
+    if n >= 12:
+        a = " ".join(words[:int(n*0.40)])
+        b = " ".join(words[int(n*0.40):int(n*0.70)])
+        d = _uncertainty_score(a) - _uncertainty_score(b)
+        if d <= 0.0:
+            # disable payoff unless other strong markers redeem it
+            score -= 0.2  # pushes final clip toward penalties if no resolution
+    
     # Resolution patterns
     resolution_patterns = [
         r"(so|therefore|thus|as a result|consequently)",
@@ -1906,6 +1940,11 @@ def _hook_score_v4(text: str, arousal: float = 0.0, words_per_sec: float = 0.0, 
     
     text_lower = text.lower()
     
+    # Pattern interrupt: "most people think ... but actually ..."
+    if _CONTRA_OPEN.search(text_lower) and _CONTRA_FLIP.search(text_lower):
+        hook_score += 0.15
+        reasons.append("contradiction_flip")
+    
     # Check for hook indicators
     for indicator in hook_indicators:
         if indicator in text_lower:
@@ -2164,6 +2203,16 @@ def compute_features_v4_enhanced(segment: Dict, audio_file: str, y_sr=None, genr
         features.q_list = whitened_paths['q_list']
         features.loopability = whitened_paths['loopability']
         features.platform_length = whitened_paths['platform_length']
+        
+        # Aha density boost (insightful + quantified statements)
+        try:
+            dur = float(segment.get("end",0.0) - segment.get("start",0.0))
+            aha = _aha_density(segment.get("text",""), dur)
+            white_info = float(whitened_paths['info_density'])
+            whitened_paths['info_density'] = min(1.0, 0.5*white_info + 0.5*aha)
+            features.info_density = whitened_paths['info_density']
+        except Exception:
+            pass
     
     # Apply genre confidence blending if enabled
     genre_debug = {}

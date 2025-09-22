@@ -165,9 +165,11 @@ async def preview_cache_headers(request, call_next):
 # Import secure routers
 from routes.downloads import router as downloads_router
 from routes.secure_uploads import router as uploads_router
+from routes.previews import router as previews_router
 
 app.include_router(downloads_router)
 app.include_router(uploads_router)
+app.include_router(previews_router)
 
 # Note: Removed public static file mounts for security
 # Use /api/signed-download and /api/download/ endpoints with authentication instead
@@ -807,7 +809,7 @@ async def upload_youtube_episode(
                 # 4) Ensure **video** previews exist for UI (20s default)
                 #    Non-breaking: if preview already present, `ensure_preview` is a no-op
                 for c in scored:
-                    preview_url = ensure_preview(
+                    preview_name = ensure_preview(
                         source_media=Path(info["video_path"]),
                         episode_id=episode_id,
                         clip_id=c["id"],
@@ -815,9 +817,9 @@ async def upload_youtube_episode(
                         end_sec=float(c["end"]),
                         max_preview_sec=20.0
                     )
-                    # Store the preview URL in the clip data
-                    if preview_url:
-                        c["preview_url"] = preview_url
+                    # Store the preview filename in the clip data
+                    if preview_name:
+                        c["preview_name"] = preview_name
 
                 # 5) Titles (existing)
                 # Generate titles for each scored clip
@@ -1358,7 +1360,7 @@ async def get_episode_clips(episode_id: str, regenerate: bool = False, backgroun
                 end_sec = float(clip.get("end", 0))
                 
                 # Check if preview already exists or generate it
-                preview_url = None
+                preview_name = None
                 if source_media and source_media.exists():
                     # Try to get existing preview first
                     from services.preview_service import build_preview_filename, ensure_preview
@@ -1369,11 +1371,11 @@ async def get_episode_clips(episode_id: str, regenerate: bool = False, backgroun
                     preview_path = Path(OUTPUT_DIR) / "previews" / preview_filename
                     
                     if preview_path.exists() and preview_path.stat().st_size > 0:
-                        preview_url = f"/clips/previews/{preview_filename}"
+                        preview_name = preview_filename
                     else:
                         # Generate preview synchronously for immediate availability
                         try:
-                            generated_url = ensure_preview(
+                            generated_name = ensure_preview(
                                 source_media=source_media,
                                 episode_id=episode_id,
                                 clip_id=clip_id,
@@ -1383,9 +1385,9 @@ async def get_episode_clips(episode_id: str, regenerate: bool = False, backgroun
                                 pad_start_sec=-0.08,  # Fix E: -80ms start padding
                                 pad_end_sec=0.24,     # Fix E: +240ms end padding
                             )
-                            if generated_url:
-                                preview_url = generated_url
-                                logger.info(f"Generated preview for clip {clip_id}: {preview_url}")
+                            if generated_name:
+                                preview_name = generated_name
+                                logger.info(f"Generated preview for clip {clip_id}: {preview_name}")
                             else:
                                 logger.warning(f"Failed to generate preview for clip {clip_id}")
                         except Exception as e:
@@ -1398,7 +1400,7 @@ async def get_episode_clips(episode_id: str, regenerate: bool = False, backgroun
                 slice_src = "variant_cut" if duration_s > 12.0 else "default"
                 
                 # Try to get actual preview duration if preview exists
-                if preview_url and preview_path.exists():
+                if preview_name and preview_path.exists():
                     try:
                         import subprocess
                         result = subprocess.run([
@@ -1420,19 +1422,18 @@ async def get_episode_clips(episode_id: str, regenerate: bool = False, backgroun
                     "duration": duration_s,
                     "duration_s": duration_s,  # Explicit field for frontend
                     "preview_duration_s": preview_duration_s,  # Server-measured duration
-                    "preview_url": preview_url,  # Add preview URL to the response
+                    "preview_name": preview_name,  # Add preview filename to the response
                     "slice_src": slice_src,  # "variant_cut" vs "default"
                     "protected": clip.get("protected", False),  # Protected flag
                     "protected_long": clip.get("protected_long", False),  # Fix A: protected_long flag
                     "rank_primary": clip.get("rank_primary", i),  # Fix A: explicit ranking
                     "reason": clip.get("reason", ""),
                     "features": clip.get("features", {}),
-                    "is_advertisement": clip.get("is_advertisement", False),
-                    "previewUrl": preview_url
+                    "is_advertisement": clip.get("is_advertisement", False)
                 })
             
             # Server-side assertions (don't regress checks)
-            previews_generated = [c for c in formatted_clips if c.get("previewUrl")]
+            previews_generated = [c for c in formatted_clips if c.get("preview_name")]
             logger.info(f"PREVIEW_ASSERT: generated {len(previews_generated)}/{len(formatted_clips)} previews")
             
             # Check for duration drift warnings

@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field, conint, confloat, field_validator, model_
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/episodes", tags=["clips"])
+router = APIRouter(prefix="/api", tags=["clips"])
 
 # Constants
 MAX_TARGET_COUNT = 50
@@ -329,7 +329,7 @@ def get_clips(ep_id: str):
     clips = _load_clips(ep_id)
     return {"ok": True, "ready": True, "clips": clips}
 
-@router.get("/api/clips/{clip_id}/transcript")
+@router.get("/clips/{clip_id}/transcript")
 def get_clip_transcript(clip_id: str):
     """Get exact transcript for a clip, building on-demand if needed"""
     from services.episode_service import EpisodeService
@@ -374,6 +374,55 @@ def get_clip_transcript(clip_id: str):
     }
 
     etag = hashlib.md5(txt.encode("utf-8")).hexdigest()
+    resp = JSONResponse(payload)
+    resp.headers["ETag"] = etag
+    return resp
+
+@router.get("/clips/{clip_id}/words")
+def get_clip_words(clip_id: str, format: str = "duration"):
+    """
+    Return word-level timestamps for a clip (aligned to clip start/end).
+    Default format: {t, d, w} (startTime, duration, word)
+    Use ?format=range for {t0, t1, w} compatibility
+    """
+    from services.episode_service import EpisodeService
+    from services.transcript_builder import slice_words_by_time
+
+    svc = EpisodeService()
+    clip, episode = None, None
+    for ep in svc.episodes.values():
+        if getattr(ep, "clips", None):
+            for c in ep.clips:
+                if c.get("id") == clip_id:
+                    clip, episode = c, ep
+                    break
+        if clip: break
+
+    if not clip or not episode or not getattr(episode, "words", None):
+        raise HTTPException(404, "Clip or words not found")
+
+    start, end = float(clip["start"]), float(clip["end"])
+    words = slice_words_by_time(episode.words, start, end, pad_s=0.25)
+    
+    if format == "range":
+        # Legacy format for compatibility
+        payload = {
+            "start": int(round(start * 1000)),
+            "end": int(round(end * 1000)),
+            "words": [{"t0": int(round(w.get("start",0.0) * 1000)), "t1": int(round(w.get("end",0.0) * 1000)), "w": w.get("text","")} for w in words]
+        }
+    else:
+        # Default format: {t, d, w}
+        payload = {
+            "clipId": clip_id,
+            "start": start, "end": end,
+            "words": [
+                {"t": float(w.get("start",0.0)), "d": float(w.get("dur", w.get("end",0.0)-w.get("start",0.0))), "w": w.get("text","")}
+                for w in words
+            ]
+        }
+    
+    etag = hashlib.md5((clip_id + str(len(payload["words"]))).encode("utf-8")).hexdigest()
     resp = JSONResponse(payload)
     resp.headers["ETag"] = etag
     return resp

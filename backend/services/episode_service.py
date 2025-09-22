@@ -134,6 +134,10 @@ class EpisodeService:
             
             for filename in recent_files:
                 if filename.endswith('.json'):
+                    # Skip words-only files - they're not episodes
+                    if filename.endswith('_words.json'):
+                        continue
+                        
                     episode_id = filename[:-5]  # Remove .json extension
                     filepath = os.path.join(self.storage_dir, filename)
                     

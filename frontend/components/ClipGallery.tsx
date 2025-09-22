@@ -5,70 +5,8 @@ import Modal from "./Modal";
 import { Clip } from "@shared/types";
 import { getClipsSimple, apiUrl, type ClipSimple } from "../src/shared/api";
 import { onClipsReady } from "../src/shared/events";
+import { PreviewPlayer } from "../src/components/PreviewPlayer";
 
-// Robust video preview component with error handling and remounting
-function VideoPreview({ src, isVideo, isAudio, clipId }: { 
-  src: string; 
-  isVideo: boolean; 
-  isAudio: boolean; 
-  clipId: string; 
-}) {
-  const [error, setError] = useState(false);
-  
-  if (!src) {
-    return (
-      <div className="h-full w-full flex items-center justify-center bg-gradient-to-br from-gray-100 to-gray-200">
-        <div className="text-center">
-          <div className="w-16 h-16 mx-auto mb-2 bg-gray-400 rounded-full flex items-center justify-center">
-            <span className="text-white text-2xl">📄</span>
-          </div>
-          <p className="text-sm text-gray-600 font-medium">No Preview</p>
-        </div>
-      </div>
-    );
-  }
-
-  if (isVideo && !error) {
-    return (
-      <video
-        key={src} // Force remount when src changes
-        src={src}
-        className="h-full w-full object-cover"
-        data-clip-id={clipId}
-        controls
-        muted={false}
-        playsInline
-        preload="metadata"
-        onError={() => setError(true)}
-        style={{ background: "#000" }}
-      />
-    );
-  }
-
-  if (isAudio && !error) {
-    return (
-      <div className="h-full w-full flex items-center justify-center bg-gradient-to-br from-blue-100 to-purple-100">
-        <div className="text-center">
-          <div className="w-16 h-16 mx-auto mb-2 bg-blue-500 rounded-full flex items-center justify-center">
-            <span className="text-white text-2xl">🎵</span>
-          </div>
-          <p className="text-sm text-gray-600 font-medium">Audio Preview</p>
-        </div>
-      </div>
-    );
-  }
-
-  // Fallback to audio if video fails or if it's not clearly video/audio
-  return (
-    <audio
-      key={src + ":audio"}
-      src={src}
-      controls
-      className="h-full w-full"
-      onError={() => setError(true)}
-    />
-  );
-}
 
 type Props = {
   clips?: Clip[]; // Make optional since we can fetch them ourselves
@@ -96,17 +34,6 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
   // Use clips from props if provided, otherwise use internal state
   const displayClips = clips || internalClips;
 
-  // Normalize preview URL from various possible field names and ensure absolute
-  const normalizeSrc = (clip: Clip | ClipSimple) => {
-    const raw =
-      (clip as any).previewUrl ||
-      (clip as any).preview_url ||
-      (clip as any).video_url ||
-      (clip as any).audio_url || "";
-    if (!raw) return "";
-    if (raw.startsWith("http://") || raw.startsWith("https://")) return raw;
-    return apiUrl(raw);
-  };
 
   // Convert ClipSimple to Clip format
   const convertToClip = (simpleClip: ClipSimple): Clip => {
@@ -125,7 +52,7 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
       status: 'completed' as const,
       features: {},
       downloadUrl: null,
-      previewUrl: normalizeSrc(simpleClip),
+      previewUrl: null, // Will be handled by PreviewPlayer
       error: null,
     };
   };
@@ -219,21 +146,6 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
     [clips]
   );
 
-  const handlePlayPause = (clip: Clip) => {
-    const selector = `video[data-clip-id="${clip.id}"]`;
-    const thisVideo = document.querySelector(selector) as HTMLVideoElement | null;
-    const allVideos = Array.from(document.querySelectorAll('video[data-clip-id]')) as HTMLVideoElement[];
-    // Pause all others
-    allVideos.forEach(v => { if (v !== thisVideo) { v.pause(); v.currentTime = 0; } });
-    if (!thisVideo) return;
-    if (!thisVideo.paused) {
-      thisVideo.pause();
-      setPlayingClipId(null);
-      return;
-    }
-    thisVideo.muted = false;
-    thisVideo.play().then(() => setPlayingClipId(clip.id)).catch(() => {});
-  };
 
   const generateNewTitle = async (clipId: string) => {
     if (process.env.NODE_ENV === 'development') {
@@ -388,9 +300,6 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
       {!loading && !error && displayClips.length > 0 && (
         <div className="grid gap-4 sm:gap-6 grid-cols-1 sm:grid-cols-2 lg:grid-cols-3">
         {displayClips.map((clip) => {
-          const src = normalizeSrc(clip);
-          const isVideo = src && src.match(/\.(mp4|mov|webm|avi)$/i);
-          const isAudio = src && src.match(/\.(mp3|m4a|aac|ogg|wav)$/i);
           return (
             <div
               key={clip.id}
@@ -399,11 +308,9 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
               {/* Decorative accent */}
               <div className="absolute top-0 right-0 w-16 h-16 bg-yellow-200 rounded-full -translate-y-8 translate-x-8 opacity-30 group-hover:opacity-50 transition-opacity"></div>
               <div className="aspect-video w-full overflow-hidden rounded-t-2xl bg-neutral-100">
-                <VideoPreview 
-                  src={normalizeSrc(clip)}
-                  isVideo={isVideo}
-                  isAudio={isAudio}
-                  clipId={clip.id}
+                <PreviewPlayer 
+                  clip={clip}
+                  className="h-full w-full"
                 />
               </div>
 
@@ -542,13 +449,12 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
               <p className="text-sm text-gray-600">{selected.text}</p>
             </div>
           )}
-          {selected && normalizeSrc(selected) && (
+          {selected && (
             <div className="mb-4">
               <h5 className="font-medium mb-2">Preview:</h5>
-              <audio 
-                src={normalizeSrc(selected)} 
-                controls
-                className="w-full" 
+              <PreviewPlayer 
+                clip={selected}
+                className="w-full"
               />
             </div>
           )}

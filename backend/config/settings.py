@@ -36,6 +36,11 @@ DATABASE_URL = os.getenv("DATABASE_URL", "supabase")
 # Security settings
 SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-key-change-in-production")
 
+# Preview settings (secure signed URLs)
+PREVIEW_FS_DIR = os.getenv("PREVIEW_FS_DIR", str(Path(OUTPUT_DIR) / "previews"))
+PREVIEW_SIGNING_KEY = os.getenv("PREVIEW_SIGNING_KEY", SECRET_KEY)  # Use SECRET_KEY as fallback
+PREVIEW_URL_TTL_SECONDS = int(os.getenv("PREVIEW_URL_TTL_SECONDS", "600"))  # 10 minutes
+
 # API settings
 API_PREFIX = "/api"
 
@@ -71,5 +76,5 @@ PRERANK_WEIGHTS = {
 }
 
 # Duration targets for pre-rank scoring
-DURATION_TARGET_MIN = int(os.getenv("DURATION_TARGET_MIN", "12"))
-DURATION_TARGET_MAX = int(os.getenv("DURATION_TARGET_MAX", "45"))
+DURATION_TARGET_MIN = int(os.getenv("DURATION_TARGET_MIN", "8"))
+DURATION_TARGET_MAX = int(os.getenv("DURATION_TARGET_MAX", "90"))

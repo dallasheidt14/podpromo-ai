@@ -43,6 +43,9 @@ export default function EpisodeUpload({
   const didFetchRef = useRef(false);
   const pollerRef = useRef<Poller | null>(null);
 
+  // Explicit file input fallback (reliable on Safari/iOS and when dropzone click is blocked)
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
   // New progress poller hook for YouTube uploads
   useProgressPoller(episodeId || undefined, {
     onUpdate: (p: ProgressResponse) => {
@@ -354,6 +357,23 @@ export default function EpisodeUpload({
 
   return (
     <div className="w-full max-w-2xl mx-auto">
+      {/* Hidden manual file picker to bypass any dropzone click issues */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="audio/*,video/*"
+        className="sr-only"
+        onChange={(e) => {
+          const f = e.currentTarget.files?.[0];
+          if (f) {
+            // Reuse your existing onDrop pipeline
+            // Note: onDrop expects File[] just like react-dropzone
+            onDrop([f]);
+            // reset so selecting the same file again fires onChange
+            e.currentTarget.value = '';
+          }
+        }}
+      />
       <AnimatePresence>
         {uploadStatus === 'idle' && (
           <motion.div
@@ -393,6 +413,14 @@ export default function EpisodeUpload({
             {uploadMode === 'file' && (
               <div
                 className="group relative rounded-xl border-2 border-dashed border-gray-300 bg-gray-50 p-8 text-center hover:border-blue-400 hover:bg-blue-50 transition-all duration-300 cursor-pointer"
+                role="button"
+                tabIndex={0}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    (document.activeElement as HTMLElement)?.click();
+                  }
+                }}
                 {...(getRootProps() as any)}
               >
                 <input {...getInputProps()} />
@@ -407,7 +435,22 @@ export default function EpisodeUpload({
                 <p className="text-gray-600 mb-4">
                   Drag and drop your audio or video file, or click to browse
                 </p>
-                <div className="inline-flex items-center gap-2 bg-white px-4 py-2 rounded-lg text-sm font-medium text-gray-700 border border-gray-200">
+                <div className="mt-4">
+                  <button
+                    type="button"
+                    data-testid="file-picker-button"
+                    onClick={(e) => {
+                      e.stopPropagation(); // avoid dropzone root handler
+                      fileInputRef.current?.click();
+                    }}
+                    className="inline-flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg
+                               focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
+                    disabled={uploadStatus === 'uploading'}
+                  >
+                    Choose file
+                  </button>
+                </div>
+                <div className="inline-flex items-center gap-2 bg-white px-4 py-2 rounded-lg text-sm font-medium text-gray-700 border border-gray-200 mt-4">
                   <FileAudio className="w-4 h-4 text-blue-500" />
                   <span>MP3, WAV, M4A, MP4, MOV, AVI</span>
                   <span className="text-gray-400">•</span>

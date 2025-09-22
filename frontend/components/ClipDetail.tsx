@@ -1,8 +1,9 @@
 // components/ClipDetail.tsx
 "use client";
-import React from "react";
+import React, { useRef } from "react";
 import Modal from "./Modal";
 import { Clip } from "@shared/types";
+import WordSyncedTranscript from "./WordSyncedTranscript";
 
 type Props = {
   clip: Clip | null;
@@ -12,6 +13,8 @@ type Props = {
 
 export default function ClipDetail({ clip, open, onClose }: Props) {
   if (!clip) return null;
+  
+  const mediaRef = useRef<HTMLVideoElement & HTMLAudioElement>(null as any);
 
   const duration =
     clip.startTime != null && clip.endTime != null
@@ -48,10 +51,10 @@ export default function ClipDetail({ clip, open, onClose }: Props) {
 
         <div className="aspect-video w-full overflow-hidden rounded-xl border border-neutral-200">
           {isVideo ? (
-            <video src={clip.previewUrl} controls className="h-full w-full" />
+            <video ref={mediaRef as any} src={clip.previewUrl} controls className="h-full w-full" />
           ) : isAudio ? (
             <div className="flex h-full w-full items-center justify-center bg-neutral-50">
-              <audio src={clip.previewUrl} controls className="w-full max-w-2xl p-4" />
+              <audio ref={mediaRef as any} src={clip.previewUrl} controls className="w-full max-w-2xl p-4" />
             </div>
           ) : (
             <div className="flex h-full w-full items-center justify-center bg-neutral-50 text-neutral-500">
@@ -62,10 +65,8 @@ export default function ClipDetail({ clip, open, onClose }: Props) {
 
         <div className="grid gap-4 sm:grid-cols-2">
           <div className="rounded-xl border border-neutral-200 p-4">
-            <h3 className="mb-2 text-sm font-medium text-neutral-600">Full Transcript</h3>
-            <div className="max-h-64 overflow-auto whitespace-pre-wrap text-sm leading-relaxed text-neutral-800 bg-neutral-50 p-3 rounded-lg">
-              {clip.full_transcript || clip.text || "No transcript available."}
-            </div>
+            <h3 className="mb-2 text-sm font-medium text-neutral-600">Transcript (word-synced)</h3>
+            <WordSyncedTranscript clip={clip} mediaRef={mediaRef} />
             {clip.raw_text && clip.raw_text !== clip.text && (
               <div className="mt-2">
                 <h4 className="text-xs font-medium text-neutral-500 mb-1">Raw Text (for audio matching)</h4>

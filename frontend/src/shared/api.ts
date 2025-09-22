@@ -29,6 +29,14 @@ export interface TitleSetRequest {
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE || 'http://localhost:8000';
 export const apiUrl = (path: string) => `${API_BASE}${path}`;
 
+// Word-level transcript types
+export interface ClipWordsResponse {
+  clipId: string;
+  start: number;
+  end: number;
+  words: { t: number; d: number; w: string }[];
+}
+
 // Get auth token from localStorage (for signed URLs)
 const getAuthToken = (): string => {
   if (typeof window === 'undefined') return '';
@@ -399,6 +407,19 @@ export function downloadFile(signedUrl: string): void {
   window.open(`${API_BASE}${signedUrl}`, '_blank');
 }
 
+// =============================
+// Preview Functions (Signed URLs)
+// =============================
+
+export async function getSignedPreviewUrl(previewName: string): Promise<string> {
+  const url = new URL(`${API_BASE}/api/previews/sign`);
+  url.searchParams.set("name", previewName);
+  const res = await fetch(url.toString(), { cache: "no-store" });
+  if (!res.ok) throw new Error("Failed to sign preview URL");
+  const data = await res.json();
+  return data.url as string; // Returns relative URL like /api/previews/get?name=...&exp=...&sig=...
+}
+
 export async function downloadFileWithSignedUrl(area: "uploads" | "clips", name: string): Promise<void> {
   const result = await getSignedDownload(area, name);
   if (result.success) {
@@ -406,4 +427,10 @@ export async function downloadFileWithSignedUrl(area: "uploads" | "clips", name:
   } else {
     throw new Error(`Failed to get signed URL: ${result.error}`);
   }
+}
+
+export async function getClipWords(clipId: string): Promise<ClipWordsResponse> {
+  const res = await fetch(apiUrl(`/api/clips/${clipId}/words`), { cache: "no-store" });
+  const result = await ensureOk<ClipWordsResponse>(res);
+  return result.data;
 }

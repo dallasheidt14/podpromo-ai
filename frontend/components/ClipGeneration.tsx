@@ -15,8 +15,8 @@ interface ClipGenerationProps {
 
 export default function ClipGeneration({ episode, onGenerateClips, isGenerating }: ClipGenerationProps) {
   const [clipCount, setClipCount] = useState(3);
-  const [minDuration, setMinDuration] = useState(12);
-  const [maxDuration, setMaxDuration] = useState(30);
+  const [minDuration, setMinDuration] = useState(8);
+  const [maxDuration, setMaxDuration] = useState(90);
   const [showAdvanced, setShowAdvanced] = useState(false);
 
   const handleGenerate = async () => {
@@ -116,10 +116,7 @@ export default function ClipGeneration({ episode, onGenerateClips, isGenerating 
               className="input-field"
               disabled={isGenerating}
             >
-              <option value={8}>8 seconds</option>
-              <option value={10}>10 seconds</option>
-              <option value={12}>12 seconds</option>
-              <option value={15}>15 seconds</option>
+              {[8,10,12,15,20,25,30].map(v => <option key={v} value={v}>{v} seconds</option>)}
             </select>
           </div>
           
@@ -133,10 +130,7 @@ export default function ClipGeneration({ episode, onGenerateClips, isGenerating 
               className="input-field"
               disabled={isGenerating}
             >
-              <option value={20}>20 seconds</option>
-              <option value={25}>25 seconds</option>
-              <option value={30}>30 seconds</option>
-              <option value={35}>35 seconds</option>
+              {[20,25,30,35,45,60,75,90].map(v => <option key={v} value={v}>{v} seconds</option>)}
             </select>
           </div>
         </div>

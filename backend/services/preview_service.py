@@ -122,7 +122,7 @@ def ensure_preview(
         name = _hash_name(episode_id, clip_id, start_sec, start_sec + duration)
         out_path = PREVIEWS_DIR / f"{episode_id}_{clip_id}_{name}.mp4"
         if out_path.exists():
-            return f"/clips/previews/{out_path.name}"
+            return out_path.name  # Return filename only, not URL path
 
         src = str(source_media)
         dst = str(out_path)
@@ -144,14 +144,14 @@ def ensure_preview(
             # 1) Try waveform lines (most compatible)
             try:
                 _run_ffmpeg(_ffmpeg_preview_args(src, dst, start_sec, duration, WAVES_FILTER))
-                return f"/clips/previews/{out_path.name}"
+                return out_path.name  # Return filename only, not URL path
             except Exception as e1:
                 logger.warning("Waveform preview failed, trying spectrum. Reason: %s", e1)
 
             # 2) Try spectrum (valid params)
             try:
                 _run_ffmpeg(_ffmpeg_preview_args(src, dst, start_sec, duration, SPECTRUM_FILTER))
-                return f"/clips/previews/{out_path.name}"
+                return out_path.name  # Return filename only, not URL path
             except Exception as e2:
                 logger.error("Spectrum preview failed: %s", e2)
                 return None

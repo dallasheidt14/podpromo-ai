@@ -28,6 +28,83 @@ FEATURES = {
     "SLICE_TRANSCRIPT_TO_AUDIO": True,
 }
 
+# --- Dynamic length support ---
+# Target bands for fair scoring & normalization
+BANDS = [(8, 12), (12, 20), (20, 35), (35, 60), (60, 90)]
+
+def _band_for(dur: float) -> tuple[float, float]:
+    """Get the length band for a given duration."""
+    for lo, hi in BANDS:
+        if lo <= dur <= hi:
+            return (lo, hi)
+    return BANDS[-1]
+
+def _robust_center(vals: list[float]) -> tuple[float, float]:
+    """median + IQR, safe for tiny sets"""
+    if not vals:
+        return 0.0, 1.0
+    vs = sorted(vals)
+    n = len(vs)
+    med = vs[n // 2]
+    q1 = vs[n // 4]
+    q3 = vs[(3 * n) // 4]
+    iqr = max(1e-6, (q3 - q1))
+    return float(med), float(iqr)
+
+def _get_dur(c: dict) -> float:
+    """Get duration from a candidate dict."""
+    if "duration" in c:
+        return float(c["duration"])
+    return float(c.get("end", 0) - c.get("start", 0))
+
+def _normalize_display_by_band(cands: list[dict]) -> list[dict]:
+    """Normalize display_score within length bands to remove short-clip bias."""
+    if not cands:
+        return cands
+    # group by band
+    groups: dict[tuple[float, float], list[dict]] = {}
+    for c in cands:
+        dur = _get_dur(c)
+        groups.setdefault(_band_for(dur), []).append(c)
+
+    for band, group in groups.items():
+        vals = [float(c.get("display_score", c.get("final_score", 0.0))*100.0) for c in group]
+        med, iqr = _robust_center(vals)
+        for c in group:
+            v = float(c.get("display_score", c.get("final_score", 0.0))*100.0)
+            z = 0.5 + 0.4 * ((v - med) / (iqr or 1.0))  # squashed into ~[0.1..0.9]
+            c["_band"] = list(band)
+            c["_band_norm_display"] = max(0.0, min(1.0, z))  # 0..1
+    # prefer normalized score for ranking, but keep originals for debugging
+    for c in cands:
+        if "_band_norm_display" in c:
+            c["rank_score"] = c["_band_norm_display"]
+        else:
+            c["rank_score"] = float(c.get("display_score", c.get("final_score", 0.0)))
+    return cands
+
+def _mmr_select_jaccard(items: list[dict], *, top_k: int, text_key: str = "text", lam: float = 0.7) -> list[dict]:
+    """MMR using simple Jaccard over token sets; no extra deps."""
+    def tokset(s: str): 
+        return set(w for w in (s or "").lower().split())
+    
+    T = [tokset(it.get(text_key,"")) for it in items]
+    S, chosen = set(), []
+    
+    while items and len(chosen) < top_k:
+        best_i, best = None, -1e9
+        for i, it in enumerate(items):
+            rel = float(it.get("rank_score", it.get("raw_score",0.0)))
+            div = 0.0
+            if chosen:
+                div = max(len(T[i]&T[j]) / max(1,len(T[i]|T[j])) for j in S)
+            sc = lam*rel - (1-lam)*div
+            if sc > best:
+                best, best_i = sc, i
+        S.add(len(chosen))  # index in chosen space doesn't matter for div since we recompute each round
+        chosen.append(items.pop(best_i))
+    return chosen
+
 # Quality gate thresholds
 THRESHOLDS = {
     "strict": {
@@ -1224,6 +1301,9 @@ class ClipScoreService:
             # Convert transcript to segments for ranking using improved moment detection
             segments = self._transcript_to_segments(transcript, genre='general', platform='tiktok')
             
+            # NEW: expand to multi-scale candidates
+            segments = self._generate_multiscale_candidates(segments)
+            
             # Rank candidates using secret sauce V4 with genre awareness
             # SPEED: Reduce top_k for faster processing (still processes all segments, just ranks fewer)
             top_k = int(os.getenv("TOP_K_CANDIDATES", "15"))  # Default 15, was 10
@@ -1597,9 +1677,15 @@ class ClipScoreService:
         # Completion progress update
         write_progress(episode_id or "unknown", "scoring:completed", 100, f"Scoring complete: {len(scored)} candidates processed")
         
-        # Sort by raw_score descending but prefer non-discarded
-        scored_sorted = sorted(scored, key=lambda s: (s.get("discard_reason") is not None, -s["raw_score"]))
-        return scored_sorted[:top_k]
+        # Apply band normalization for fair ranking across length bands
+        scored = _normalize_display_by_band(scored)
+        
+        # Sort by rank_score (band-normalized) descending but prefer non-discarded
+        scored_sorted = sorted(scored, key=lambda s: (s.get("discard_reason") is not None, -s.get("rank_score", s.get("raw_score", 0))))
+        
+        # Apply MMR selection for diversity (remove duplicates)
+        scored_sorted = _mmr_select_jaccard(scored_sorted, top_k=top_k, text_key="text", lam=0.7)
+        return scored_sorted
     
     def _calibrate_score_for_ui(self, raw_score: float) -> dict:
         """Transform raw 0-1 scores into user-friendly 45-95 range with confidence bands"""
@@ -1656,7 +1742,8 @@ class ClipScoreService:
         ]
         
         for i, seg in enumerate(transcript):
-            text = seg.text.lower()
+            text = (getattr(seg, "text", None) if not isinstance(seg, dict) else seg.get("text", "")) or ""
+            text = text.lower()
             # Check for topic transition markers
             if any(marker in text for marker in topic_markers):
                 boundaries.append(i)
@@ -1699,7 +1786,7 @@ class ClipScoreService:
                 duration = segment_end - segment_start
                 
                 # More flexible duration range to get more segments
-                if 12 <= duration <= 60:  # Expanded range for more variety
+                if 8.0 <= duration <= 90.0:  # Expanded range for more variety
                     segment_text = " ".join([t.text for t in transcript[start_idx:end_idx+1]])
                     
                     # Less restrictive self-contained check for topic-based segments
@@ -1960,7 +2047,7 @@ class ClipScoreService:
         for start_time in range(0, int(total_duration), int(step)):
             end_time = min(start_time + window, total_duration)
             
-            if end_time - start_time < 15:  # Minimum duration (increased from 12 to 15)
+            if end_time - start_time < 8.0:  # Minimum duration (expanded to 8s)
                 continue
             
             segment_text = self._get_transcript_segment_text(transcript, start_time, end_time)
@@ -1994,6 +2081,83 @@ class ClipScoreService:
                     segment_texts.append(seg.get('text', ''))
         
         return ' '.join(segment_texts)
+    
+    def _snap_to_sentence_or_pause(self, t: float, prefer: str = "start") -> float:
+        """Placeholder: returns input unchanged until a smarter snapper is implemented"""
+        return t
+    
+    def _generate_multiscale_candidates(self, source: list, *, step_frac: float = 0.6) -> list[dict]:
+        """
+        Accepts either a raw transcript (word/segment entries) OR prebuilt segments [{start,end,text},...].
+        If it's already segments, we use them directly. Otherwise we build base segments from transcript.
+        """
+        if not source:
+            return []
+
+        def _as_seg_dict(x):
+            if isinstance(x, dict) and "start" in x and "end" in x and "text" in x:
+                return {"start": float(x["start"]), "end": float(x["end"]), "text": str(x["text"])}
+            # Objects with attributes
+            if hasattr(x, "start") and hasattr(x, "end") and hasattr(x, "text"):
+                return {"start": float(x.start), "end": float(x.end), "text": str(x.text)}
+            return None
+
+        # If input already looks like segments, don't call transcript->segments again
+        first = _as_seg_dict(source[0])
+        if first is not None:
+            base = [first] + [sd for sd in (_as_seg_dict(s) for s in source[1:]) if sd]
+        else:
+            # Treat as transcript; derive base segments using your existing helpers
+            derived = self._transcript_to_segments_aligned(source) or self._transcript_to_segments(source)
+            base = []
+            for s in derived:
+                sd = _as_seg_dict(s)
+                if sd:
+                    base.append(sd)
+
+        # Now sweep multi-scale windows over 'base'
+        if not base:
+            return []
+
+        total = max(b["end"] for b in base)
+        out: list[dict] = []
+        BANDS = [(8,12),(12,20),(20,35),(35,60),(60,90)]
+        for (lo, hi) in BANDS:
+            win = (lo + hi) / 2.0
+            step = max(2.0, win * step_frac)
+            t = 0.0
+            while t < total - lo + 1e-6:
+                start = t
+                end = min(t + win, total)
+                if end - start >= 8.0:
+                    text = self._get_transcript_segment_text(base, start, end)  # works on [{start,end,text}]
+                    if text.strip():
+                        out.append({"start": start, "end": end, "text": text, "type": f"multiscale_{lo}-{hi}"})
+                t += step
+        return self._dedup_by_timing(out, time_window=0.15)
+    
+    def _dedup_by_timing(self, candidates: list[dict], time_window: float = 0.15) -> list[dict]:
+        """Remove duplicate candidates based on timing overlap"""
+        if not candidates:
+            return candidates
+        
+        # Sort by start time
+        sorted_candidates = sorted(candidates, key=lambda x: x.get("start", 0))
+        deduped = []
+        
+        for candidate in sorted_candidates:
+            # Check if this overlaps with any already selected
+            overlaps = False
+            for selected in deduped:
+                if (candidate.get("start", 0) < selected.get("end", 0) + time_window and 
+                    candidate.get("end", 0) > selected.get("start", 0) - time_window):
+                    overlaps = True
+                    break
+            
+            if not overlaps:
+                deduped.append(candidate)
+        
+        return deduped
     
     def _filter_overlapping_candidates(self, candidates: List[Dict], min_gap: float = 15.0) -> List[Dict]:
         """Remove overlapping candidates, keeping highest scoring ones"""
@@ -2143,6 +2307,19 @@ class ClipScoreService:
 
             # Convert transcript to segments using intelligent moment detection
             segments = self._transcript_to_segments(episode.transcript, genre=final_genre, platform=platform)
+            
+            # Store original segments as fallback
+            original_segments = segments.copy() if segments else []
+            
+            # NEW: expand to multi-scale candidates with fail-safe
+            try:
+                segments = self._generate_multiscale_candidates(segments)
+                logger.info(f"Generated {len(segments)} multiscale candidates")
+            except Exception as e:
+                logger.exception("Multiscale generation failed; falling back to dynamic segments: %s", e)
+                # Fallback to previously computed dynamic segments
+                segments = original_segments
+                logger.info(f"Using fallback segments: {len(segments)} candidates")
 
             # Build EOS index early to determine fallback mode
             from services.secret_sauce_pkg.features import build_eos_index
