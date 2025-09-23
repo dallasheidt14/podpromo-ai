@@ -14,6 +14,9 @@ from config.settings import (
     PRERANK_WEIGHTS,
     DURATION_TARGET_MIN,
     DURATION_TARGET_MAX,
+    ENABLE_EXPLORATION,
+    EXPLORATION_QUOTA,
+    EXPLORATION_MIN,
 )
 from services.progress_writer import write_progress
 
@@ -135,9 +138,32 @@ def pre_rank_candidates(segments: List[Dict], episode_id: str) -> List[Dict]:
     candidates.sort(key=lambda x: x["prerank_score"], reverse=True)
     n = len(candidates)
     k = min(TOP_K_MAX or n, max(TOP_K_MIN, math.ceil(TOP_K_RATIO * n)))
-    logger.info("Pre-rank complete: %d candidates -> keeping top %d", n, k)
-    write_progress(episode_id, "scoring:prerank", 20, f"Pre-ranked {n} candidates, keeping top {k}")
-    return candidates[:k]
+    
+    top = candidates[:k]
+    
+    # Add exploration quota if enabled
+    if ENABLE_EXPLORATION:
+        M = max(EXPLORATION_MIN, int(EXPLORATION_QUOTA * k))
+        rest = candidates[k:]
+        rest_sorted = sorted(rest, key=lambda x: x.get("prerank_features", {}).get("info_density", 0.0), reverse=True)
+        explore = []
+        seen = {id(x) for x in top}
+        for seg in rest_sorted:
+            if id(seg) in seen:
+                continue
+            explore.append(seg)
+            if len(explore) >= M:
+                break
+        
+        picked = top + explore
+        logger.info("prerank.explore", extra={"added": len(explore), "k": k})
+        logger.info("Pre-rank complete: %d candidates -> keeping top %d + explore %d", n, k, len(explore))
+        write_progress(episode_id, "scoring:prerank", 20, f"Pre-ranked {n} candidates, keeping top {k} + explore {len(explore)}")
+        return picked
+    else:
+        logger.info("Pre-rank complete: %d candidates -> keeping top %d", n, k)
+        write_progress(episode_id, "scoring:prerank", 20, f"Pre-ranked {n} candidates, keeping top {k}")
+        return top
 
 
 def get_safety_candidates(segments: List[Dict]) -> List[Dict]:

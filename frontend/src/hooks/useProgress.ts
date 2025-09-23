@@ -1,7 +1,8 @@
 import { useEffect, useRef } from "react";
-import { getProgressSimple, type ProgressResponse } from "../shared/api";
+import { getProgressSimple, type ProgressResponse, apiUrl } from "../shared/api";
 import { notifyClipsReady } from "../shared/events";
 import { isTerminalProgress } from "../shared/progress";
+import { startProgressPoll } from "../shared/single-poller";
 
 type Options = {
   onUpdate?: (p: ProgressResponse) => void;
@@ -10,39 +11,44 @@ type Options = {
 };
 
 export function useProgressPoller(episodeId?: string, opts: Options = {}) {
-  const { onUpdate, onDone, intervalMs = 4000 } = opts;
-  const timer = useRef<number | null>(null);
-  const stopRef = useRef(false);
+  const { onUpdate, onDone, intervalMs = 1000 } = opts;
+  const stopRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
     if (!episodeId) return;
-    stopRef.current = false;
 
     const isTerminal = (p: ProgressResponse) => {
       return isTerminalProgress(p) || p.stage === "error";
     };
 
-    const tick = async () => {
-      try {
-        const p = await getProgressSimple(episodeId);
-        onUpdate?.(p);
-        if (isTerminal(p)) {
-          notifyClipsReady(episodeId);
-          onDone?.();
-          return;
+    // Use single poller per episode with ETag support
+    const url = apiUrl(`/api/progress/${episodeId}`);
+    stopRef.current = startProgressPoll(episodeId, url, {
+      interval: intervalMs,
+      onSuccess: (data) => {
+        const progress = data?.progress || data;
+        if (progress) {
+          onUpdate?.(progress);
+          if (isTerminal(progress)) {
+            notifyClipsReady(episodeId);
+            onDone?.();
+          }
         }
-      } catch {
-        // ignore transient errors
+      },
+      onError: (error, retryCount) => {
+        console.warn(`[useProgressPoller] Error for ${episodeId} (attempt ${retryCount}):`, error);
+      },
+      onComplete: () => {
+        notifyClipsReady(episodeId);
+        onDone?.();
       }
-      if (!stopRef.current) {
-        timer.current = window.setTimeout(tick, intervalMs) as unknown as number;
-      }
-    };
+    });
 
-    timer.current = window.setTimeout(tick, 1000) as unknown as number;
     return () => {
-      stopRef.current = true;
-      if (timer.current) window.clearTimeout(timer.current);
+      if (stopRef.current) {
+        stopRef.current();
+        stopRef.current = null;
+      }
     };
   }, [episodeId, intervalMs, onDone, onUpdate]);
 }

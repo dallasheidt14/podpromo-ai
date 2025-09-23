@@ -1729,6 +1729,18 @@ class ClipScoreService:
     def __init__(self, episode_service):
         self.episode_service = episode_service
 
+    def _best_audio_for_features(self, audio_path: str) -> str:
+        """Prefer clean WAV if available to eliminate mpg123 errors"""
+        import os
+        base, ext = os.path.splitext(audio_path)
+        wav_candidate = f"{base}.__asr16k.wav"
+        if os.path.exists(wav_candidate):
+            logger.debug(f"Using clean WAV for features: {wav_candidate}")
+            return wav_candidate
+        else:
+            logger.debug(f"Using original audio for features: {audio_path}")
+            return audio_path
+
 
     def pre_rank_candidates(self, segments: List[Dict], episode_id: str) -> List[Dict]:
         return pre_rank_candidates(segments, episode_id)
@@ -1907,9 +1919,23 @@ class ClipScoreService:
         # preload audio once for arousal (big speed-up)
         try:
             import librosa
-            y_sr = librosa.load(audio_file, sr=None)
+            # Prefer clean WAV if available to eliminate mpg123 errors
+            audio_for_features = self._best_audio_for_features(audio_file)
+            y_sr = librosa.load(audio_for_features, sr=None)
         except Exception:
             y_sr = None
+
+        # Compute episode-level prosody stats for arousal v2
+        episode_stats = None
+        if y_sr is not None:
+            try:
+                from services.audio_features import episode_prosody_stats
+                y, sr = y_sr
+                episode_stats = episode_prosody_stats(y, sr)
+                logger.info("prosody.stats_computed", extra={"episode_id": episode_id})
+            except Exception as e:
+                logger.warning(f"Prosody stats failed: {e}")
+                episode_stats = None
 
         # Stage 2: Full V4 scoring on selected candidates
         write_progress(episode_id or "unknown", "scoring:full", 20, f"Full scoring {len(segments_to_score)} candidates...")
@@ -1949,6 +1975,56 @@ class ClipScoreService:
                 logger.info(f"Hook reasons: {feats.get('hook_reasons', 'none')}")
                 logger.info(f"Payoff type: {feats.get('payoff_type', 'none')}")
                 logger.info(f"Moment type: {feats.get('type', 'general')}")
+                
+                # Add prosody and trend scoring
+                try:
+                    if episode_stats is not None and y_sr is not None:
+                        from services.audio_features import segment_prosody, blend_arousal_v2
+                        y, sr = y_sr
+                        t0 = float(seg.get("start", 0.0)); t1 = float(seg.get("end", t0))
+                        prosody = segment_prosody(y, sr, t0, t1)
+                        feats["prosody_rms"] = prosody["prosody_rms"]
+                        feats["prosody_flux"] = prosody["prosody_flux"]
+                        feats["arousal_score_v2"] = blend_arousal_v2(
+                            feats.get("arousal_score", 0.0), feats, episode_stats, ab_key=episode_id
+                        )
+                        feats["_arousal_src"] = "v2"
+                        logger.debug("prosody.v2_ok", extra={"segment_id": seg.get("id")})
+                except Exception as e:
+                    logger.debug("prosody.v2_skipped", extra={"segment_id": seg.get("id"), "err": str(e)})
+                
+                try:
+                    from services.trending_provider import trend_match_score, detect_categories
+                    raw_text = seg.get("text", "")
+                    hashtags = feats.get("hashtags", [])
+                    cats = detect_categories(raw_text)
+                    
+                    # Optional: use episode ID for AB bucket stability
+                    ab_key = episode_id if 'episode_id' in locals() else None
+                    
+                    # Enhanced trend computation
+                    new_trend = trend_match_score(raw_text, hashtags, categories=cats, ab_key=ab_key)
+                    old_trend = feats.get("trend_match_score", 0.0)
+                    feats["trend_match_score"] = new_trend if new_trend > 0 else old_trend
+                    feats["trend_categories"] = cats
+                    
+                    # AB test logging
+                    enabled = new_trend > 0
+                    logger.info("trend.ab", extra={"episode_id": episode_id, "enabled": enabled})
+                    
+                    if feats["trend_match_score"] > 0:
+                        logger.info("trend.hit", extra={"cats": cats, "score": round(feats["trend_match_score"], 3)})
+                except Exception as e:
+                    logger.debug(f"Trend score skipped: {e}")
+                
+                # Diagnostic: log what features we have
+                logger.debug("features.computed", extra={
+                    "segment_id": seg.get("id"),
+                    "has_arousal_v2": "arousal_score_v2" in feats,
+                    "has_trend": "trend_match_score" in feats,
+                    "arousal_v2_val": feats.get("arousal_score_v2", None),
+                    "trend_val": feats.get("trend_match_score", None)
+                })
             except Exception as e:
                 logger.warning(f"Enhanced features failed for segment {seg.get('id', i)}: {e}; falling back to v4")
                 try:
@@ -1967,6 +2043,56 @@ class ClipScoreService:
                     # Debug: log what features we got
                     logger.info(f"Fallback V4 Features computed: {list(feats.keys())}")
                     logger.info(f"Feature values: hook={feats.get('hook_score', 0):.3f}, arousal={feats.get('arousal_score', 0):.3f}, payoff={feats.get('payoff_score', 0):.3f}")
+                    
+                    # Add prosody and trend scoring (fallback path)
+                    try:
+                        if episode_stats is not None and y_sr is not None:
+                            from services.audio_features import segment_prosody, blend_arousal_v2
+                            y, sr = y_sr
+                            t0 = float(seg.get("start", 0.0)); t1 = float(seg.get("end", t0))
+                            prosody = segment_prosody(y, sr, t0, t1)
+                            feats["prosody_rms"] = prosody["prosody_rms"]
+                            feats["prosody_flux"] = prosody["prosody_flux"]
+                            feats["arousal_score_v2"] = blend_arousal_v2(
+                                feats.get("arousal_score", 0.0), feats, episode_stats, ab_key=episode_id
+                            )
+                            feats["_arousal_src"] = "v2"
+                            logger.debug("prosody.v2_ok", extra={"segment_id": seg.get("id")})
+                    except Exception as e:
+                        logger.debug("prosody.v2_skipped", extra={"segment_id": seg.get("id"), "err": str(e)})
+                    
+                    try:
+                        from services.trending_provider import trend_match_score, detect_categories
+                        raw_text = seg.get("text", "")
+                        hashtags = feats.get("hashtags", [])
+                        cats = detect_categories(raw_text)
+                        
+                        # Optional: use episode ID for AB bucket stability
+                        ab_key = episode_id if 'episode_id' in locals() else None
+                        
+                        # Enhanced trend computation
+                        new_trend = trend_match_score(raw_text, hashtags, categories=cats, ab_key=ab_key)
+                        old_trend = feats.get("trend_match_score", 0.0)
+                        feats["trend_match_score"] = new_trend if new_trend > 0 else old_trend
+                        feats["trend_categories"] = cats
+                        
+                        # AB test logging
+                        enabled = new_trend > 0
+                        logger.info("trend.ab", extra={"episode_id": episode_id, "enabled": enabled})
+                        
+                        if feats["trend_match_score"] > 0:
+                            logger.info("trend.hit", extra={"cats": cats, "score": round(feats["trend_match_score"], 3)})
+                    except Exception as e:
+                        logger.debug(f"Trend score skipped: {e}")
+                    
+                    # Diagnostic: log what features we have (fallback path)
+                    logger.debug("features.computed", extra={
+                        "segment_id": seg.get("id"),
+                        "has_arousal_v2": "arousal_score_v2" in feats,
+                        "has_trend": "trend_match_score" in feats,
+                        "arousal_v2_val": feats.get("arousal_score_v2", None),
+                        "trend_val": feats.get("trend_match_score", None)
+                    })
                 except Exception as e2:
                     logger.exception(f"Both enhanced and fallback feature compute failed for segment {seg.get('id', i)}: {e2}")
                     continue
@@ -3042,12 +3168,13 @@ class ClipScoreService:
                     assert final_score <= 0.55 + 1e-6, f"Question cap failed: {final_score} '{text[:60]}'"
                 
                 logger.info(
-                    "Top #%d: score=%.2f w=%s hook=%.2f arous=%.2f payoff=%.2f info=%.2f ql=%.2f pl_v2=%.2f ad_pen=%.2f q=%s payoff_ok=%s ad=%s caps=%s text='%s'",
+                    "Top #%d: score=%.2f w=%s hook=%.2f arous=%.2f arous_src=%s payoff=%.2f info=%.2f ql=%.2f pl_v2=%.2f ad_pen=%.2f q=%s payoff_ok=%s ad=%s caps=%s text='%s'",
                     i+1,
                     final_score,
                     words,
                     c.get("hook_score", 0),
                     c.get("arousal_score", 0),
+                    c.get("_arousal_src", "v1"),
                     c.get("payoff_score", 0),
                     c.get("info_density", 0),
                     c.get("q_list_score", 0),

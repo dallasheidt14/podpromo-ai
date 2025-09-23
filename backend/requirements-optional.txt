@@ -1,0 +1,10 @@
+# Optional dependencies for enhanced features
+# Install with: pip install -r requirements-optional.txt
+
+# Audio processing for prosody-based arousal v2
+librosa>=0.10.1
+
+# Trending data collection
+pytrends>=4.9.2
+google-api-python-client>=2.137.0
+praw>=7.7.1

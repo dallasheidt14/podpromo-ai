@@ -4,9 +4,19 @@ Advanced scoring utilities for Phase 1 improvements.
 
 import numpy as np
 import re
+import os
 from typing import Dict, List, Tuple
 from .types import _c01, quantize
 # blend_weights will be defined locally to avoid circular import
+
+def _best_audio_for_features(audio_path: str) -> str:
+    """Prefer clean WAV if available to eliminate mpg123 errors"""
+    base, ext = os.path.splitext(audio_path)
+    wav_candidate = f"{base}.__asr16k.wav"
+    if os.path.exists(wav_candidate):
+        return wav_candidate
+    else:
+        return audio_path
 
 def blend_weights(
     genre_conf: Dict[str, float],
@@ -428,8 +438,9 @@ def extract_prosody_features(audio_file: str, start: float, end: float, sr: int 
         import librosa
         import numpy as np
         
-        # Load audio segment
-        y, sr = librosa.load(audio_file, sr=sr, offset=start, duration=end-start)
+        # Load audio segment - prefer clean WAV if available
+        audio_for_features = _best_audio_for_features(audio_file)
+        y, sr = librosa.load(audio_for_features, sr=sr, offset=start, duration=end-start)
         
         if len(y) == 0:
             return {"rms": 0.0, "zcr": 0.0, "pitch_std": 0.0, "error": "empty_audio"}

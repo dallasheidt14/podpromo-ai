@@ -4,6 +4,16 @@ import React, { useRef } from "react";
 import Modal from "./Modal";
 import { Clip } from "@shared/types";
 import WordSyncedTranscript from "./WordSyncedTranscript";
+import { PreviewPlayer } from "../src/components/PreviewPlayer";
+import { fmtTimecode } from "../src/utils/timecode";
+import { SHOW_TRANSCRIPT } from "../src/config/features";
+
+function fallbackFromText(t?: string, max = 80) {
+  const s = (t || '').replace(/\s+/g, ' ').trim();
+  if (!s) return 'Untitled Clip';
+  const firstSent = s.split(/(?<=[.!?])\s/)[0] || s.slice(0, max);
+  return firstSent.length > max ? firstSent.slice(0, max).replace(/[ ,;:.!-]+$/,'') : firstSent;
+}
 
 type Props = {
   clip: Clip | null;
@@ -29,7 +39,7 @@ export default function ClipDetail({ clip, open, onClose }: Props) {
       <div className="space-y-5">
         <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
           <h2 className="text-xl sm:text-2xl font-semibold text-neutral-900">
-            {clip.title || "Clip Details"}
+            {clip.title || fallbackFromText(clip.display_text || clip.text) || "Clip Details"}
           </h2>
 
           <div className="flex items-center gap-2">
@@ -43,39 +53,40 @@ export default function ClipDetail({ clip, open, onClose }: Props) {
             )}
             {duration != null && (
               <span className="inline-flex items-center gap-1 rounded-full bg-neutral-100 px-3 py-1 text-sm text-neutral-700">
-                ⏱ Duration: {duration}s ({Math.round(clip.startTime!)}s-{Math.round(clip.endTime!)}s)
+                ⏱ {fmtTimecode(clip.startTime!)}–{fmtTimecode(clip.endTime!)} ({duration}s)
               </span>
             )}
           </div>
         </div>
 
         <div className="aspect-video w-full overflow-hidden rounded-xl border border-neutral-200">
-          {isVideo ? (
-            <video ref={mediaRef as any} src={clip.previewUrl} controls className="h-full w-full" />
-          ) : isAudio ? (
-            <div className="flex h-full w-full items-center justify-center bg-neutral-50">
-              <audio ref={mediaRef as any} src={clip.previewUrl} controls className="w-full max-w-2xl p-4" />
-            </div>
-          ) : (
-            <div className="flex h-full w-full items-center justify-center bg-neutral-50 text-neutral-500">
-              No preview available
-            </div>
-          )}
+          <PreviewPlayer 
+            clip={clip} 
+            className="h-full w-full"
+            mediaRef={mediaRef}
+          />
         </div>
 
         <div className="grid gap-4 sm:grid-cols-2">
-          <div className="rounded-xl border border-neutral-200 p-4">
-            <h3 className="mb-2 text-sm font-medium text-neutral-600">Transcript (word-synced)</h3>
-            <WordSyncedTranscript clip={clip} mediaRef={mediaRef} />
-            {clip.raw_text && clip.raw_text !== clip.text && (
-              <div className="mt-2">
-                <h4 className="text-xs font-medium text-neutral-500 mb-1">Raw Text (for audio matching)</h4>
-                <div className="text-xs text-neutral-600 bg-neutral-100 p-2 rounded">
-                  {clip.raw_text}
+          {SHOW_TRANSCRIPT && (
+            <div className="rounded-xl border border-neutral-200 p-4">
+              <h3 className="mb-2 text-sm font-medium text-neutral-600">Transcript (word-synced)</h3>
+              <WordSyncedTranscript clip={clip} mediaRef={mediaRef} />
+              {clip.transcript_source && (
+                <div className="mt-1 text-xs text-neutral-500">
+                  transcript source: {clip.transcript_source}
                 </div>
-              </div>
-            )}
-          </div>
+              )}
+              {clip.raw_text && clip.raw_text !== clip.text && (
+                <div className="mt-2">
+                  <h4 className="text-xs font-medium text-neutral-500 mb-1">Raw Text (for audio matching)</h4>
+                  <div className="text-xs text-neutral-600 bg-neutral-100 p-2 rounded">
+                    {clip.raw_text}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
 
           <div className="rounded-xl border border-neutral-200 p-4 space-y-3">
             <h3 className="text-sm font-medium text-neutral-600">Actions</h3>
@@ -97,7 +108,7 @@ export default function ClipDetail({ clip, open, onClose }: Props) {
               <button
                 className="btn"
                 onClick={() => {
-                  navigator.clipboard.writeText(clip.title || "Great clip!");
+                  navigator.clipboard.writeText(clip.title || fallbackFromText(clip.display_text || clip.text) || "Great clip!");
                 }}
               >
                 Copy Title

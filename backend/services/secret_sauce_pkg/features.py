@@ -15,6 +15,16 @@ _CAUSAL = ["because","therefore","thus","which means","that means","as a result"
 _CONTRA_OPEN = re.compile(r"\b(most|many|people|everyone|they)\s+(think|say|assume)\b", re.I)
 _CONTRA_FLIP = re.compile(r"\bbut\s+actually\b|\bhowever\b|\bbut\s+(it|this)\s+isn'?t\b", re.I)
 
+def _best_audio_for_features(audio_path: str) -> str:
+    """Prefer clean WAV if available to eliminate mpg123 errors"""
+    import os
+    base, ext = os.path.splitext(audio_path)
+    wav_candidate = f"{base}.__asr16k.wav"
+    if os.path.exists(wav_candidate):
+        return wav_candidate
+    else:
+        return audio_path
+
 def _uncertainty_score(txt: str) -> float:
     t = txt.lower()
     hits = sum(t.count(w) for w in _UNCERTAINTY)
@@ -701,7 +711,30 @@ def compute_features_v4(segment: Dict, audio_file: str, y_sr=None, genre: str = 
         # Legacy V4 hook scoring
         hook_score, hook_reasons, hook_details = _hook_score_v4(text, segment.get("arousal_score", 0.0), words_per_sec, genre, 
                                                                segment.get("audio_data"), segment.get("sr"), segment.get("start", 0.0))
-    payoff_score, payoff_type = _detect_payoff(text, genre)
+    # Payoff V2 with feature flag and fallback
+    from config.settings import ENABLE_PAYOFF_V2
+    
+    # Initialize payoff variables
+    payoff_score = 0.0
+    payoff_type = "none"
+    payoff_label = "none"
+    payoff_span = None
+    payoff_src = "v1"
+    
+    if ENABLE_PAYOFF_V2:
+        score_v2, label_v2, span_v2 = _detect_payoff_v2(text, genre)
+        payoff_score = score_v2
+        payoff_type = label_v2  # keeps old key consumers happy
+        payoff_label = label_v2  # new, human-readable
+        payoff_span = span_v2
+        payoff_src = "v2"
+    else:
+        score_v1, type_v1 = _detect_payoff(text, genre)
+        payoff_score = score_v1
+        payoff_type = type_v1
+        payoff_label = type_v1
+        payoff_span = None
+        payoff_src = "v1"
     
     # NEW: Detect insight content vs. intro/filler (V2 if enabled)
     if config.get("insight_v2", {}).get("enabled", False):
@@ -825,6 +858,11 @@ def compute_features_v4(segment: Dict, audio_file: str, y_sr=None, genre: str = 
         'prosody_arousal': 0.0,
         'platform_length_score_v2': 0.0,
     })
+    
+    # Add payoff V2 fields for compatibility and analytics
+    feats['payoff_label'] = payoff_label
+    feats['payoff_span'] = payoff_span
+    feats['payoff_src'] = payoff_src
     
     return feats
 
@@ -1574,7 +1612,9 @@ def _audio_prosody_score(audio_path: str, start: float, end: float, y_sr=None, t
     """Enhanced audio analysis for arousal/energy detection with intelligent fallback"""
     try:
         if y_sr is None:
-            y, sr = librosa.load(audio_path, sr=None, offset=max(0, start-0.2), duration=(end-start+0.4))
+            # Prefer clean WAV if available to eliminate mpg123 errors
+            audio_for_features = _best_audio_for_features(audio_path)
+            y, sr = librosa.load(audio_for_features, sr=None, offset=max(0, start-0.2), duration=(end-start+0.4))
         else:
             y, sr = y_sr
             s = max(int((start-0.2)*sr), 0)
@@ -1743,6 +1783,167 @@ def _detect_payoff(text: str, genre: str = 'general') -> tuple[float, str]:
     final_score = float(np.clip(score, 0.0, 1.0))
     reason_str = ";".join(reasons) if reasons else "no_payoff"
     return final_score, reason_str
+
+# --- Payoff V2: rhetorical/QA/numeric resolution with tail bias ---
+_PAYOFF_LEADS = [
+    r"\bthe (?:bottom|top) line\b",
+    r"\btl;?dr\b",
+    r"\bhere(?:'|')?s (?:the|what)\b",
+    r"\bso (?:the|what this) (?:means|is)\b",
+    r"\bnet[-\s]?net\b",
+    r"\bkey takeaway\b",
+    r"\bin (?:short|summary)\b",
+    r"\bthe answer is\b",
+    r"\bthe play (?:here|now) is\b",
+    r"\bmy advice\b", r"\bpro tip\b",
+    r"\bdo this\b", r"\byou should\b", r"\bthe trick is\b",
+    r"\bhere(?:'|')?s how\b", r"\bstep(?:s)? to\b",
+    r"\bstop doing\b", r"\bstart doing\b",
+    r"\btherefore\b", r"\bbecause\b",
+]
+
+# CTA-ish endings we should *not* reward as payoff
+_PAYOFF_NEG = [
+    r"\bsubscribe\b", r"\bfollow\b", r"\bsmash (?:that )?like\b",
+    r"\bcheck (?:the )?link\b", r"\bjoin (?:my|our)\b",
+]
+
+_NUMERIC_HINT = r"(?:\b\d{1,3}(?:,\d{3})*(?:\.\d+)?\b|\b\d+%|\$\d+(?:\.\d+)?)"
+
+# Precompile regexes at module import for performance
+_PAYOFF_LEADS_RE = [re.compile(p, re.I) for p in _PAYOFF_LEADS]
+_PAYOFF_NEG_RE = [re.compile(p, re.I) for p in _PAYOFF_NEG]
+_NUMERIC_HINT_RE = re.compile(_NUMERIC_HINT)
+
+def _detect_payoff_v2(text: str, genre: str = "general") -> tuple[float, str, Optional[tuple[int, int]]]:
+    """
+    Returns: (score[0..1], label: str, span: (start,end) or None)
+    Heuristics:
+      - reward: explicit payoff leads, numeric commitment, QA resolution
+      - tail bias: payoff in final 35% of the segment is stronger
+      - penalties: open-ended teasers, pure CTAs
+    """
+    import logging
+    from config.settings import PAYOFF_TAIL_BIAS, PAYOFF_V2_DEBUG
+    
+    if not text or len(text) < 24:
+        return 0.0, "none", None
+
+    # Cap text length for analysis (first/last 1,800 chars)
+    if len(text) > 1800:
+        text = text[:900] + " ... " + text[-900:]
+
+    t = " ".join(text.split())
+    n = len(t)
+    tail_start = int(PAYOFF_TAIL_BIAS * n)  # weight payoff that appears near the end
+
+    # Sentence split (cheap)
+    sents = re.split(r"(?<=[\.\!\?])\s+", t)
+    sent_spans = []
+    off = 0
+    for s in sents:
+        s2 = s.strip()
+        if not s2:
+            continue
+        i0 = t.find(s2, off)
+        if i0 < 0:
+            continue
+        i1 = i0 + len(s2)
+        sent_spans.append((s2, i0, i1))
+        off = i1
+
+    score = 0.0
+    label = "none"
+    span = None
+    lead_hit_count = 0
+    numeric_hit_count = 0
+    qa_detected = False
+    tail_boost_applied = False
+
+    # 1) payoff leads
+    for pat in _PAYOFF_LEADS_RE:
+        cnt = 0
+        for m in pat.finditer(t):
+            w = 0.25
+            if m.start() >= tail_start:
+                w += 0.15
+                tail_boost_applied = True
+            score += w
+            lead_hit_count += 1
+            label = "lead"
+            span = (m.start(), min(n, m.end()))
+            cnt += 1
+            if cnt >= 5:  # limit matches per pattern
+                break
+
+    # 2) numeric commitments
+    cnt = 0
+    for m in _NUMERIC_HINT_RE.finditer(t):
+        w = 0.12
+        # slight extra weight if in tail
+        if m.start() >= tail_start:
+            w += 0.08
+            tail_boost_applied = True
+        score += w
+        numeric_hit_count += 1
+        if label == "none":
+            label = "numeric"
+            span = (m.start(), min(n, m.end()))
+        cnt += 1
+        if cnt >= 5:  # limit matches
+            break
+
+    # 3) QA resolution: question followed by declarative answer
+    qpos = t.find("?")
+    if qpos != -1 and qpos < n - 5:
+        answer_tail = t[qpos+1:].strip()
+        # non-trivial answer & not another question
+        if len(answer_tail) > 15 and "?" not in answer_tail:
+            w = 0.22
+            # tail bias if most of the answer sits in the tail
+            if qpos >= int(0.4 * n):
+                w += 0.10
+                tail_boost_applied = True
+            score += w
+            qa_detected = True
+            if label == "none":
+                label = "qa"
+                # approximate span: from qpos to end or sentence end
+                span = (qpos+1, min(n, qpos + 1 + len(answer_tail)))
+
+    # 4) last-sentence reinforcement
+    if sent_spans:
+        last_text, i0, i1 = sent_spans[-1]
+        # if last sentence looks conclusive
+        if re.search(r"\b(so|hence|therefore|that means|in short)\b", last_text, re.I):
+            score += 0.15
+            if label == "none":
+                label = "conclusion"
+                span = (i0, i1)
+
+    # 5) penalize pure CTAs masquerading as payoff
+    for pat in _PAYOFF_NEG_RE:
+        if pat.search(t):
+            score -= 0.20
+
+    # light cap/boosts
+    score = max(0.0, min(1.0, score))
+    # normalize gently toward 0..0.75 typical range
+    if score > 0.75:
+        score = 0.75 + 0.25 * (score - 0.75)
+    
+    # Debug logging
+    if PAYOFF_V2_DEBUG:
+        logger = logging.getLogger(__name__)
+        logger.debug("payoff.v2.matches", extra={
+            "lead_hits": lead_hit_count,
+            "numeric_hits": numeric_hit_count,
+            "qa": qa_detected,
+            "tail_bias": tail_boost_applied,
+            "score": score
+        })
+    
+    return float(score), label, span
 
 def _detect_insight_content(text: str, genre: str = 'general') -> tuple[float, str]:
     """Detect if content contains actual insights vs. intro/filler material"""
@@ -2399,6 +2600,10 @@ def compute_features_v4_enhanced(segment: Dict, audio_file: str, y_sr=None, genr
     body_text = text[100:] if text else ""
     enhanced_payoff = payoff_guard(hook_text, body_text, base_payoff, genre)
     result['payoff_score'] = enhanced_payoff
+    # Add payoff V2 fields for compatibility and analytics (get from base function result)
+    result['payoff_label'] = features_dict.get('payoff_label', 'none')
+    result['payoff_span'] = features_dict.get('payoff_span', None)
+    result['payoff_src'] = features_dict.get('payoff_src', 'v1')
     
     # Calculate duration for enhanced features
     duration_s = segment.get("end", 0) - segment.get("start", 0)

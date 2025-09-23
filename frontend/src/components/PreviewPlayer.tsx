@@ -9,9 +9,10 @@ interface PreviewPlayerProps {
     preview_url?: string; // fallback for backwards compatibility
   };
   className?: string;
+  mediaRef?: React.RefObject<HTMLVideoElement | HTMLAudioElement>;
 }
 
-export function PreviewPlayer({ clip, className = "" }: PreviewPlayerProps) {
+export function PreviewPlayer({ clip, className = "", mediaRef }: PreviewPlayerProps) {
   const [src, setSrc] = useState<string | undefined>();
   const [error, setError] = useState<string | null>(null);
 
@@ -77,6 +78,7 @@ export function PreviewPlayer({ clip, className = "" }: PreviewPlayerProps) {
 
   return (
     <video
+      ref={mediaRef as any}
       controls
       playsInline
       preload="metadata"

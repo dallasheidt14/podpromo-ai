@@ -6,6 +6,33 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+def _concat_segment_text(source, start_s: float, end_s: float) -> str:
+    """
+    Build transcript by concatenating segment texts that overlap [start, end].
+    Fallback when word timestamps are not available.
+    """
+    segments = getattr(source, "segments", None) or []
+    if not segments:
+        return ""
+    
+    # Find segments that overlap with the clip window
+    overlapping_segments = []
+    for seg in segments:
+        seg_start = getattr(seg, "start", 0.0)
+        seg_end = getattr(seg, "end", 0.0)
+        # Check for overlap
+        if seg_end > start_s and seg_start < end_s:
+            overlapping_segments.append(seg)
+    
+    # Concatenate text from overlapping segments
+    texts = []
+    for seg in overlapping_segments:
+        text = getattr(seg, "text", "") or ""
+        if text.strip():
+            texts.append(text.strip())
+    
+    return " ".join(texts)
+
 def slice_items_by_time(items, start: float, end: float, get_start, get_end, pad_s: float = 0.25, eps: float = 0.01):
     """
     Return items that OVERLAP the [start-pad, end+pad] window.
@@ -70,6 +97,13 @@ def build_clip_transcript_exact(source, start_s: float, end_s: float, pad_s: flo
     
     # Get words from source (episode or list)
     words = getattr(source, "words", None) or source or []
+    
+    # Graceful fallback if no words available
+    if not words:
+        logger.warning("CLIP_TRANSCRIPT: episode.words missing; using segment-text fallback")
+        # Build transcript by concatenating segment texts that overlap [start, end]
+        text = _concat_segment_text(source, start_s, end_s)
+        return text, "segment_fallback", {"start": start_s, "end": end_s, "word_count": 0, "coverage_s": 0.0}
     
     # Normalize word schema to handle different formats
     norm = []

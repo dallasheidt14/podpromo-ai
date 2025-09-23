@@ -11,6 +11,13 @@ from datetime import datetime
 from typing import List, Dict, Optional, Any
 from concurrent.futures import ProcessPoolExecutor
 
+# Hard guard: prevent accidental Torch/CUDA usage on Windows
+os.environ.setdefault("ENABLE_TORCH_ALIGNMENT", "0")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")  # prevents accidental torch cuda picks
+os.environ.setdefault("FORCE_CPU_WHISPER", "1")  # force CPU for Whisper on this Windows host
+if os.getenv("FORCE_CPU_WHISPER") == "1":
+    os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+
 # Ensure correct MIME type for .m4a files
 mimetypes.add_type("audio/mp4", ".m4a")
 
@@ -1581,8 +1588,11 @@ async def get_progress():
         }
 
 @app.get("/api/progress/{episode_id}")
-async def get_episode_progress(episode_id: str):
-    """Return the same normalized shape as /api/progress"""
+async def get_episode_progress(episode_id: str, request: Request):
+    """Return the same normalized shape as /api/progress with ETag caching"""
+    import hashlib
+    from fastapi import Response
+    
     try:
         from services.progress_service import progress_service
         result = progress_service.get_progress(episode_id) or {}
@@ -1594,7 +1604,27 @@ async def get_episode_progress(episode_id: str):
         progress_data.setdefault(
             "message", "Processing..." if progress_data.get("percent", 0) < 100 else "Completed"
         )
-        return {"ok": True, "progress": progress_data}
+        
+        # Generate weak ETag from progress data (stable, cheap)
+        etag_data = f"{episode_id}:{progress_data['stage']}:{progress_data['percent']}:{progress_data.get('updated_at', 'unknown')}"
+        etag = f"W/{hashlib.sha1(etag_data.encode()).hexdigest()}"
+        
+        # Check If-None-Match header
+        if_none_match = request.headers.get("if-none-match")
+        if if_none_match == etag:
+            logger.debug(f"PROGRESS_ETAG_HIT {episode_id} etag={etag}")
+            return Response(status_code=304, headers={"ETag": etag})
+        
+        # Log progress request (for monitoring)
+        logger.debug(f"PROGRESS_ETAG_MISS {episode_id} etag={etag} stage={progress_data['stage']} percent={progress_data['percent']}")
+        
+        # Return response with ETag header
+        response_data = {"ok": True, "progress": progress_data}
+        response = JSONResponse(response_data)
+        response.headers["ETag"] = etag
+        response.headers["Cache-Control"] = "private, max-age=0, must-revalidate"
+        return response
+        
     except Exception as e:
         logger.error(f"Episode progress failed for {episode_id}: {e}")
         return {

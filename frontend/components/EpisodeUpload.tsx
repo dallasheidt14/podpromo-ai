@@ -7,7 +7,7 @@ import { Upload, FileAudio, FileVideo, X, CheckCircle, AlertCircle, Clock, Loade
 import { Episode, Clip, ProgressInfo } from '@shared/types';
 import { normalizeClip, normalizeProgressInfo, normalizeProgress } from '@shared/normalize';
 import { getClips, uploadFile, uploadYouTube, handleApiResult, uploadYouTubeSimple, type ProgressResponse, isTerminalProgress } from '../src/shared/api';
-import { createProgressPoller, PollingOptions, Poller } from '@shared/polling';
+// Removed old polling imports - using useProgressPoller hook instead
 import { useProgressPoller } from '../src/hooks/useProgress';
 
 
@@ -41,7 +41,7 @@ export default function EpisodeUpload({
   // Guard against duplicate clips fetch
   const clipsFetchedRef = useRef(false);
   const didFetchRef = useRef(false);
-  const pollerRef = useRef<Poller | null>(null);
+  // Removed old polling ref - using useProgressPoller hook instead
 
   // Explicit file input fallback (reliable on Safari/iOS and when dropzone click is blocked)
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -178,10 +178,7 @@ export default function EpisodeUpload({
     }
 
     // Reset state
-    if (pollerRef.current) {
-      pollerRef.current.stop();
-      pollerRef.current = null;
-    }
+    // Polling cleanup is handled by useProgressPoller hook
     
     setEpisodeId(null);
     setProgressData(null);
@@ -221,10 +218,7 @@ export default function EpisodeUpload({
     if (acceptedFiles.length === 0) return;
 
     // Reset state
-    if (pollerRef.current) {
-      pollerRef.current.stop();
-      pollerRef.current = null;
-    }
+    // Polling cleanup is handled by useProgressPoller hook
     
     setEpisodeId(null);
     setProgressData(null);
@@ -267,44 +261,7 @@ export default function EpisodeUpload({
           setUploadProgress(25); // Initial progress after upload
           setUploadStatus('processing');
           
-          // Start polling for progress
-          const pollingOptions: PollingOptions = {
-            onSuccess: (data) => {
-              const progressInfo = normalizeProgressInfo(data);
-              setProgressData(progressInfo);
-              if (process.env.NODE_ENV === 'development') {
-                console.log(`[POLLING] Updated progress: ${progressInfo?.stage} ${progressInfo?.percentage}%`);
-              }
-            },
-            onError: (error, retryCount) => {
-              if (process.env.NODE_ENV === 'development') {
-                console.error(`[POLLING] Error (attempt ${retryCount}):`, error);
-              }
-              // Don't show error for scoring - it can take 30+ minutes
-              // Only show error for actual failures, not timeouts during scoring
-              if (retryCount >= 50 && !error.includes('signal timed out')) {
-                setError(`Processing failed: ${error}`);
-              }
-            },
-            on404: () => {
-              if (process.env.NODE_ENV === 'development') {
-                console.log('[POLLING] Episode not found, stopping');
-              }
-              setError('Episode not found');
-              return false;
-            },
-            onComplete: () => {
-              if (process.env.NODE_ENV === 'development') {
-                console.log('[POLLING] Processing completed!');
-              }
-              setUploadStatus('completed');
-              onCompleted?.();
-            }
-          };
-          
-          const poller = createProgressPoller(`http://localhost:8000/api/progress/${episodeId}`, pollingOptions);
-          pollerRef.current = poller;
-          poller.start();
+          // Polling is now handled by useProgressPoller hook
           
           onEpisodeUploaded(episodeId);
         },
@@ -349,9 +306,7 @@ export default function EpisodeUpload({
   // Cleanup on unmount
   useEffect(() => {
     return () => {
-      if (pollerRef.current) {
-        pollerRef.current.stop();
-      }
+      // Polling cleanup is handled by useProgressPoller hook
     };
   }, []);
 
@@ -602,32 +557,7 @@ export default function EpisodeUpload({
               <button
                 onClick={() => {
                   setError(null);
-                  // Continue polling if we have an episodeId
-                  if (episodeId) {
-                    const pollingOptions: PollingOptions = {
-                      onSuccess: (data) => {
-                        const progressInfo = normalizeProgressInfo(data);
-                        setProgressData(progressInfo);
-                      },
-                      onError: (error, retryCount) => {
-                        if (process.env.NODE_ENV === 'development') {
-                          console.error(`[POLLING] Error (attempt ${retryCount}):`, error);
-                        }
-                        // Don't show error for scoring timeouts
-                        if (retryCount >= 50 && !error.includes('signal timed out')) {
-                          setError(`Processing failed: ${error}`);
-                        }
-                      },
-                      on404: () => {
-                        setError('Episode not found');
-                        return false;
-                      }
-                    };
-                    
-                    const poller = createProgressPoller(`http://localhost:8000/api/progress/${episodeId}`, pollingOptions);
-                    pollerRef.current = poller;
-                    poller.start();
-                  }
+                  // Polling is now handled by useProgressPoller hook
                 }}
                 className="mt-4 px-4 py-2 bg-blue-500 hover:bg-blue-600 text-white rounded-lg transition-colors shadow-sm"
               >

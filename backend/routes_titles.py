@@ -67,7 +67,13 @@ def generate_titles(clip_id: str, body: TitleGenRequest, request: Request):
                 "generated_at": datetime.utcnow().isoformat() + "Z",
             }
     
-    svc.save_titles(clip_id, body.platform, variants, chosen, meta)
+    svc.save_titles(
+        clip_id=clip_id,
+        platform=body.platform,
+        variants=variants,
+        chosen=chosen,
+        meta=meta
+    )
     return TitleGenResponse(platform=body.platform, variants=variants, chosen=chosen, meta=meta)
 
 @router.post("/{clip_id}/titles/save")
@@ -96,7 +102,13 @@ def save_titles(clip_id: str, req: SaveTitlesRequest = Body(...)):
             return {"ok": False, "reason": "no_titles", "message": "No titles provided"}
         
         # Save titles using the existing service
-        svc.save_titles(clip_id, req.platform, titles, titles[0] if titles else "", {})
+        svc.save_titles(
+            clip_id=clip_id,
+            platform=req.platform,
+            variants=titles,
+            chosen=titles[0] if titles else "",
+            meta={}
+        )
         logger.info(f"SAVE_TITLES_SUCCESS: clip_id={clip_id} saved {len(titles)} titles")
         return {"ok": True, "count": len(titles), "platform": req.platform}
         

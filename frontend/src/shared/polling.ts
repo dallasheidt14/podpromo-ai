@@ -9,6 +9,8 @@ export interface PollingOptions {
   onError?: (error: string, retryCount: number) => void;
   on404?: () => boolean | void;
   onComplete?: () => void;
+  enableETag?: boolean;  // Enable ETag caching
+  maxBackoff?: number;   // Maximum backoff interval in ms
 }
 
 /**
@@ -21,19 +23,39 @@ export function createProgressPoller(
   options: PollingOptions = {}
 ): Poller {
   const {
-    interval = 2000,
+    interval = 1000,  // Reduced from 2000ms to 1000ms
     onSuccess,
     onError,
     on404,
-    onComplete
+    onComplete,
+    enableETag = true,
+    maxBackoff = 4000
   } = options;
 
   let timer: NodeJS.Timeout | null = null;
   let retryCount = 0;
+  let lastETag: string | null = null;
+  let currentInterval = interval;
+  let consecutiveUnchanged = 0;
 
   const poll = async () => {
     try {
-      const response = await fetch(url);
+      const headers: HeadersInit = {};
+      if (enableETag && lastETag) {
+        headers['If-None-Match'] = lastETag;
+      }
+
+      const response = await fetch(url, { headers });
+      
+      if (response.status === 304) {
+        // Data unchanged, implement exponential backoff
+        consecutiveUnchanged++;
+        if (consecutiveUnchanged > 1) {
+          currentInterval = Math.min(currentInterval * 1.5, maxBackoff);
+        }
+        return;
+      }
+
       if (response.status === 404) {
         const shouldContinue = on404?.();
         if (shouldContinue === false) {
@@ -44,6 +66,15 @@ export function createProgressPoller(
 
       if (!response.ok) {
         throw new Error(await response.text());
+      }
+
+      // Reset backoff on successful response
+      consecutiveUnchanged = 0;
+      currentInterval = interval;
+
+      // Update ETag for next request
+      if (enableETag) {
+        lastETag = response.headers.get('ETag');
       }
 
       const data = await response.json();
@@ -62,13 +93,24 @@ export function createProgressPoller(
 
   const start = () => {
     if (timer) return;
-    poll();
-    timer = setInterval(poll, interval);
+    
+    const scheduleNext = () => {
+      timer = setTimeout(() => {
+        poll().then(() => {
+          scheduleNext();
+        });
+      }, currentInterval);
+    };
+    
+    // Start immediately, then schedule subsequent polls
+    poll().then(() => {
+      scheduleNext();
+    });
   };
 
   const stop = () => {
     if (timer) {
-      clearInterval(timer);
+      clearTimeout(timer);
       timer = null;
     }
   };

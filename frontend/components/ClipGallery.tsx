@@ -6,7 +6,14 @@ import { Clip } from "@shared/types";
 import { getClipsSimple, apiUrl, type ClipSimple } from "../src/shared/api";
 import { onClipsReady } from "../src/shared/events";
 import { PreviewPlayer } from "../src/components/PreviewPlayer";
+import { fmtTimecode } from "../src/utils/timecode";
 
+function fallbackFromText(t?: string, max = 80) {
+  const s = (t || '').replace(/\s+/g, ' ').trim();
+  if (!s) return 'Untitled Clip';
+  const firstSent = s.split(/(?<=[.!?])\s/)[0] || s.slice(0, max);
+  return firstSent.length > max ? firstSent.slice(0, max).replace(/[ ,;:.!-]+$/,'') : firstSent;
+}
 
 type Props = {
   clips?: Clip[]; // Make optional since we can fetch them ourselves
@@ -317,7 +324,7 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
               <div className="p-4 space-y-3">
                 <div className="flex items-start justify-between gap-2">
                   <h3 className="line-clamp-2 font-medium text-neutral-900">
-                    {clip.title || clip.text?.slice(0, 60) + "..." || "Untitled clip"}
+                    {clip.title || fallbackFromText(clip.display_text || clip.text) || "Untitled clip"}
                   </h3>
                   {typeof clip.score === "number" && (
                     <span className="shrink-0 rounded-full bg-gradient-to-r from-blue-500 to-blue-600 px-3 py-1.5 text-xs font-bold text-white shadow-lg">
@@ -330,7 +337,7 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
                 {clip.startTime != null && clip.endTime != null && (
                   <div className="text-xs text-blue-800 bg-gradient-to-r from-blue-100 to-yellow-100 px-3 py-2 rounded-lg border border-blue-200 relative z-10">
                     <div className="flex items-center justify-between">
-                      <span className="font-semibold">⏱️ Duration: {Math.max(0, Math.round(clip.endTime - clip.startTime))}s ({Math.round(clip.startTime)}s-{Math.round(clip.endTime)}s)</span>
+                      <span className="font-semibold">⏱️ {clip.display_range || `${fmtTimecode(clip.startTime)}–${fmtTimecode(clip.endTime)}`} ({Math.max(0, Math.round(clip.endTime - clip.startTime))}s)</span>
                       {clip.previewDuration && clip.previewDuration < (clip.endTime - clip.startTime) && (
                         <span className="ml-2 px-2 py-1 bg-orange-100 text-orange-700 text-xs rounded-full border border-orange-200">
                           trimmed to {Math.round(clip.previewDuration)}s
@@ -395,7 +402,7 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
                   <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z" fill="currentColor"/>
                 </svg>
                 <span className="text-lg font-semibold text-blue-900">
-                  Duration: {Math.max(0, Math.round(selected.endTime - selected.startTime))}s ({Math.round(selected.startTime)}s-{Math.round(selected.endTime)}s)
+                  {selected.display_range || `${fmtTimecode(selected.startTime)}–${fmtTimecode(selected.endTime)}`} ({Math.max(0, Math.round(selected.endTime - selected.startTime))}s)
                 </span>
               </div>
             </div>

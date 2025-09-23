@@ -24,9 +24,13 @@ import ffmpeg
 from pydub import AudioSegment
 
 from models import Episode, TranscriptSegment
-from config.settings import UPLOAD_DIR, OUTPUT_DIR, SAMPLE_RATE, WHISPER_LANGUAGE, MAX_FILE_SIZE, ALLOWED_EXTENSIONS, PROGRESS_TRACKER_TTL
+from config.settings import UPLOAD_DIR, OUTPUT_DIR, SAMPLE_RATE, WHISPER_LANGUAGE, MAX_FILE_SIZE, ALLOWED_EXTENSIONS, PROGRESS_TRACKER_TTL, ENABLE_ASR_V2, ASR_PROGRESS_LABEL_HQ, AUDIO_PREDECODE_PCM
+from services.asr import transcribe_with_quality, ASRSettings
+from services.audio_io import ensure_pcm_wav
+from services.util import normalize_asr_result
 
 logger = logging.getLogger(__name__)
+
 
 class EnhancedProgressTracker:
     """Enhanced progress tracker with band mapping to prevent jumps"""
@@ -206,9 +210,13 @@ class EpisodeService:
     def _save_words_to_disk(self, episode: Episode):
         """Save words data to disk for transcript building"""
         try:
+            # Belt & suspenders: prevent None from ever reaching len()
+            words = getattr(episode, 'words', []) or []
+            words_normalized = getattr(episode, 'words_normalized', []) or []
+            
             words_data = {
-                "words": getattr(episode, 'words', []),
-                "words_normalized": getattr(episode, 'words_normalized', []),
+                "words": words,
+                "words_normalized": words_normalized,
                 "episode_id": episode.id,
                 "saved_at": datetime.utcnow().isoformat()
             }
@@ -641,13 +649,9 @@ class EpisodeService:
                 logger.info(f"Normalized {len(episode.words)} words for episode {episode_id}")
             tracker.update_stage("audio_processing", 100, f"Audio ready - Duration: {duration:.1f}s")
             
-            # Transcribe audio with enhanced progress
-            if self._has_faster_whisper():
-                tracker.update_stage("transcription", 0, "Starting transcription with Faster-Whisper...")
-                transcript = await self._transcribe_with_faster_whisper(audio_path, episode_id, tracker, duration)
-            else:
-                tracker.update_stage("transcription", 0, "Starting transcription with Whisper...")
-                transcript = await self._transcribe_audio_with_progress(audio_path, episode_id, tracker)
+            # Transcribe audio with single ASR path
+            tracker.update_stage("transcription", 0, "Starting transcription...")
+            transcript = await self._transcribe_audio_single_path(audio_path, episode_id, tracker, duration)
             
             # Store transcript in episode
             episode.transcript = transcript
@@ -1111,6 +1115,74 @@ class EpisodeService:
                 logger.error(f"Fallback transcription also failed: {fallback_error}")
                 raise Exception(f"Both primary and fallback transcription failed: {e}, {fallback_error}")
     
+    async def _transcribe_audio_single_path(self, audio_path: str, episode_id: str, tracker: EnhancedProgressTracker, total_duration: float) -> List[TranscriptSegment]:
+        """Single ASR path using transcribe_with_quality with proper result normalization"""
+        try:
+            from services.progress_writer import write_progress
+            
+            # Pre-process audio to eliminate mpg123 errors
+            asr_input = ensure_pcm_wav(audio_path)
+            logger.info(f"Using pre-processed audio for ASR: {asr_input}")
+            
+            # Create ASR settings
+            settings = ASRSettings()
+            
+            # --- Transcribe (retry here only) ---
+            try:
+                segments, info, words = transcribe_with_quality(asr_input, settings)
+                logger.info(f"ASR_DONE: segments={len(segments)} words={'present' if words else 'none'}")
+            except Exception as e:
+                logger.error("TRANSCRIBE_FAIL (%s), falling back to CPU: %s", settings.device, e)
+                cpu_settings = settings.with_cpu_fallback()
+                segments, info, words = transcribe_with_quality(asr_input, cpu_settings)
+                logger.info(f"ASR_DONE: segments={len(segments)} words={'present' if words else 'none'}")
+            
+            # --- Post-processing (never re-enters GPU) ---
+            # Words are already extracted by transcribe_with_quality, but ensure they're safe
+            safe_words = words or []  # belt & suspenders
+            logger.info(f"WORDS_READY: count={len(safe_words)} (normalized/synthesized)")
+            
+            # No other ASR paths beyond this point
+            # Persist words safely (never None)
+            logger.info(f"SAVE_WORDS start")
+            logger.info(f"WORDS_SAVE: n={len(safe_words)} eos_from_words={'yes' if safe_words else 'no'}")
+            
+            # Store quality metrics in episode metadata
+            if hasattr(self, 'current_episode') and self.current_episode:
+                self.current_episode.meta = self.current_episode.meta or {}
+                self.current_episode.meta["asr_quality"] = info
+                self.current_episode.words = safe_words
+            
+            logger.info(f"SAVE_WORDS done")
+            
+            # Convert segments to our format
+            segments_list = []
+            for seg in segments:
+                words_for_seg = []
+                if hasattr(seg, 'words') and seg.words:
+                    words_for_seg = [{"text": w.word, "start": w.start, "end": w.end, "prob": getattr(w, 'probability', 0.0)} for w in seg.words]
+                
+                segments_list.append(TranscriptSegment(
+                    start=seg.start,
+                    end=seg.end,
+                    text=seg.text.strip(),
+                    raw_text=seg.text.strip(),
+                    words=words_for_seg
+                ))
+            
+            # Update progress
+            tracker.update_stage("transcription", 100, "Transcription complete")
+            write_progress(episode_id, "transcribing", 95, "Transcription complete")
+            logger.info(f"Single ASR path completed: {len(segments_list)} segments, {len(safe_words)} words")
+            
+            return segments_list
+            
+        except Exception as e:
+            logger.error(f"Single ASR path failed: {e}")
+            # Final fallback to original transcription method
+            logger.info("Falling back to original transcription method...")
+            return await self._transcribe_audio(audio_path, episode_id)
+
     async def _transcribe_audio_with_progress(self, audio_path: str, episode_id: str, tracker: EnhancedProgressTracker) -> List[TranscriptSegment]:
         """Enhanced transcription with better progress tracking"""
         try:
@@ -1206,61 +1278,99 @@ class EpisodeService:
             
         except Exception as e:
             logger.error(f"Enhanced transcription failed: {e}")
-            # Fallback to original method
+            # Fallback to original method - still use pre-processed audio
             logger.info("Falling back to original transcription method...")
-            return await self._transcribe_audio(audio_path, episode_id)
+            return await self._transcribe_audio(audio_for_asr, episode_id)
     
     async def _transcribe_with_faster_whisper(self, audio_path: str, episode_id: str, tracker: EnhancedProgressTracker, total_duration: float) -> List[TranscriptSegment]:
         """Transcribe using faster-whisper with streaming progress"""
         try:
-            from faster_whisper import WhisperModel
             from services.progress_writer import write_progress
-            
-            # Load model once
-            if not hasattr(self, 'fw_model'):
-                tracker.update_stage("transcription", 5, "Loading Faster-Whisper model...")
-                write_progress(episode_id, "transcribing", 5, "Loading model...")
-                # Use CPU to avoid CUDA library issues
-                compute_type = "int8"  # Use int8 for CPU
-                self.fw_model = WhisperModel("base", device="cpu", compute_type=compute_type)
-                logger.info(f"Faster-Whisper model loaded successfully with {compute_type}")
             
             segments_list = []
             tracker.update_stage("transcription", 10, "Starting Faster-Whisper transcription...")
             write_progress(episode_id, "transcribing", 10, "Starting transcription...")
             
-            # Stream segments with balanced preset settings
-            segments, info = self.fw_model.transcribe(
-                audio_path, 
-                language="en",
-                word_timestamps=True,          # REQUIRED for EOS index
-                vad_filter=True,               # better prosody gaps
-                vad_parameters={"min_silence_duration_ms": 200},
-                beam_size=self._get_whisper_beam_size(),
-                best_of=self._get_whisper_best_of(),
-                temperature=self._get_whisper_temperature(),
-                condition_on_previous_text=self._get_whisper_condition_previous()
-            )
+            if ENABLE_ASR_V2:
+                # Use ASR v2 with quality-aware two-pass transcription
+                
+                # Pre-process audio to eliminate mpg123 errors
+                if AUDIO_PREDECODE_PCM:
+                    from services.audio_io import ensure_pcm_wav
+                    audio_for_asr = ensure_pcm_wav(audio_path)
+                    logger.info(f"Using pre-processed audio for ASR: {audio_for_asr}")
+                else:
+                    audio_for_asr = audio_path
+                    logger.info(f"Using original audio for ASR: {audio_for_asr}")
+                
+                # Run ASR v2 in thread pool
+                import asyncio
+                loop = asyncio.get_event_loop()
+                segments, info, quality_metrics = await loop.run_in_executor(
+                    None,
+                    lambda: transcribe_with_quality(audio_for_asr, language="en")
+                )
+                
+                # Store quality metrics in episode metadata
+                if hasattr(self, 'current_episode') and self.current_episode:
+                    self.current_episode.meta = self.current_episode.meta or {}
+                    self.current_episode.meta["asr_quality"] = quality_metrics
+                
+                # Update progress if retry was used
+                if quality_metrics.get("retried"):
+                    tracker.update_stage("transcription", 90, "High-quality retry completed...")
+                    write_progress(episode_id, ASR_PROGRESS_LABEL_HQ, 90)
+                
+                # Convert segments to our format
+                for seg in segments:
+                    words = []
+                    if hasattr(seg, 'words') and seg.words:
+                        words = [{"text": w.word, "start": w.start, "end": w.end, "prob": getattr(w, 'probability', 0.0)} for w in seg.words]
+                    
+                    segments_list.append(TranscriptSegment(
+                        start=seg.start,
+                        end=seg.end,
+                        text=seg.text.strip(),
+                        raw_text=seg.text.strip(),
+                        words=words
+                    ))
+                
+                # Store normalized words for boundary refinement - SAFE EXTRACTION
+                if hasattr(self, 'current_episode') and self.current_episode:
+                    try:
+                        # Use words from ASR response if available, otherwise extract from segments
+                        words = quality_metrics.get("words")
+                        if words is None:
+                            words = _extract_words_safe(segments)
+                        # ensure never None before len() or serialization
+                        words = words or []
+                        self.current_episode.words = words
+                        logger.info("WORDS_SAVE: count=%d for episode %s", len(words), episode_id)
+                    except Exception as e:
+                        logger.exception("Failed to save words for episode %s: %s", episode_id, e)
+                        self.current_episode.words = []
+                
+            # ASR v2 is the only path now - no legacy fallback needed
             
-            # Collect all words for episode-level storage
+            # Collect all words for episode-level storage - SAFE EXTRACTION
             all_words = []
             last_pct = 10
-            for seg in segments:
-                # Store word-level timestamps if available
-                words = []
-                if hasattr(seg, 'words') and seg.words:
-                    words = [{"text": w.word, "start": w.start, "end": w.end, "prob": getattr(w, 'probability', 0.0)} for w in seg.words]
-                    all_words.extend(words)
-                
-                segments_list.append(TranscriptSegment(
-                    start=seg.start,
-                    end=seg.end,
-                    text=seg.text.strip(),
-                    raw_text=seg.text.strip(),  # Keep punctuation intact for EOS
-                    words=words  # Store word-level data
-                ))
-                
-                # Calculate progress based on audio position
+            try:
+                # Use words from ASR response if available, otherwise extract from segments
+                if hasattr(self, 'current_episode') and self.current_episode and hasattr(self.current_episode, 'words'):
+                    all_words = self.current_episode.words or []
+                    logger.info("Using words from current episode: %d words", len(all_words))
+                else:
+                    # Fallback: extract from segments
+                    words = _extract_words_safe(segments_list)
+                    all_words = words or []
+                    logger.info("Extracted %d words from %d segments", len(all_words), len(segments_list))
+            except Exception as e:
+                logger.exception("Failed to extract words from segments: %s", e)
+                all_words = []
+            
+            # Calculate progress based on audio position
+            for seg in segments_list:
                 pct = min(95.0, 10 + (seg.end / max(1.0, total_duration)) * 85.0)
                 
                 if pct - last_pct >= 2.0:  # Update every 2%
@@ -1275,19 +1385,27 @@ class EpisodeService:
             if word_count < 500:  # short ep threshold; use 1500–3000 for long eps
                 logger.warning(f"EOS_SPARSE: word_count={word_count} too low; enabling fallback mode")
             
-            # Store word data in episode for transcript slicing
+            # Store word data in episode for transcript slicing - SAFE STORAGE
             episode = await self.get_episode(episode_id)
             if episode:
-                # Normalize word structure before storing
-                from services.word_normalizer import normalize_words
-                normalized_words = normalize_words(all_words)
-                episode.words = normalized_words
-                episode.word_count = len(normalized_words)
-                episode.raw_text = " ".join([seg.text for seg in segments_list])
+                try:
+                    # Normalize word structure before storing
+                    from services.word_normalizer import normalize_words
+                    normalized_words = normalize_words(all_words)
+                    # ensure never None before len() or serialization
+                    normalized_words = normalized_words or []
+                    episode.words = normalized_words
+                    episode.word_count = len(normalized_words)
+                    episode.raw_text = " ".join([seg.text for seg in segments_list])
+                    logger.info("WORDS_SAVE: saved %d normalized words for episode %s", len(normalized_words), episode_id)
+                except Exception as e:
+                    logger.exception("Failed to save normalized words for episode %s: %s", episode_id, e)
+                    episode.words = []
+                    episode.word_count = 0
                 
                 # Attach normalized words to segments for local EOS detection
-                self._attach_words_to_segments(normalized_words, segments_list)
-                logger.info(f"Normalized {len(normalized_words)} words for episode {episode_id}")
+                self._attach_words_to_segments(episode.words, segments_list)
+                logger.info(f"Normalized {len(episode.words)} words for episode {episode_id}")
                 
                 self._save_episode(episode)
             
@@ -1297,10 +1415,10 @@ class EpisodeService:
             return segments_list
             
         except Exception as e:
-            logger.error(f"Faster-Whisper transcription failed: {e}")
-            # Fallback to regular transcription
-            logger.info("Falling back to regular Whisper transcription...")
-            return await self._transcribe_audio_with_progress(audio_path, episode_id, tracker)
+            logger.error(f"ASR v2 transcription failed: {e}")
+            # Fallback to original transcription method - still use pre-processed audio
+            logger.info("Falling back to original transcription method...")
+            return await self._transcribe_audio(audio_for_asr, episode_id)
     
     def check_storage(self) -> bool:
         """Check if storage is accessible"""

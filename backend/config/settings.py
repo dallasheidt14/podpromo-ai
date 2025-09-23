@@ -73,6 +73,54 @@ TRAIL_PAD_SEC = float(os.getenv("TRAIL_PAD_SEC", "0.25"))
 REFINE_SNAP_MAX_NUDGE = float(os.getenv("REFINE_SNAP_MAX_NUDGE", "0.35"))
 REFINE_MIN_TAIL_SILENCE = float(os.getenv("REFINE_MIN_TAIL_SILENCE", "0.12"))
 
+# -------- Prosody Arousal v2 --------
+ENABLE_PROSODY_V2 = os.getenv("ENABLE_PROSODY_V2", "1") == "1"
+AROUSAL_V2_BLEND_TEXT = float(os.getenv("AROUSAL_V2_BLEND_TEXT", "0.6"))  # 0..1
+AROUSAL_V2_BLEND_AUDIO = 1.0 - AROUSAL_V2_BLEND_TEXT
+
+# -------- Trend Boost --------
+ENABLE_TREND_BOOST = os.getenv("ENABLE_TREND_BOOST", "1") == "1"
+TREND_BOOST_WEIGHT = float(os.getenv("TREND_BOOST_WEIGHT", "0.05"))  # 0..0.15 rec
+# Compatibility shim - prefer new path, fallback to old
+TRENDING_TERMS_FILE = os.getenv("TRENDING_TERMS_FILE", os.getenv("TRENDS_FILE", "backend/data/trending_terms.json"))
+
+# Decay + blending
+TREND_HALF_LIFE_DAYS = float(os.getenv("TREND_HALF_LIFE_DAYS", "7"))
+TREND_GLOBAL_WEIGHT = float(os.getenv("TREND_GLOBAL_WEIGHT", "0.4"))
+TREND_CATEGORY_WEIGHT = float(os.getenv("TREND_CATEGORY_WEIGHT", "0.6"))
+
+# Categories (used by collector & provider)
+TREND_CATEGORIES = os.getenv("TREND_CATEGORIES",
+    "general,tech,business,crypto,sports,entertainment,health,politics").split(",")
+
+# Optional AB test (stable hash % 100 < pct ⇒ enabled)
+TREND_AB_PCT = int(os.getenv("TREND_AB_PCT", "100"))  # 0..100
+
+# -------- Prerank Exploration --------
+ENABLE_EXPLORATION = os.getenv("ENABLE_EXPLORATION", "1") == "1"
+EXPLORATION_QUOTA = float(os.getenv("EXPLORATION_QUOTA", "0.15"))  # fraction of k
+EXPLORATION_MIN = int(os.getenv("EXPLORATION_MIN", "2"))
+
+# -------- Spectral Flux Feature (gated) --------
+ENABLE_SPECTRAL_FLUX = os.getenv("ENABLE_SPECTRAL_FLUX", "0") == "1"
+
+# Audio-side weights inside the arousal blend (used only if flux enabled+gated)
+RMS_AUDIO_WEIGHT = float(os.getenv("RMS_AUDIO_WEIGHT", "0.6"))
+F0_AUDIO_WEIGHT = float(os.getenv("F0_AUDIO_WEIGHT", "0.3"))
+FLUX_AUDIO_WEIGHT = float(os.getenv("FLUX_AUDIO_WEIGHT", "0.1"))
+
+# Speech gating thresholds
+VOICED_FRAC_MIN = float(os.getenv("VOICED_FRAC_MIN", "0.30"))
+PAUSE_FRAC_MAX = float(os.getenv("PAUSE_FRAC_MAX", "0.85"))
+
+# Optional AB (0..1). If >0, only this fraction of ab_key traffic gets flux.
+FLUX_AB_PCT = float(os.getenv("FLUX_AB_PCT", "0.0"))
+
+# -------- Payoff V2 --------
+ENABLE_PAYOFF_V2 = os.getenv("ENABLE_PAYOFF_V2", "1") == "1"
+PAYOFF_TAIL_BIAS = float(os.getenv("PAYOFF_TAIL_BIAS", "0.65"))  # cutoff as fraction of text length
+PAYOFF_V2_DEBUG = os.getenv("PAYOFF_V2_DEBUG", "0") == "1"
+
 # Title generation settings
 PLAT_LIMITS = {
     "shorts": 80,
@@ -82,6 +130,9 @@ PLAT_LIMITS = {
     "default": 80,
 }
 TITLE_ENGINE_V2 = os.getenv("TITLE_ENGINE_V2", "true").lower() == "true"
+
+# Title persistence settings
+TITLES_INDEX_TTL_SEC = int(os.getenv("TITLES_INDEX_TTL_SEC", "60"))
 
 # API settings
 API_PREFIX = "/api"
@@ -120,3 +171,61 @@ PRERANK_WEIGHTS = {
 # Duration targets for pre-rank scoring
 DURATION_TARGET_MIN = int(os.getenv("DURATION_TARGET_MIN", "8"))
 DURATION_TARGET_MAX = int(os.getenv("DURATION_TARGET_MAX", "90"))
+
+# --- ASR settings (v2) ---
+def _bool(v, d=False): 
+    s = str(os.getenv(v, str(int(d)))).strip().lower()
+    return s in ("1","true","yes","y","on")
+
+def _float(v, d): 
+    try: return float(os.getenv(v, str(d)))
+    except: return d
+
+def _int(v, d): 
+    try: return int(os.getenv(v, str(d)))
+    except: return d
+
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "large-v3")  # legacy
+ASR_MODEL = os.getenv("ASR_MODEL", "Systran/faster-whisper-large-v3")
+ASR_DEVICE = os.getenv("ASR_DEVICE", "cuda")
+ASR_IMPL = os.getenv("ASR_IMPL", "faster_whisper")
+
+_VALID_COMPUTE = {"int8","int8_float16","float16","float32"}
+ASR_COMPUTE_TYPE = os.getenv("ASR_COMPUTE_TYPE", "int8_float16")
+if ASR_COMPUTE_TYPE not in _VALID_COMPUTE:
+    import logging
+    logging.warning("ASR_COMPUTE_TYPE=%s invalid; defaulting to int8", ASR_COMPUTE_TYPE)
+    ASR_COMPUTE_TYPE = "int8"
+
+ASR_WORD_TS = _bool("ASR_WORD_TIMESTAMPS", True)
+ASR_VAD = _bool("ASR_VAD_FILTER", True)
+ASR_VAD_SILENCE_MS = _int("ASR_VAD_MIN_SILENCE_MS", 300)
+ASR_VAD_SPEECH_PAD_MS = _int("ASR_VAD_SPEECH_PAD_MS", 200)
+ASR_COND_PREV = _bool("ASR_COND_PREV", True)
+
+ASR_BEAM_SIZE = _int("ASR_BEAM_SIZE", 1)
+ASR_TEMPS = os.getenv("ASR_TEMPERATURES", "0.0,0.2")
+
+# GPU memory management
+ASR_GPU_MEMORY_FRACTION = _float("ASR_GPU_MEMORY_FRACTION", 0.85)
+
+# Audio pre-processing
+AUDIO_PREDECODE_PCM = _bool("AUDIO_PREDECODE_PCM", True)
+
+# Torch/CUDA alignment (disabled by default on Windows)
+ENABLE_TORCH_ALIGNMENT = _bool("ENABLE_TORCH_ALIGNMENT", False)
+
+ENABLE_ASR_V2 = _bool("ENABLE_ASR_V2", True)
+ENABLE_QUALITY_RETRY = _bool("ENABLE_QUALITY_RETRY", True)
+ASR_LOW_QL_LOGPROB = _float("ASR_LOW_QL_LOGPROB", -1.0)
+ASR_LOW_QL_COMPRESS = _float("ASR_LOW_QL_COMPRESS", 2.3)
+ASR_LOW_QL_MIN_PUNCT = _float("ASR_LOW_QL_MIN_PUNCT", 0.25)
+ASR_HQ_ON_RETRY_COMPUTE_TYPE = os.getenv("ASR_HQ_ON_RETRY_COMPUTE_TYPE", "int8_float16")
+if ASR_HQ_ON_RETRY_COMPUTE_TYPE not in _VALID_COMPUTE:
+    ASR_HQ_ON_RETRY_COMPUTE_TYPE = "int8_float16"
+
+# UI/progress tweaks
+ASR_PROGRESS_LABEL_HQ = os.getenv("ASR_PROGRESS_LABEL_HQ", "transcribing_hq")
+
+# Feature weight adjustments for low ASR quality
+ENABLE_ASR_QUALITY_WEIGHTING = _bool("ENABLE_ASR_QUALITY_WEIGHTING", True)
