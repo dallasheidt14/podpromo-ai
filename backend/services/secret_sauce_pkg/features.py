@@ -4640,11 +4640,19 @@ def build_eos_index(segments: List[Dict], episode_words: List[Dict] = None, epis
     # 1) Try episode-level word timings (best)
     episode_eos = []
     if episode_words and len(episode_words) >= 100:
+        # Use existing sophisticated EOS detection
         episode_eos = _build_eos_from_words(episode_words)
-        if episode_eos:
-            eos_times.update(episode_eos)
-            eos_source = "episode"
-            logger.info(f"EOS from episode words: {len(episode_eos)} markers")
+        
+        # Add enhanced punctuation-based detection
+        from services.util import detect_sentence_endings_from_words, unify_eos_markers
+        enhanced_eos = detect_sentence_endings_from_words(episode_words)
+        
+        if episode_eos or enhanced_eos:
+            # Unify both approaches, preferring enhanced punctuation detection
+            unified_eos = unify_eos_markers(list(episode_eos), enhanced_eos)
+            eos_times.update(unified_eos)
+            eos_source = "episode+enhanced"
+            logger.info(f"EOS from episode words: {len(episode_eos)} markers, enhanced: {len(enhanced_eos)} markers, unified: {len(unified_eos)} markers")
     
     # 2) Try segment-level words (next best)
     if not eos_times:

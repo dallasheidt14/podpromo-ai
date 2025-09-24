@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 from config.settings import (
     TRENDING_TERMS_FILE, TREND_GLOBAL_WEIGHT, TREND_CATEGORY_WEIGHT,
-    TREND_HALF_LIFE_DAYS, TREND_AB_PCT
+    TREND_HALF_LIFE_DAYS, TREND_AB_PCT, TREND_CONTROL_SCALE
 )
 
 logger = logging.getLogger(__name__)
@@ -92,19 +92,44 @@ def _score_terms(text_tokens: List[str], items: List[Dict], half_life_days: floa
             score += w
     return min(1.0, score)
 
-def _ab_enabled(key: Optional[str]) -> bool:
+def collect_hashtags(seg_text: str, episode_meta: Optional[Dict]) -> List[str]:
+    """Extract hashtags from segment text and episode metadata"""
+    import re
+    
+    # Text hashtags like #Productivity
+    text_tags = [f"#{m.lower()}" for m in re.findall(r"#([A-Za-z0-9_]{2,40})", seg_text or "")]
+    
+    # Episode metadata hashtags
+    meta_tags = []
+    if episode_meta:
+        for k in ("hashtags", "tags", "social_hashtags", "topics"):
+            v = episode_meta.get(k)
+            if isinstance(v, (list, tuple)):
+                meta_tags.extend([f"#{str(x).lower().lstrip('#')}" for x in v])
+    
+    # Dedupe and limit to top 8
+    tags = list(dict.fromkeys(text_tags + meta_tags))[:8]
+    return tags
+
+def _ab_scale(key: Optional[str]) -> float:
+    """
+    Continuous AB scaling:
+    - Treatment bucket: 1.0 (full weight)
+    - Control bucket: TREND_CONTROL_SCALE (reduced but non-zero)
+    """
     if TREND_AB_PCT >= 100:
-        return True
+        return 1.0
     if not key:
-        return False
+        return 0.0
     h = hashlib.md5(key.encode("utf-8")).hexdigest()
     bucket = int(h[:6], 16) % 100
-    return bucket < TREND_AB_PCT
+    return 1.0 if bucket < TREND_AB_PCT else TREND_CONTROL_SCALE
 
 def trend_match_score(text: str, hashtags: Optional[List[str]] = None,
                       categories: Optional[List[str]] = None,
                       ab_key: Optional[str] = None) -> float:
-    if not _ab_enabled(ab_key):
+    scale = _ab_scale(ab_key)
+    if scale <= 0.0:
         return 0.0
     doc = _load_doc()
     if not doc:
@@ -133,4 +158,4 @@ def trend_match_score(text: str, hashtags: Optional[List[str]] = None,
         s_cats = max(s_cats, _score_terms(tokens, by_cat.get(c, []), half_life_days))
 
     combined = TREND_GLOBAL_WEIGHT * s_global + TREND_CATEGORY_WEIGHT * s_cats
-    return float(min(1.0, combined))
+    return float(min(1.0, combined * scale))

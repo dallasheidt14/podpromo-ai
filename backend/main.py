@@ -1605,18 +1605,24 @@ async def get_episode_progress(episode_id: str, request: Request):
             "message", "Processing..." if progress_data.get("percent", 0) < 100 else "Completed"
         )
         
-        # Generate weak ETag from progress data (stable, cheap)
-        etag_data = f"{episode_id}:{progress_data['stage']}:{progress_data['percent']}:{progress_data.get('updated_at', 'unknown')}"
-        etag = f"W/{hashlib.sha1(etag_data.encode()).hexdigest()}"
+        # Generate weak ETag from stable fields only (no volatile timestamps)
+        stable = (
+            episode_id,
+            str(progress_data.get("stage", "unknown")),
+            str(progress_data.get("message", "")),
+            int(progress_data.get("percent", 0)),
+        )
+        etag = f"W/{hashlib.sha1('::'.join(map(str, stable)).encode()).hexdigest()}"
         
         # Check If-None-Match header
         if_none_match = request.headers.get("if-none-match")
+        
         if if_none_match == etag:
-            logger.debug(f"PROGRESS_ETAG_HIT {episode_id} etag={etag}")
+            logger.debug(f"PROGRESS_ETAG_HIT {episode_id} returning 304")
             return Response(status_code=304, headers={"ETag": etag})
         
-        # Log progress request (for monitoring)
-        logger.debug(f"PROGRESS_ETAG_MISS {episode_id} etag={etag} stage={progress_data['stage']} percent={progress_data['percent']}")
+        # Log progress request (for monitoring) - only log misses to reduce noise
+        logger.debug(f"PROGRESS_ETAG_MISS {episode_id} etag={etag} if_none_match={if_none_match} stage={progress_data['stage']} percent={progress_data['percent']}")
         
         # Return response with ETag header
         response_data = {"ok": True, "progress": progress_data}

@@ -43,6 +43,9 @@ export function createProgressPoller(
       const headers: HeadersInit = {};
       if (enableETag && lastETag) {
         headers['If-None-Match'] = lastETag;
+        console.log(`[POLLING] Request with If-None-Match: ${lastETag}`);
+      } else {
+        console.log(`[POLLING] Request without ETag`);
       }
 
       const response = await fetch(url, { headers });
@@ -53,6 +56,7 @@ export function createProgressPoller(
         if (consecutiveUnchanged > 1) {
           currentInterval = Math.min(currentInterval * 1.5, maxBackoff);
         }
+        console.log(`[POLLING] 304 Not Modified - backoff to ${currentInterval}ms`);
         return;
       }
 

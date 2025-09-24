@@ -4,6 +4,10 @@ Utility functions for cross-cutting concerns and data normalization.
 
 from typing import Dict, List, Any, Tuple, Union
 import logging
+import json
+import os
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 
 logger = logging.getLogger(__name__)
@@ -270,3 +274,195 @@ def _extract_words_safe(segments: List[Any], words: List[Dict[str, Any]] = None)
     synthesized = _synthesize_words_from_segments(segments)
     logger.debug(f"Synthesized {len(synthesized)} words from {len(segments)} segments")
     return synthesized
+
+
+def atomic_write_json(path: Path, data: Any) -> None:
+    """
+    Atomically write JSON data to a file using temp file + rename.
+    Ensures atomic writes on Windows and prevents partial/corrupted files.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Create temp file in same directory for atomic rename
+    with tempfile.NamedTemporaryFile(
+        mode='w', 
+        delete=False, 
+        dir=path.parent, 
+        suffix='.tmp',
+        encoding='utf-8'
+    ) as tmp_file:
+        tmp_path = Path(tmp_file.name)
+        json.dump(data, tmp_file, ensure_ascii=False, separators=(',', ':'))
+        tmp_file.flush()
+        os.fsync(tmp_file.fileno())  # Force write to disk
+    
+    try:
+        # Atomic rename (works on same filesystem)
+        os.replace(tmp_path, path)
+    except Exception as e:
+        # Clean up temp file on failure
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except:
+            pass
+        raise e
+
+
+def detect_sentence_endings_from_words(words: List[Dict]) -> List[float]:
+    """
+    Return list of times (float seconds) marking likely sentence ends.
+    Enhanced version that works with the existing EOS system.
+    """
+    eos = []
+    n = len(words)
+    
+    for i, w in enumerate(words):
+        text = (w.get("word") or w.get("text") or "").strip()
+        end = float(w.get("end") or 0.0)
+
+        if not text:
+            continue
+
+        # Strong punctuation
+        if text.endswith((".", "!", "?")):
+            nxt = words[i + 1] if i + 1 < n else None
+            nxt_tok = (nxt.get("word") or nxt.get("text") or "").strip() if nxt else ""
+            if (not nxt) or (nxt_tok and nxt_tok[0].isupper()):
+                eos.append(end)
+                continue
+
+        # Weak punctuation + pause
+        if text.endswith((",", ";", ":")) and i + 1 < n:
+            nxt = words[i + 1]
+            gap = float(nxt.get("start") or 0.0) - end
+            if gap > 0.5:
+                eos.append(end)
+
+    return eos
+
+
+def unify_eos_markers(existing_eos: List[float], eos_from_words: List[float], *, tol: float = 0.25) -> List[float]:
+    """
+    Merge and de-dup EOS markers; prefer words-based within ±tol seconds.
+    """
+    merged = []
+    for t in sorted(existing_eos + eos_from_words):
+        if not merged or abs(t - merged[-1]) > tol:
+            merged.append(t)
+        else:
+            # Collision: prefer the words-based timestamp if it's in this neighborhood
+            # Heuristic: if any words-based marker falls within tol, use the one
+            # closest to a punctuation end; otherwise keep earliest.
+            pass  # optional: keep simple, current 'closest-to-words' logic below
+    
+    # Simple preference: snap merged markers to nearest words-based marker if within tol
+    if eos_from_words:
+        snapped = []
+        for t in merged:
+            nearest = min(eos_from_words, key=lambda w: abs(w - t), default=None)
+            snapped.append(nearest if nearest is not None and abs(nearest - t) <= tol else t)
+        merged = snapped
+    
+    return merged
+
+
+def extend_to_natural_end(clip: Dict, words: List[Dict], max_extend_sec: float = 3.0) -> Dict:
+    """
+    Extend clip['end'] to the next EOS within max_extend_sec, if any.
+    """
+    end = float(clip.get("end", 0.0))
+    best = None
+    n = len(words)
+    
+    # Find first word ending after current end
+    for i, w in enumerate(words):
+        w_end = float(w.get("end") or 0.0)
+        if w_end <= end:
+            continue
+        if w_end - end > max_extend_sec:
+            break
+            
+        tok = (w.get("word") or w.get("text") or "").strip()
+        if tok.endswith((".", "!", "?")):
+            nxt = words[i + 1] if i + 1 < n else None
+            nxt_tok = (nxt.get("word") or nxt.get("text") or "").strip() if nxt else ""
+            if (not nxt) or (nxt_tok and nxt_tok[0].isupper()):
+                best = w_end
+                break
+
+    if best is not None and best > end:
+        clip["end"] = best
+        clip["extended"] = True
+        clip["extension_delta"] = best - end
+    
+    return clip
+
+
+def calculate_finish_confidence(clip: Dict, words: List[Dict] = None) -> float:
+    """
+    Calculate confidence that a clip represents a finished thought.
+    Returns value between 0.0 and 1.0.
+    """
+    text = (clip.get("text") or "").strip()
+    if not text:
+        return 0.0
+    
+    confidence = 0.0
+    
+    # Strong punctuation (high confidence)
+    if text.endswith((".", "!", "?")):
+        confidence += 0.6
+        
+        # Check for proper sentence structure (capitalization after period)
+        if words:
+            clip_end = float(clip.get("end", 0.0))
+            for w in words:
+                w_start = float(w.get("start", 0.0))
+                if w_start > clip_end + 0.1:  # Next word after clip
+                    w_text = (w.get("word") or w.get("text") or "").strip()
+                    if w_text and w_text[0].isupper():
+                        confidence += 0.2
+                    break
+    
+    # Discourse closers (medium-high confidence)
+    discourse_closers = [
+        "and that's why", "so we", "that's why", "which is why", 
+        "this is why", "that's it", "that's right", "all set", "we're done"
+    ]
+    text_lower = text.lower()
+    if any(closer in text_lower for closer in discourse_closers):
+        confidence += 0.4
+    
+    # Pause after end (if words available)
+    if words:
+        clip_end = float(clip.get("end", 0.0))
+        for i, w in enumerate(words):
+            w_start = float(w.get("start", 0.0))
+            if w_start > clip_end:
+                gap = w_start - clip_end
+                if gap > 0.5:  # Significant pause
+                    confidence += 0.2
+                break
+    
+    # Weak punctuation (low confidence)
+    if text.endswith((",", ";", ":")):
+        confidence += 0.1
+    
+    return min(1.0, confidence)
+
+
+def finish_threshold_for(genre: str, indicators: Dict) -> float:
+    """
+    Calculate adaptive finish threshold based on genre and content indicators.
+    """
+    t = 0.60  # Base threshold
+    
+    if indicators.get("conversational_ratio", 0) > 0.7:
+        t -= 0.15
+    if genre in {"educational", "technical"}:
+        t += 0.10
+    if indicators.get("interview_format"):
+        t -= 0.10
+    
+    return max(0.30, min(0.80, t))

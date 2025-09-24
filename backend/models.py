@@ -152,13 +152,16 @@ class Episode(BaseModel):
     words: Optional[List[Dict[str, Any]]] = None  # Store word-level timestamps
     word_count: Optional[int] = None  # Store word count for EOS index
     raw_text: Optional[str] = None  # Store raw text with punctuation intact for EOS
+    words_normalized: Optional[bool] = None  # Flag for normalized word data
+    eos_from_words: Optional[bool] = None  # Flag for EOS detection from words
     error: Optional[str] = None
     uploaded_at: Optional[datetime] = None
     processed_at: Optional[datetime] = None
     
     model_config = {
         "from_attributes": True,
-        "frozen": False  # Allow mutation of fields after creation
+        "frozen": False,  # Allow mutation of fields after creation
+        "extra": "ignore"  # Ignore unknown fields during deserialization
     }
     
     @field_validator('clips', mode='before')

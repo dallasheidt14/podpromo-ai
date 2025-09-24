@@ -95,6 +95,7 @@ TREND_CATEGORIES = os.getenv("TREND_CATEGORIES",
 
 # Optional AB test (stable hash % 100 < pct ⇒ enabled)
 TREND_AB_PCT = int(os.getenv("TREND_AB_PCT", "100"))  # 0..100
+TREND_CONTROL_SCALE = float(os.getenv("TREND_CONTROL_SCALE", "0.25"))  # Control bucket weight
 
 # -------- Prerank Exploration --------
 ENABLE_EXPLORATION = os.getenv("ENABLE_EXPLORATION", "1") == "1"
@@ -187,11 +188,11 @@ def _int(v, d):
 
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "large-v3")  # legacy
 ASR_MODEL = os.getenv("ASR_MODEL", "Systran/faster-whisper-large-v3")
-ASR_DEVICE = os.getenv("ASR_DEVICE", "cuda")
+ASR_DEVICE = os.getenv("ASR_DEVICE", "auto")  # Auto-detect with proper fallback
 ASR_IMPL = os.getenv("ASR_IMPL", "faster_whisper")
 
 _VALID_COMPUTE = {"int8","int8_float16","float16","float32"}
-ASR_COMPUTE_TYPE = os.getenv("ASR_COMPUTE_TYPE", "int8_float16")
+ASR_COMPUTE_TYPE = os.getenv("ASR_COMPUTE_TYPE", "int8_float16")  # GPU-optimized when available
 if ASR_COMPUTE_TYPE not in _VALID_COMPUTE:
     import logging
     logging.warning("ASR_COMPUTE_TYPE=%s invalid; defaulting to int8", ASR_COMPUTE_TYPE)

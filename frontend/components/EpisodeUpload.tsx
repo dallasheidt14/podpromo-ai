@@ -7,8 +7,8 @@ import { Upload, FileAudio, FileVideo, X, CheckCircle, AlertCircle, Clock, Loade
 import { Episode, Clip, ProgressInfo } from '@shared/types';
 import { normalizeClip, normalizeProgressInfo, normalizeProgress } from '@shared/normalize';
 import { getClips, uploadFile, uploadYouTube, handleApiResult, uploadYouTubeSimple, type ProgressResponse, isTerminalProgress } from '../src/shared/api';
-// Removed old polling imports - using useProgressPoller hook instead
-import { useProgressPoller } from '../src/hooks/useProgress';
+// Using new progress poller with proper ETag handling
+import { startProgressPoller, stopProgressPoller } from '../lib/progressPoller';
 
 
 type Props = {
@@ -46,9 +46,11 @@ export default function EpisodeUpload({
   // Explicit file input fallback (reliable on Safari/iOS and when dropzone click is blocked)
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // New progress poller hook for YouTube uploads
-  useProgressPoller(episodeId || undefined, {
-    onUpdate: (p: ProgressResponse) => {
+  // Progress poller with proper ETag handling
+  useEffect(() => {
+    if (!episodeId) return;
+    
+    const handleProgressUpdate = (p: { stage: string; message: string; percent: number }) => {
       const progressInfo = normalizeProgressInfo({
         stage: p.stage,
         percentage: p.percent || 0,
@@ -58,15 +60,23 @@ export default function EpisodeUpload({
       if (process.env.NODE_ENV === 'development') {
         console.log(`[PROGRESS_POLLER] Updated progress: ${p.stage} ${p.percent}%`);
       }
-    },
-    onDone: () => {
-      if (process.env.NODE_ENV === 'development') {
-        console.log('[PROGRESS_POLLER] Processing completed!');
+      
+      // Check if processing is complete
+      if (p.stage === 'completed' || p.percent >= 100) {
+        if (process.env.NODE_ENV === 'development') {
+          console.log('[PROGRESS_POLLER] Processing completed!');
+        }
+        setUploadStatus('completed');
+        onCompleted?.();
       }
-      setUploadStatus('completed');
-      onCompleted?.();
-    }
-  });
+    };
+    
+    startProgressPoller(episodeId, handleProgressUpdate);
+    
+    return () => {
+      stopProgressPoller(episodeId);
+    };
+  }, [episodeId, onCompleted]);
 
   // 🔁 If parent passes an id+status, pick up polling
   useEffect(() => {

@@ -697,6 +697,29 @@ def _is_finished_like(cand: dict, *, fallback: bool, tail_close_sec: float = 0.7
         cand["finish_reason"] = "close_eos"
         return True, "KEEP_TAIL_CLOSE"
 
+    # Confidence-based finished thought detection (soft decision)
+    from services.util import calculate_finish_confidence
+    words = cand.get("words") or []
+    confidence = calculate_finish_confidence(cand, words)
+    
+    # Adaptive threshold based on genre and content indicators
+    genre = cand.get("genre", "general")
+    indicators = {
+        "conversational_ratio": cand.get("conversational_ratio", 0.0),
+        "interview_format": cand.get("interview_format", False)
+    }
+    from services.util import finish_threshold_for
+    threshold = finish_threshold_for(genre, indicators)
+    
+    if confidence >= threshold:
+        cand["finished_thought"] = True
+        cand["finish_reason"] = "confidence_based"
+        cand["finish_confidence"] = confidence
+        cand["finish_threshold"] = threshold
+        logger.debug("FINISH_CONF: clip=%s conf=%.2f thr=%.2f finished=%s", 
+                    cand.get("id", "unknown"), confidence, threshold, confidence >= threshold)
+        return True, "KEEP_CONFIDENCE"
+
     return False, "DROP_UNFINISHED"
 
 def _apply_quality_gates_fallback_aware(candidates, *, fallback: bool, tail_close_sec: float, cfg=None):

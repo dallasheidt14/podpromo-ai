@@ -28,7 +28,7 @@ from models import Episode, TranscriptSegment
 from config.settings import UPLOAD_DIR, OUTPUT_DIR, SAMPLE_RATE, WHISPER_LANGUAGE, MAX_FILE_SIZE, ALLOWED_EXTENSIONS, PROGRESS_TRACKER_TTL, ENABLE_ASR_V2, ASR_PROGRESS_LABEL_HQ, AUDIO_PREDECODE_PCM
 from services.asr import transcribe_with_quality, ASRSettings
 from services.audio_io import ensure_pcm_wav
-from services.util import normalize_asr_result
+from services.util import normalize_asr_result, atomic_write_json
 
 logger = logging.getLogger(__name__)
 
@@ -219,7 +219,7 @@ class EpisodeService:
                 
                 with open(filepath, 'w', encoding='utf-8') as f:
                     json.dump(episode_dict, f, indent=2, ensure_ascii=False)
-                logger.info(f"Saved episode {episode.id} to storage")
+                logger.info(f"Saved episode metadata {episode.id} to storage")
             except Exception as file_error:
                 logger.warning(f"Failed to save episode {episode.id} to file: {file_error}, but kept in memory")
         except Exception as e:
@@ -281,22 +281,22 @@ class EpisodeService:
                     pass  # fall through to replace
 
         path = self._words_path(episode_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Atomic write
-        import tempfile
-        tmp_fd, tmp_name = tempfile.mkstemp(prefix="words_", suffix=".json", dir=str(path.parent))
-        try:
-            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
-                json.dump(words, f, ensure_ascii=False)
-            os.replace(tmp_name, str(path))
-            logger.info("WORDS_SAVE_PATH: %s (n=%d)", path, len(words))
-        finally:
+        atomic_write_json(path, words)
+        
+        # Lightweight verification
+        ok = path.exists() and path.stat().st_size > 0
+        logger.info("WORDS_SAVED: %s (n=%d, ok=%s)", path, len(words), ok)
+        
+        # Debug-only verification (parse and validate structure)
+        if logger.isEnabledFor(logging.DEBUG):
             try:
-                if os.path.exists(tmp_name):
-                    os.remove(tmp_name)
-            except Exception:
-                pass
+                data = json.loads(path.read_text(encoding="utf-8"))
+                debug_ok = isinstance(data, list) and len(data) > 0
+                logger.debug("WORDS_VERIFY: ok=%s count=%s", debug_ok, len(data) if debug_ok else None)
+                if not debug_ok:
+                    logger.warning("WORDS_VERIFY_FAIL: %s malformed/empty", path)
+            except Exception as e:
+                logger.warning("WORDS_VERIFY_FAIL: %s parse error: %s", path, e)
     
     def _init_whisper(self):
         """Initialize Whisper model"""
@@ -1281,34 +1281,28 @@ class EpisodeService:
                     assert hasattr(w, "start") or ("start" in w), "Word objects must expose start/end/text"
             
             # Materialize words immediately after ASR (force materialization ONCE)
-            raw_words_iter = result["words"]
-            words_list = self._normalize_words(list(raw_words_iter))
+            raw_words = result.get("words") or []
+            words_list = self._normalize_words(list(raw_words))
             
             if not words_list:
                 logger.error("WORDS_EMPTY: episode=%s", episode_id)
                 raise EpisodeWordsEmpty(episode_id)
             
-            logger.info("WORDS_READY: count=%d (normalized/synthesized)", len(words_list))
+            logger.info("WORDS_READY: count=%d", len(words_list))
             
-            # Store quality metrics and words in episode metadata
-            if hasattr(self, 'current_episode') and self.current_episode:
-                self.current_episode.meta = self.current_episode.meta or {}
-                self.current_episode.meta["asr_quality"] = info
-                self.current_episode.words = words_list
-                self.current_episode.eos_from_words = True
-                
-                # >>> SAVE WORDS IMMEDIATELY AFTER ASR <<<
-                self._save_words_to_disk(self.current_episode.id, words_list)
-                self.current_episode._words_saved = True
-                
-                # Verify the save worked
-                saved = self._read_words_file(self.current_episode.id)
-                if not saved:
-                    logger.error("WORDS_VERIFY_FAIL: episode=%s path=%s", 
-                               self.current_episode.id, self._words_path(self.current_episode.id))
-                else:
-                    logger.info("WORDS_VERIFY_OK: episode=%s count=%d", 
-                              self.current_episode.id, len(saved))
+            # Persist words immediately after ASR and before any scoring
+            self._save_words_to_disk(episode_id, words_list)
+            
+            # Set progress to complete immediately after words are saved
+            tracker.update_stage("transcription", 100, "Transcription complete")
+            write_progress(episode_id, "transcribing", 95, "Transcription complete")
+            
+            # Load episode and attach words (use in-memory if present, otherwise load from disk)
+            episode = await self.get_episode(episode_id)
+            if episode:
+                episode.words = words_list
+                episode.eos_from_words = True
+                logger.info("WORDS_PERSISTED: episode=%s count=%d", episode_id, len(words_list))
             
             # Convert segments to our format
             segments_list = []
@@ -1325,9 +1319,6 @@ class EpisodeService:
                     words=words_for_seg
                 ))
             
-            # Update progress
-            tracker.update_stage("transcription", 100, "Transcription complete")
-            write_progress(episode_id, "transcribing", 95, "Transcription complete")
             logger.info(f"Single ASR path completed: {len(segments_list)} segments, {len(words)} words")
             
             return segments_list

@@ -28,7 +28,7 @@ export function startProgressPoll(episodeId: string, url: string, options: Polli
 
   // Create new poller with enhanced options
   const enhancedOptions: PollingOptions = {
-    interval: 1000,  // Start with 1s
+    interval: 2000,  // Start with 2s to reduce load
     maxBackoff: 10000,  // Max 10s backoff
     enableETag: true,
     ...options,

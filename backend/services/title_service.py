@@ -660,13 +660,7 @@ def dedup_titles(titles: List[Dict]) -> List[Dict]:
     return out
 
 # ---------- Platform limits & normalization ----------
-PLAT_LIMITS = {
-    "tiktok": 80,
-    "reels": 80,
-    "shorts": 80,
-    "youtube": 100,
-    "default": 90,
-}
+# Using PLAT_LIMITS from config.settings to avoid configuration drift
 
 def normalize_platform(p: Optional[str]) -> str:
     if not p:

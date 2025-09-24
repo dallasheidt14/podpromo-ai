@@ -167,8 +167,16 @@ def score_segment_v4(features: Dict, apply_penalties: bool = True, genre: str = 
     if apply_penalties and ad_penalty > 0:
         base_score -= ad_penalty
 
-    # Calculate final score (additive synergy + bonuses)
-    final_score = base_score + synergy_boost + bonuses_applied
+    # CAP: prevent double-counting of high-energy chatter
+    # Allow up to +25% uplift vs the strongest single component.
+    hook = f.get("hook_score", 0.0)
+    payoff = f.get("payoff_score", 0.0)
+    triad = hook + AROUS + payoff + synergy_boost
+    triad_cap = 1.25 * max(hook, AROUS, payoff)
+    triad_adj = min(triad, triad_cap)
+    
+    # Calculate final score with capped triad
+    final_score = base_score + (triad_adj - (hook + AROUS + payoff)) + bonuses_applied
 
     # Platform-fit boost for excellent length matches
     pl_v2 = f.get("platform_length_score_v2", f.get("platform_len_match", 0.0))

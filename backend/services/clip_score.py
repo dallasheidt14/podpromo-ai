@@ -105,10 +105,10 @@ def _episode_words(episode):
 def _episode_words_or_empty(ep):
     """Try common attachment points in order; adjust to your schema."""
     return (
-        getattr(ep, "normalized_words", None)
-        or getattr(ep, "words", None)
-        or ep.get("normalized_words") if isinstance(ep, dict) else None
-        or ep.get("words")            if isinstance(ep, dict) else None
+        getattr(ep, "words", None)  # Primary: words attached after ASR
+        or getattr(ep, "normalized_words", None)  # Fallback: legacy normalized_words
+        or ep.get("words") if isinstance(ep, dict) else None  # Dict access
+        or ep.get("normalized_words") if isinstance(ep, dict) else None  # Dict fallback
         or []
     )
 
@@ -3574,7 +3574,21 @@ class ClipScoreService:
             
             # --- boundary refinement pass (safe, best-effort) -----------------------------
             refined = []
-            episode_words = _episode_words_or_empty(episode)
+            
+            # Explicit words loading with fallback to disk
+            episode_words = getattr(episode, "words", None)
+            if not episode_words:
+                # Try to load from disk as fallback
+                try:
+                    from services.episode_service import EpisodeService
+                    episode_service = EpisodeService()
+                    episode_words = episode_service._load_words_from_disk(episode.id)
+                    if episode_words:
+                        logger.info("BOUNDARY_REFINEMENT: loaded %d words from disk for episode %s", len(episode_words), episode.id)
+                except Exception as e:
+                    logger.warning("BOUNDARY_REFINEMENT: failed to load words from disk: %s", e)
+                    episode_words = []
+            
             logger.info("BOUNDARY_REFINEMENT: using %d episode words", len(episode_words or []))
             
             for clip in ranked_clips:
@@ -3599,6 +3613,28 @@ class ClipScoreService:
                 except Exception as ex:
                     logger.exception("REFINE_BOUNDS_ERROR: %s", ex)
                     # keep original clip untouched
+            
+            # Step 3: Smart extension to natural sentence endings (if words available)
+            if episode_words:
+                from services.util import extend_to_natural_end
+                extended_count = 0
+                for clip in ranked_clips:
+                    old_end = clip.get("end", 0.0)
+                    clip = extend_to_natural_end(clip, episode_words, max_extend_sec=3.0)
+                    if clip.get("extended"):
+                        new_end = clip.get("end", 0.0)
+                        delta = clip.get("extension_delta", 0.0)
+                        logger.debug("BOUNDARY_REFINEMENT: extended end %.2f->%.2f (+%.2fs)", old_end, new_end, delta)
+                        extended_count += 1
+                        # Update derived fields
+                        clip["duration"] = round(max(0.0, new_end - clip.get("start", 0.0)), 2)
+                        clip["end_tc"] = _fmt_tc(new_end)
+                        clip["end_sec"] = new_end
+                        clip["display_range"] = f"{_fmt_ts(clip.get('start', 0.0))}–{_fmt_ts(new_end)}"
+                
+                if extended_count > 0:
+                    logger.info("BOUNDARY_REFINEMENT: extended %d/%d clips to natural endings", extended_count, len(ranked_clips))
+            
             logger.info("BOUNDARY_REFINEMENT: refined=%d/%d", len(refined), len(ranked_clips))
             
             # Apply trail padding and nudge to punctuation
