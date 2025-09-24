@@ -9,6 +9,7 @@ import json
 import time
 from typing import List, Optional, Dict
 from datetime import datetime
+from pathlib import Path
 from cachetools import TTLCache
 import psutil
 try:
@@ -30,6 +31,24 @@ from services.audio_io import ensure_pcm_wav
 from services.util import normalize_asr_result
 
 logger = logging.getLogger(__name__)
+
+# Canonical words filename - use everywhere for consistency
+WORDS_FILE = "words.json"
+
+
+class EpisodeWordsEmpty(Exception):
+    """Raised when ASR produces no words for an episode"""
+    def __init__(self, episode_id: str):
+        self.episode_id = episode_id
+        super().__init__(f"Episode {episode_id} has no words after ASR normalization")
+
+
+def atomic_write_json(path: Path, obj: dict) -> None:
+    """Atomically write JSON to file using temp file + rename"""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.parent.mkdir(parents=True, exist_ok=True)
+    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2))
+    os.replace(tmp, path)
 
 
 class EnhancedProgressTracker:
@@ -185,8 +204,7 @@ class EpisodeService:
             self.episodes[episode.id] = episode
             logger.info(f"Episode {episode.id} kept in memory")
             
-            # Persist words to disk for transcript building
-            self._save_words_to_disk(episode)
+            # Words are saved immediately after ASR - no need to save here
             
             # Try to save to file (optional)
             try:
@@ -207,27 +225,78 @@ class EpisodeService:
         except Exception as e:
             logger.error(f"Failed to save episode {episode.id}: {e}")
     
-    def _save_words_to_disk(self, episode: Episode):
-        """Save words data to disk for transcript building"""
+    def _words_path(self, episode_id: str) -> Path:
+        """Get the canonical path for words file"""
+        return Path(self.storage_dir) / episode_id / "words.json"
+
+    def _read_words_file(self, episode_id: str):
+        """Read words from file, return None if not found or empty"""
+        path = self._words_path(episode_id)
+        if not path.exists() or path.stat().st_size == 0:
+            return None
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def _normalize_words(self, raw_words):
+        """Normalize words into a plain list of dicts for serialization"""
+        out = []
+        for w in raw_words or []:
+            # Handle both AttrDict and regular dict objects
+            if hasattr(w, 'start'):
+                # AttrDict or object with attributes
+                out.append({
+                    "start": float(getattr(w, "start", 0.0)),
+                    "end": float(getattr(w, "end", 0.0)),
+                    "word": str(getattr(w, "word", getattr(w, "text", ""))),
+                    "prob": float(getattr(w, "prob", getattr(w, "probability", 1.0))),
+                })
+            elif isinstance(w, dict):
+                # Regular dict
+                out.append({
+                    "start": float(w.get("start", 0.0)),
+                    "end": float(w.get("end", 0.0)),
+                    "word": str(w.get("word", w.get("text", ""))),
+                    "prob": float(w.get("prob", w.get("probability", 1.0))),
+                })
+        return out
+
+    def _save_words_to_disk(self, episode_id: str, words: List[dict]) -> None:
+        """Save words data to disk for transcript building (idempotent)"""
+        if not words:
+            logger.warning("WORDS_SAVE_SKIP: empty words for episode=%s", episode_id)
+            return
+
+        # Idempotency check
+        existing = self._read_words_file(episode_id)
+        if isinstance(existing, list) and existing:
+            same_len = (len(existing) == len(words))
+            if same_len:
+                try:
+                    ex_first, ex_last = existing[0], existing[-1]
+                    nw_first, nw_last = words[0], words[-1]
+                    if (ex_first["start"], ex_last["end"]) == (nw_first["start"], nw_last["end"]):
+                        logger.info("WORDS_SAVE_SKIP: already up-to-date (n=%d)", len(words))
+                        return
+                except Exception:
+                    pass  # fall through to replace
+
+        path = self._words_path(episode_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Atomic write
+        import tempfile
+        tmp_fd, tmp_name = tempfile.mkstemp(prefix="words_", suffix=".json", dir=str(path.parent))
         try:
-            # Belt & suspenders: prevent None from ever reaching len()
-            words = getattr(episode, 'words', []) or []
-            words_normalized = getattr(episode, 'words_normalized', []) or []
-            
-            words_data = {
-                "words": words,
-                "words_normalized": words_normalized,
-                "episode_id": episode.id,
-                "saved_at": datetime.utcnow().isoformat()
-            }
-            
-            words_file = os.path.join(self.storage_dir, f"{episode.id}_words.json")
-            with open(words_file, 'w', encoding='utf-8') as f:
-                json.dump(words_data, f, ensure_ascii=False, indent=2)
-            
-            logger.debug(f"Saved {len(words_data['words'])} words to {words_file}")
-        except Exception as e:
-            logger.warning(f"Failed to save words for episode {episode.id}: {e}")
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                json.dump(words, f, ensure_ascii=False)
+            os.replace(tmp_name, str(path))
+            logger.info("WORDS_SAVE_PATH: %s (n=%d)", path, len(words))
+        finally:
+            try:
+                if os.path.exists(tmp_name):
+                    os.remove(tmp_name)
+            except Exception:
+                pass
     
     def _init_whisper(self):
         """Initialize Whisper model"""
@@ -527,50 +596,109 @@ class EpisodeService:
             self._mark_error(episode_id, f"Upload failed: {str(e)}")
             raise
     
-    async def get_episode(self, episode_id: str) -> Optional[Episode]:
-        """Get episode by ID"""
-        self._ensure_episodes_loaded()
-        if episode_id in self.episodes:
-            self._hits += 1
-            return self.episodes[episode_id]
-        self._misses += 1
-        return None
+    async def get_episode(self, episode_id: str, with_words: bool = False) -> Optional[Episode]:
+        """Get episode by ID with optional words loading (async wrapper)"""
+        return await asyncio.get_event_loop().run_in_executor(
+            None, self.get_or_load_episode, episode_id, with_words
+        )
     
+    def load_words(self, episode_id: str) -> Optional[List[dict]]:
+        """Load words from storage using canonical path"""
+        words_path = Path(self.storage_dir) / episode_id / WORDS_FILE
+        if not words_path.exists():
+            logger.warning("WORDS_LOAD_MISS: %s", words_path)
+            return None
+            
+        logger.info("WORDS_LOAD_PATH: %s", words_path)
+        try:
+            with open(words_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            # Handle both old format (wrapper) and new format (list)
+            if isinstance(data, list):
+                words_list = data
+            elif isinstance(data, dict) and "words" in data:
+                words_list = data["words"]
+            else:
+                logger.warning("WORDS_LOAD_EMPTY: %s (invalid format)", words_path)
+                return None
+                
+            if not isinstance(words_list, list) or len(words_list) == 0:
+                logger.warning("WORDS_LOAD_EMPTY: %s (len=%d)", words_path, len(words_list) if isinstance(words_list, list) else 0)
+                return None
+                
+            return words_list
+        except Exception as e:
+            logger.warning("WORDS_LOAD_ERROR: %s - %s", words_path, e)
+            return None
+
+    def verify_words_io(self, episode_id: str) -> None:
+        """Verify words file exists and log details for debugging"""
+        words_path = Path(self.storage_dir) / episode_id / WORDS_FILE
+        exists = words_path.exists()
+        size = words_path.stat().st_size if exists else -1
+        logger.info("WORDS_VERIFY: exists=%s size=%s path=%s", exists, size, words_path)
+
+    def _load_words_from_disk(self, episode_id: str) -> Optional[List[dict]]:
+        """Load words from disk (fallback for scorer)"""
+        data = self._read_words_file(episode_id)
+        if data is None:
+            logger.warning("WORDS_LOAD_MISS: %s", self._words_path(episode_id))
+            return None
+            
+        if not isinstance(data, list) or len(data) == 0:
+            logger.warning("WORDS_LOAD_EMPTY: %s (len=%d)", self._words_path(episode_id), len(data) if isinstance(data, list) else 0)
+            return None
+            
+        logger.info("WORDS_LOAD_OK: %s (n=%d)", self._words_path(episode_id), len(data))
+        return data
+
     def get_or_load_episode(self, episode_id: str, with_words: bool = False) -> Optional[Episode]:
         """Get episode from cache or load from storage with optional words data"""
         # Try cache first
-        episode = self.get_episode(episode_id)
-        if episode and (not with_words or hasattr(episode, 'words')):
-            return episode
+        self._ensure_episodes_loaded()
+        episode = None
+        if episode_id in self.episodes:
+            episode = self.episodes[episode_id]
+            self._hits += 1
+        else:
+            self._misses += 1
         
         # Load from storage if not in cache
-        try:
-            episode_file = os.path.join(self.storage_dir, f"{episode_id}.json")
-            if os.path.exists(episode_file):
-                with open(episode_file, 'r', encoding='utf-8') as f:
-                    episode_data = json.load(f)
-                
-                # Convert back to Episode object
-                episode = Episode(**episode_data)
-                self.episodes[episode_id] = episode
-                
-                # Load words if requested
-                if with_words:
-                    words_file = os.path.join(self.storage_dir, f"{episode_id}_words.json")
-                    if os.path.exists(words_file):
-                        with open(words_file, 'r', encoding='utf-8') as f:
-                            words_data = json.load(f)
-                        episode.words = words_data.get('words', [])
-                        episode.words_normalized = words_data.get('words_normalized', [])
-                        logger.debug(f"Loaded {len(episode.words)} words for episode {episode_id}")
-                    else:
-                        logger.warning(f"No words file found for episode {episode_id}")
-                
-                return episode
-        except Exception as e:
-            logger.error(f"Failed to load episode {episode_id}: {e}")
+        if episode is None:
+            try:
+                episode_file = os.path.join(self.storage_dir, f"{episode_id}.json")
+                if os.path.exists(episode_file):
+                    with open(episode_file, 'r', encoding='utf-8') as f:
+                        episode_data = json.load(f)
+                    
+                    # Defensive defaults for newly added keys
+                    episode_data.setdefault("words_normalized", None)
+                    episode_data.setdefault("eos_from_words", None)
+                    
+                    # Convert back to Episode object
+                    episode = Episode(**episode_data)
+                    self.episodes[episode_id] = episode
+                else:
+                    logger.error(f"Episode file not found: {episode_file}")
+                    return None
+            except Exception as e:
+                logger.error(f"Failed to load episode {episode_id}: {e}")
+                return None
         
-        return None
+        # Load words if requested (for both cached and newly loaded episodes)
+        if with_words and (not getattr(episode, "words", None)):
+            words_list = self.load_words(episode_id)
+            if words_list:
+                from services.util import to_attrdict_list
+                episode.words = to_attrdict_list(words_list)
+                episode.eos_from_words = True
+                logger.info("EP_LOAD: words attached (episode=%s, count=%d)", episode_id, len(episode.words))
+            else:
+                logger.warning("EP_LOAD: words not found on disk (episode=%s)", episode_id)
+                episode.words = []
+        
+        return episode
     
     async def get_all_episodes(self) -> List[Episode]:
         """Get all episodes"""
@@ -1032,9 +1160,13 @@ class EpisodeService:
             # Update progress during processing
             self._update_progress(episode_id, "processing", 75.0, "Processing transcription results...")
             
+            # Normalize ASR result shape at boundary
+            from services.util import normalize_asr_result
+            segments, info, words = normalize_asr_result(result)
+            
             # Convert to our format
             transcript = []
-            for i, segment in enumerate(result['segments']):
+            for i, segment in enumerate(segments):
                 words = []
                 if 'words' in segment:
                     for word_info in segment['words']:
@@ -1080,11 +1212,9 @@ class EpisodeService:
                 
                 # Convert to our format
                 transcript = []
-                # Handle both tuple and dict return formats
-                if isinstance(result, tuple):
-                    segments, info = result
-                else:
-                    segments = result.get('segments', [])
+                # Normalize ASR result shape at boundary
+                from services.util import normalize_asr_result
+                segments, info, words = normalize_asr_result(result)
                 
                 for i, segment in enumerate(segments):
                     # No transcript logging - just progress updates
@@ -1129,31 +1259,56 @@ class EpisodeService:
             
             # --- Transcribe (retry here only) ---
             try:
-                segments, info, words = transcribe_with_quality(asr_input, settings)
-                logger.info(f"ASR_DONE: segments={len(segments)} words={'present' if words else 'none'}")
+                result = transcribe_with_quality(asr_input, settings)
+                logger.info(f"ASR_DONE: segments={len(result['segments'])} words={'present' if result['words'] else 'none'}")
             except Exception as e:
-                logger.error("TRANSCRIBE_FAIL (%s), falling back to CPU: %s", settings.device, e)
-                cpu_settings = settings.with_cpu_fallback()
-                segments, info, words = transcribe_with_quality(asr_input, cpu_settings)
-                logger.info(f"ASR_DONE: segments={len(segments)} words={'present' if words else 'none'}")
+                logger.error("ASR primary failed; will retry on CPU", exc_info=True)
+                from services.asr import _settings_to_cpu
+                cpu_settings = _settings_to_cpu(settings)
+                result = transcribe_with_quality(asr_input, cpu_settings)
+                logger.info(f"ASR_DONE: segments={len(result['segments'])} words={'present' if result['words'] else 'none'}")
             
             # --- Post-processing (never re-enters GPU) ---
-            # Words are already extracted by transcribe_with_quality, but ensure they're safe
-            safe_words = words or []  # belt & suspenders
-            logger.info(f"WORDS_READY: count={len(safe_words)} (normalized/synthesized)")
+            # Extract normalized results
+            segments = result["segments"]
+            info = result["info"] 
+            words = result["words"]
             
-            # No other ASR paths beyond this point
-            # Persist words safely (never None)
-            logger.info(f"SAVE_WORDS start")
-            logger.info(f"WORDS_SAVE: n={len(safe_words)} eos_from_words={'yes' if safe_words else 'no'}")
+            # Guard against malformed ASR results
+            assert isinstance(words, (list, tuple)), "ASR words must be a list"
+            if words:
+                for w in words[:1]:  # Check first word only
+                    assert hasattr(w, "start") or ("start" in w), "Word objects must expose start/end/text"
             
-            # Store quality metrics in episode metadata
+            # Materialize words immediately after ASR (force materialization ONCE)
+            raw_words_iter = result["words"]
+            words_list = self._normalize_words(list(raw_words_iter))
+            
+            if not words_list:
+                logger.error("WORDS_EMPTY: episode=%s", episode_id)
+                raise EpisodeWordsEmpty(episode_id)
+            
+            logger.info("WORDS_READY: count=%d (normalized/synthesized)", len(words_list))
+            
+            # Store quality metrics and words in episode metadata
             if hasattr(self, 'current_episode') and self.current_episode:
                 self.current_episode.meta = self.current_episode.meta or {}
                 self.current_episode.meta["asr_quality"] = info
-                self.current_episode.words = safe_words
-            
-            logger.info(f"SAVE_WORDS done")
+                self.current_episode.words = words_list
+                self.current_episode.eos_from_words = True
+                
+                # >>> SAVE WORDS IMMEDIATELY AFTER ASR <<<
+                self._save_words_to_disk(self.current_episode.id, words_list)
+                self.current_episode._words_saved = True
+                
+                # Verify the save worked
+                saved = self._read_words_file(self.current_episode.id)
+                if not saved:
+                    logger.error("WORDS_VERIFY_FAIL: episode=%s path=%s", 
+                               self.current_episode.id, self._words_path(self.current_episode.id))
+                else:
+                    logger.info("WORDS_VERIFY_OK: episode=%s count=%d", 
+                              self.current_episode.id, len(saved))
             
             # Convert segments to our format
             segments_list = []
@@ -1173,7 +1328,7 @@ class EpisodeService:
             # Update progress
             tracker.update_stage("transcription", 100, "Transcription complete")
             write_progress(episode_id, "transcribing", 95, "Transcription complete")
-            logger.info(f"Single ASR path completed: {len(segments_list)} segments, {len(safe_words)} words")
+            logger.info(f"Single ASR path completed: {len(segments_list)} segments, {len(words)} words")
             
             return segments_list
             
@@ -1235,11 +1390,9 @@ class EpisodeService:
             
             # Convert to our format with progress updates
             transcript = []
-            # Handle both tuple and dict return formats
-            if isinstance(result, tuple):
-                segments, info = result
-            else:
-                segments = result.get("segments", [])
+            # Normalize ASR result shape at boundary
+            from services.util import normalize_asr_result
+            segments, info, words = normalize_asr_result(result)
             
             # Convert generator to list if needed
             if hasattr(segments, '__iter__') and not isinstance(segments, (list, tuple)):
@@ -1303,52 +1456,72 @@ class EpisodeService:
                     audio_for_asr = audio_path
                     logger.info(f"Using original audio for ASR: {audio_for_asr}")
                 
-                # Run ASR v2 in thread pool
+                # Run ASR v2 in thread pool with proper error handling
                 import asyncio
                 loop = asyncio.get_event_loop()
-                segments, info, quality_metrics = await loop.run_in_executor(
-                    None,
-                    lambda: transcribe_with_quality(audio_for_asr, language="en")
-                )
-                
-                # Store quality metrics in episode metadata
-                if hasattr(self, 'current_episode') and self.current_episode:
-                    self.current_episode.meta = self.current_episode.meta or {}
-                    self.current_episode.meta["asr_quality"] = quality_metrics
-                
-                # Update progress if retry was used
-                if quality_metrics.get("retried"):
-                    tracker.update_stage("transcription", 90, "High-quality retry completed...")
-                    write_progress(episode_id, ASR_PROGRESS_LABEL_HQ, 90)
-                
-                # Convert segments to our format
-                for seg in segments:
-                    words = []
-                    if hasattr(seg, 'words') and seg.words:
-                        words = [{"text": w.word, "start": w.start, "end": w.end, "prob": getattr(w, 'probability', 0.0)} for w in seg.words]
-                    
-                    segments_list.append(TranscriptSegment(
-                        start=seg.start,
-                        end=seg.end,
-                        text=seg.text.strip(),
-                        raw_text=seg.text.strip(),
-                        words=words
-                    ))
-                
-                # Store normalized words for boundary refinement - SAFE EXTRACTION
-                if hasattr(self, 'current_episode') and self.current_episode:
+                try:
+                    asr_result = await loop.run_in_executor(
+                        None,
+                        lambda: transcribe_with_quality(audio_for_asr, ASRSettings())
+                    )
+                    # Extract components from the new dict format
+                    segments = asr_result["segments"]
+                    quality_metrics = asr_result["info"]
+                    words = asr_result["words"]
+                except Exception as e:
+                    logger.error(f"ASR primary failed; will retry on CPU: {e}")
+                    # Only retry for true ASR failures, not post-processing errors
                     try:
-                        # Use words from ASR response if available, otherwise extract from segments
-                        words = quality_metrics.get("words")
-                        if words is None:
-                            words = _extract_words_safe(segments)
-                        # ensure never None before len() or serialization
+                        from services.asr import ASRSettings
+                        cpu_settings = ASRSettings()
+                        cpu_settings = cpu_settings.with_cpu_fallback()
+                        asr_result = await loop.run_in_executor(
+                            None,
+                            lambda: transcribe_with_quality(audio_for_asr, cpu_settings)
+                        )
+                        segments = asr_result["segments"]
+                        quality_metrics = asr_result["info"]
+                        words = asr_result["words"]
+                        logger.info("ASR CPU fallback succeeded")
+                    except Exception as cpu_e:
+                        logger.error(f"ASR CPU fallback also failed: {cpu_e}")
+                        raise e  # Re-raise original error
+                
+                # Post-ASR processing - wrap in try-catch to prevent fallback on non-ASR errors
+                try:
+                    # Store quality metrics in episode metadata
+                    if hasattr(self, 'current_episode') and self.current_episode:
+                        self.current_episode.meta = self.current_episode.meta or {}
+                        self.current_episode.meta["asr_quality"] = quality_metrics
+                    
+                    # Update progress if retry was used
+                    if quality_metrics.get("retried"):
+                        tracker.update_stage("transcription", 90, "High-quality retry completed...")
+                        write_progress(episode_id, ASR_PROGRESS_LABEL_HQ, 90)
+                    
+                    # Convert segments to our format
+                    for seg in segments:
+                        words = []
+                        if hasattr(seg, 'words') and seg.words:
+                            words = [{"text": w.word, "start": w.start, "end": w.end, "prob": getattr(w, 'prob', 0.0)} for w in seg.words]
+                        
+                        segments_list.append(TranscriptSegment(
+                            start=seg.start,
+                            end=seg.end,
+                            text=seg.text.strip(),
+                            raw_text=seg.text.strip(),
+                            words=words
+                        ))
+                    
+                    # Store normalized words for boundary refinement - SAFE EXTRACTION
+                    if hasattr(self, 'current_episode') and self.current_episode:
+                        # Use words from ASR response (now in the words field)
                         words = words or []
                         self.current_episode.words = words
                         logger.info("WORDS_SAVE: count=%d for episode %s", len(words), episode_id)
-                    except Exception as e:
-                        logger.exception("Failed to save words for episode %s: %s", episode_id, e)
-                        self.current_episode.words = []
+                except Exception as e:
+                    logger.exception("POST_ASR_WARN: continuing with ASR result despite error: %s", e)
+                    # Continue with the ASR result we already have
                 
             # ASR v2 is the only path now - no legacy fallback needed
             

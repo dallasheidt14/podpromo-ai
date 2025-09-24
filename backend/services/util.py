@@ -4,8 +4,119 @@ Utility functions for cross-cutting concerns and data normalization.
 
 from typing import Dict, List, Any, Tuple, Union
 import logging
+from types import SimpleNamespace
 
 logger = logging.getLogger(__name__)
+
+
+class AttrDict(dict):
+    """
+    Dict that also supports attribute access: d.key == d['key'].
+    Safe for legacy code paths that expect seg.start / seg.text / word.prob
+    while preserving normal dict semantics for callers that use ['key'].
+    """
+    __slots__ = ()
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return self[name]
+        except KeyError as e:
+            raise AttributeError(name) from e
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        # keep behavior consistent with dict: set as key
+        self[name] = value
+
+
+def coerce_word_schema(w) -> dict:
+    """Coerce word objects to canonical schema with word/start/end/prob fields."""
+    # Helper to get attribute or dict key with fallbacks
+    def g(attr, *alts):
+        if hasattr(w, attr):
+            return getattr(w, attr)
+        if isinstance(w, dict):
+            for key in [attr] + list(alts):
+                if key in w:
+                    return w[key]
+        return None
+
+    txt = g("word") or g("text") or g("token") or ""
+    start = g("start") or 0.0
+    end = g("end") or 0.0
+    prob = g("prob") or g("probability") or 1.0
+
+    # normalize types
+    try:
+        start = float(start)
+    except (ValueError, TypeError):
+        start = 0.0
+    try:
+        end = float(end)
+    except (ValueError, TypeError):
+        end = start
+    try:
+        prob = float(prob)
+    except (ValueError, TypeError):
+        prob = 1.0
+
+    return {"word": str(txt), "start": start, "end": end, "prob": prob}
+
+
+def to_attrdict_list(items: List[Dict[str, Any]]) -> List[AttrDict]:
+    """Convert list of dicts to AttrDict objects for attribute access compatibility."""
+    out: List[AttrDict] = []
+    for s in items:
+        if isinstance(s, AttrDict):
+            out.append(s)
+            continue
+        if not isinstance(s, dict):
+            # leave non-dicts untouched (already an object from some path)
+            out.append(s)  # type: ignore
+            continue
+        sd = AttrDict(s)
+        # normalize nested words if present
+        wlist = sd.get("words")
+        if isinstance(wlist, list):
+            sd["words"] = [AttrDict(w) if isinstance(w, dict) else w for w in wlist]
+        out.append(sd)
+    return out
+
+
+def _coerce_word(w: Any) -> Dict[str, Any]:
+    """Accept FW Word object or dict variants and return {start,end,text}."""
+    if isinstance(w, dict):
+        start = w.get("start", w.get("t", 0.0)) or 0.0
+        end = w.get("end", w.get("d", start)) or start
+        text = w.get("text", w.get("word", w.get("w", ""))) or ""
+        return {"start": float(start), "end": float(end), "text": str(text)}
+    start = getattr(w, "start", getattr(w, "t", 0.0)) or 0.0
+    end = getattr(w, "end", getattr(w, "d", start)) or start
+    text = getattr(w, "word", getattr(w, "text", "")) or ""
+    return {"start": float(start), "end": float(end), "text": str(text)}
+
+
+def _coerce_segment(seg: Any) -> Dict[str, Any]:
+    """Accept FW Segment object or dict and return normalized dict with words list coerced."""
+    if isinstance(seg, dict):
+        start = seg.get("start", 0.0) or 0.0
+        end = seg.get("end", start) or start
+        text = seg.get("text", "") or ""
+        words = seg.get("words", None)
+    else:
+        start = getattr(seg, "start", 0.0) or 0.0
+        end = getattr(seg, "end", start) or start
+        text = getattr(seg, "text", "") or ""
+        words = getattr(seg, "words", None)
+
+    words_list: List[Dict[str, Any]] = []
+    if words is not None:
+        try:
+            words_list = [_coerce_word(w) for w in words]
+        except TypeError:
+            # Single word object
+            words_list = [_coerce_word(words)]
+
+    return {"start": float(start), "end": float(end), "text": str(text), "words": words_list}
 
 
 def normalize_asr_result(res: Union[Tuple, Dict, List]) -> Tuple[List, Dict, List]:
@@ -16,24 +127,50 @@ def normalize_asr_result(res: Union[Tuple, Dict, List]) -> Tuple[List, Dict, Lis
     - (segments, info, words) tuple
     - (segments, info) tuple  
     - dict with "segments", "info", "words" keys
+    - Single Segment object (wraps to list)
     """
-    if isinstance(res, dict):
-        segments = res.get("segments", [])
-        info = res.get("info") or {}
-        words = res.get("words") or []
-        return segments, info, words
+    segs, info, words = [], {}, []
     
-    if isinstance(res, (list, tuple)):
-        if len(res) == 3:
-            segments, info, words = res
-        elif len(res) == 2:
-            segments, info = res
-            words = []
-        else:
-            raise TypeError(f"Unexpected ASR tuple length: {len(res)}")
-        return segments or [], (info or {}), (words or [])
+    if isinstance(res, tuple):
+        # (segments, info) or (segments, info, words)
+        parts = list(res)
+        if len(parts) >= 1: 
+            segs = parts[0]
+        if len(parts) >= 2: 
+            info = parts[1] or {}
+        if len(parts) >= 3: 
+            words = parts[2] or []
+    elif isinstance(res, dict):
+        segs = res.get("segments", [])
+        info = res.get("info", {}) or {}
+        words = res.get("words", []) or []
+    else:
+        segs = res
     
-    raise TypeError(f"Unexpected ASR result type: {type(res)}")
+    # If a single Segment object sneaks in, wrap it
+    if hasattr(segs, "start") and hasattr(segs, "end"):
+        segs = [segs]
+    
+    # Convert Segment/Word objects to plain dicts and aggregate words
+    out: List[Dict[str, Any]] = []
+    for s in segs or []:
+        out.append(_coerce_segment(s))
+
+    # Prefer provided words (normalize), else aggregate from segments
+    words_out: List[Dict[str, Any]] = []
+    if words:
+        # Normalize incoming word schema to {start,end,text}
+        words_out = _normalize_schema(words)
+    if not words_out:
+        for seg in out:
+            seg_words = seg.get("words") or []
+            for w in seg_words:
+                if isinstance(w, dict):
+                    words_out.append(_coerce_word(w))
+                else:
+                    words_out.append(_coerce_word(w))
+
+    return out, info, words_out
 
 
 def _normalize_schema(words: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

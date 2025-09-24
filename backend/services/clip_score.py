@@ -1994,9 +1994,22 @@ class ClipScoreService:
                     logger.debug("prosody.v2_skipped", extra={"segment_id": seg.get("id"), "err": str(e)})
                 
                 try:
-                    from services.trending_provider import trend_match_score, detect_categories
+                    from services.trending_provider import trend_match_score, detect_categories, collect_hashtags
                     raw_text = seg.get("text", "")
-                    hashtags = feats.get("hashtags", [])
+                    
+                    # Merge hashtags from text + episode meta (if any)
+                    try:
+                        # Get episode metadata from the episode object if available
+                        episode_meta = None
+                        if hasattr(self, 'current_episode') and self.current_episode and hasattr(self.current_episode, 'meta'):
+                            episode_meta = self.current_episode.meta
+                        
+                        hashtags = collect_hashtags(raw_text, episode_meta)
+                        if hashtags:
+                            feats["hashtags"] = hashtags
+                    except Exception:
+                        hashtags = feats.get("hashtags", [])
+                    
                     cats = detect_categories(raw_text)
                     
                     # Optional: use episode ID for AB bucket stability
@@ -2062,9 +2075,22 @@ class ClipScoreService:
                         logger.debug("prosody.v2_skipped", extra={"segment_id": seg.get("id"), "err": str(e)})
                     
                     try:
-                        from services.trending_provider import trend_match_score, detect_categories
+                        from services.trending_provider import trend_match_score, detect_categories, collect_hashtags
                         raw_text = seg.get("text", "")
-                        hashtags = feats.get("hashtags", [])
+                        
+                        # Merge hashtags from text + episode meta (if any)
+                        try:
+                            # Get episode metadata from the episode object if available
+                            episode_meta = None
+                            if hasattr(self, 'current_episode') and self.current_episode and hasattr(self.current_episode, 'meta'):
+                                episode_meta = self.current_episode.meta
+                            
+                            hashtags = collect_hashtags(raw_text, episode_meta)
+                            if hashtags:
+                                feats["hashtags"] = hashtags
+                        except Exception:
+                            hashtags = feats.get("hashtags", [])
+                        
                         cats = detect_categories(raw_text)
                         
                         # Optional: use episode ID for AB bucket stability
@@ -3014,11 +3040,23 @@ class ClipScoreService:
             )
             from services.platform_recommender import add_platform_recommendations_to_clips
 
-            # Get episode
-            episode = await self.episode_service.get_episode(episode_id)
+            # Get episode with words loaded (async version)
+            episode = await self.episode_service.get_episode(episode_id, with_words=True)
             if not episode or not episode.transcript:
                 logger.error(f"Episode {episode_id} not found or has no transcript")
                 return [], {"reason": "episode_not_found", "episode_id": episode_id}
+            
+            # Fallback word loading if not present
+            if not getattr(episode, "words", None):
+                loaded = self.episode_service._load_words_from_disk(episode_id)
+                if loaded:
+                    episode.words = loaded
+                    episode.eos_from_words = True
+                    logger.info("CLIP_INPUT: words=present count=%d (from disk)", len(loaded))
+                else:
+                    logger.warning("CLIP_INPUT: words missing (episode_id=%s)", episode_id)
+            else:
+                logger.info("CLIP_INPUT: words=present count=%d (from memory)", len(episode.words))
             
             # Set current episode for boundary snapper
             self._current_episode = episode
