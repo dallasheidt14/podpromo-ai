@@ -3637,6 +3637,43 @@ class ClipScoreService:
             
             logger.info("BOUNDARY_REFINEMENT: refined=%d/%d", len(refined), len(ranked_clips))
             
+            # EOS confidence scoring and smart extension (post-boundary refinement)
+            from services.util import calculate_finish_confidence, finish_threshold_for, extend_to_natural_end
+            
+            for clip in ranked_clips:
+                try:
+                    # Calculate EOS confidence for the clip end
+                    if episode_words:
+                        end_confidence = calculate_finish_confidence(
+                            clip.get("text", ""), 
+                            episode_words, 
+                            clip.get("end", 0.0)
+                        )
+                        clip["eos_confidence"] = end_confidence
+                        
+                        # Smart extension to natural end if confidence is low
+                        threshold = finish_threshold_for(final_genre, platform)
+                        if end_confidence < threshold:
+                            extended_end = extend_to_natural_end(
+                                clip.get("end", 0.0),
+                                episode_words,
+                                max_extension=2.0  # Allow up to 2 seconds extension
+                            )
+                            if extended_end > clip.get("end", 0.0):
+                                old_end = clip.get("end", 0.0)
+                                clip["end"] = extended_end
+                                clip["extension_delta"] = extended_end - old_end
+                                clip["smart_extended"] = True
+                                logger.debug("SMART_EXTENSION: extended clip %s from %.2f to %.2f (+%.2fs)", 
+                                           clip.get("id", "unknown"), old_end, extended_end, extended_end - old_end)
+                    else:
+                        clip["eos_confidence"] = 0.5  # Default confidence when no words available
+                        clip["smart_extended"] = False
+                except Exception as e:
+                    logger.warning("EOS_CONFIDENCE: failed to calculate for clip %s: %s", clip.get("id", "unknown"), e)
+                    clip["eos_confidence"] = 0.5
+                    clip["smart_extended"] = False
+            
             # Apply trail padding and nudge to punctuation
             from config.settings import HEAD_PAD_SEC, TRAIL_PAD_SEC, REFINE_SNAP_MAX_NUDGE, REFINE_MIN_TAIL_SILENCE
             episode_words = _episode_words(episode)
@@ -3672,16 +3709,27 @@ class ClipScoreService:
                 if clip["duration"] < CLIP_LEN_MIN or clip["duration"] > CLIP_LEN_MAX:
                     continue  # Skip clips outside bounds
                 clip["pl_v2"] = clip.get("platform_length_score_v2", 0.0)
-                # Use better finished_thought detection
-                from services.secret_sauce_pkg.features import likely_finished_text
-                clip["finished_thought"] = likely_finished_text(clip.get("text", ""))
                 
-                # Ensure ft_status is set (fallback to finished_thought if not set)
-                if "ft_status" not in clip:
-                    if clip.get("finished_thought", 0) == 1:
-                        clip["ft_status"] = "finished"
-                    else:
-                        clip["ft_status"] = "unresolved"
+                # Recompute finished_thought detection after all refinements
+                from services.secret_sauce_pkg.features import likely_finished_text
+                from services.util import calculate_finish_confidence, finish_threshold_for
+                
+                # Use both text-based and EOS confidence-based detection
+                text_finished = likely_finished_text(clip.get("text", ""))
+                eos_confidence = clip.get("eos_confidence", 0.5)
+                threshold = finish_threshold_for(final_genre, platform)
+                eos_finished = 1 if eos_confidence >= threshold else 0
+                
+                # Combine both signals (either can indicate finished)
+                clip["finished_thought"] = max(text_finished, eos_finished)
+                clip["text_finished"] = text_finished
+                clip["eos_finished"] = eos_finished
+                
+                # Set ft_status based on the combined result
+                if clip.get("finished_thought", 0) == 1:
+                    clip["ft_status"] = "finished"
+                else:
+                    clip["ft_status"] = "unresolved"
                 
                 final_clips.append(clip)
             
@@ -3691,38 +3739,31 @@ class ClipScoreService:
             # Calculate longest clip duration
             longest_dur = max((c.get("end", 0) - c.get("start", 0)) for c in final_clips) if final_clips else 0.0
             
-            # Use the authoritative FT summary returned from the enhanced pipeline when available
-            if viral_result and "ft" in viral_result:
-                ft_data = viral_result["ft"]
-                logger.info("FT_SUMMARY: finished=%d sparse=%d total=%d ratio_strict=%.2f ratio_sparse_ok=%.2f longest=%.1fs",
-                            ft_data["finished"], ft_data["sparse_finished"], ft_data["total"],
-                            ft_data["ratio_strict"], ft_data["ratio_sparse_ok"], longest_dur)
-            else:
-                # Fallback to local calculation if no FT data available
-                finished_count = sum(1 for c in ranked_clips if c.get('ft_status') == 'finished')
-                sparse_count = sum(1 for c in ranked_clips if c.get('ft_status') == 'sparse_finished')
-                total = len(ranked_clips)
-                ratio_strict = finished_count / max(total, 1)
-                ratio_sparse_ok = (finished_count + sparse_count) / max(total, 1) if episode_fallback_mode else ratio_strict
-                
-                logger.info("FT_SUMMARY: finished=%d sparse=%d total=%d ratio_strict=%.2f ratio_sparse_ok=%.2f longest=%.1fs",
-                            finished_count, sparse_count, total, ratio_strict, ratio_sparse_ok, longest_dur)
+            # Compute FT summary from final_clips (post-refinement, post-extension)
+            finished_count = sum(1 for c in final_clips if c.get('ft_status') == 'finished')
+            sparse_count = sum(1 for c in final_clips if c.get('ft_status') == 'sparse_finished')
+            total = len(final_clips)
+            ratio_strict = finished_count / max(total, 1)
+            ratio_sparse_ok = (finished_count + sparse_count) / max(total, 1) if episode_fallback_mode else ratio_strict
+            
+            logger.info("FT_SUMMARY: finished=%d sparse=%d total=%d ratio_strict=%.2f ratio_sparse_ok=%.2f longest=%.1fs",
+                        finished_count, sparse_count, total, ratio_strict, ratio_sparse_ok, longest_dur)
             
             # Telemetry that can't disagree with itself
             wc, ec, dens = len(word_end_times), len(eos_times), len(eos_times)/max(len(word_end_times), 1)
             logger.info(f"TELEMETRY: word_count={wc}, eos_count={ec}, eos_density={dens:.3f}")
             logger.info(f"TELEMETRY: fallback_mode={episode_fallback_mode} (authoritative)")
             
-            # Candidate-level FT summary (post-gates)
-            cand_total = len(ranked_clips)
-            cand_finished = sum(1 for c in ranked_clips if c.get("ft_status") == "finished")
-            cand_sparse = sum(1 for c in ranked_clips if c.get("ft_status") == "sparse_finished")
+            # Candidate-level FT summary (post-refinement, post-extension)
+            cand_total = len(final_clips)
+            cand_finished = sum(1 for c in final_clips if c.get("ft_status") == "finished")
+            cand_sparse = sum(1 for c in final_clips if c.get("ft_status") == "sparse_finished")
             cand_ratio_strict = (cand_finished / cand_total) if cand_total else 0.0
             cand_ratio_sparse_ok = ((cand_finished + (cand_sparse if episode_fallback_mode else 0)) / cand_total) if cand_total else 0.0
             
             logger.info("FT_SUMMARY_CANDIDATES: total=%d finished=%d sparse=%d ratio_strict=%.2f ratio_sparse_ok=%.2f",
                         cand_total, cand_finished, cand_sparse, cand_ratio_strict, cand_ratio_sparse_ok)
-            logger.info(f"POST_SAFETY: kept={len(ranked_clips)} ids={[c.get('id', 'unknown') for c in ranked_clips]}")
+            logger.info(f"POST_SAFETY: kept={len(final_clips)} ids={[c.get('id', 'unknown') for c in final_clips]}")
             
             # Candidate-based warning (use env tunable threshold; defaults are sensible)
             warn_min_strict = float(os.getenv("FT_WARN_MIN_CAND_RATIO_STRICT", "0.60"))
