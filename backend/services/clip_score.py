@@ -13,6 +13,7 @@ import json
 from typing import List, Dict, Tuple, Any, Optional
 from collections import Counter
 from math import sqrt
+from distutils.util import strtobool
 from models import AudioFeatures, TranscriptSegment, MomentScore
 from config.settings import (
     UPLOAD_DIR, OUTPUT_DIR, MAX_FILE_SIZE, ALLOWED_EXTENSIONS,
@@ -1582,6 +1583,31 @@ def is_on(_): return True  # temporary until flags are unified
 
 logger = logging.getLogger(__name__)
 
+def _get_platform_mode():
+    """Get platform mode flags unconditionally - always defined."""
+    try:
+        pl_v2_weight = float(os.getenv("PL_V2_WEIGHT", "0.5"))
+    except Exception:
+        pl_v2_weight = 0.5
+    try:
+        platform_protect = bool(strtobool(os.getenv("PLATFORM_PROTECT", "true")))
+    except Exception:
+        platform_protect = True
+    length_agnostic = (pl_v2_weight == 0.0 and not platform_protect)
+    return pl_v2_weight, platform_protect, length_agnostic
+
+def test_limits_never_nameerror_or_empty():
+    """Quick sanity test to prevent regressions."""
+    _, _, length_agnostic = _get_platform_mode()
+    finals = [
+        {"id":"a","duration":48.0,"score":0.60},
+        {"id":"b","duration":16.0,"score":0.58},
+        {"id":"c","duration":27.5,"score":0.57},
+    ]
+    out = apply_length_bucket_cap(finals, length_agnostic=length_agnostic)
+    assert out, "Limiter must never return empty when input non-empty"
+    return True
+
 def _normalize_episode_words(maybe_words):
     """Accept: list[dict], dict with 'words', or anything else → []"""
     if isinstance(maybe_words, list):
@@ -1625,21 +1651,18 @@ def apply_length_bucket_cap(finals, *, length_agnostic: bool) -> list:
     try:
         short, mid, long = [], [], []
         for c in finals:
-            d = float(c.get("duration", c.get("end", 0) - c.get("start", 0)))
+            d = float(c.get("duration", 0))
             (short if d < 13 else mid if d <= 30 else long).append(c)
 
-        # Only enforce the "max 1 long" policy when truly length-agnostic
+        # Only cap when truly length agnostic
         if length_agnostic and len(long) > 1:
-            # Keep the best long, demote the rest
-            long_sorted = sorted(long, key=lambda x: x.get("final_score", x.get("score", 0)), reverse=True)
-            keep_long = [long_sorted[0]]
-            drop_longs = set(id(x) for x in long_sorted[1:])
-
-            # Rebuild finals, backfilling with next best short/mid
-            keep_pool = [c for c in finals if id(c) not in drop_longs]
+            long_sorted = sorted(long, key=lambda x: x.get("score", 0), reverse=True)
+            keep_one = {id(long_sorted[0])}
+            # drop the rest of longs
+            result = [c for c in finals if (c in short or c in mid or id(c) in keep_one)]
             logger.info("LENGTH_CAP: kept 1 long, dropped %d longs, total kept=%d", 
-                       len(long_sorted) - 1, len(keep_pool))
-            return keep_pool
+                       len(long_sorted) - 1, len(result))
+            return result
 
         return finals
 
@@ -3661,21 +3684,8 @@ class ClipScoreService:
                 ranked_clips = mmr_select_semantic(ranked_clips, K=min(6, len(ranked_clips)), lam=0.7)
             
             
-            # Platform flags (always defined up front to prevent undefined variable errors)
-            try:
-                pl_v2_weight = float(os.getenv("PL_V2_WEIGHT", "0.5"))
-            except Exception:
-                pl_v2_weight = 0.5
-
-            try:
-                platform_protect = os.getenv("PLATFORM_PROTECT", "true").lower() == "true"
-            except Exception:
-                platform_protect = True
-
-            # Length-agnostic means "don't let platform length affect scores"
-            length_agnostic = (pl_v2_weight == 0.0 and not platform_protect)
-            
-            # Log platform mode for debugging
+            # Platform flags: always defined unconditionally at the start
+            pl_v2_weight, platform_protect, length_agnostic = _get_platform_mode()
             logger.info("PLATFORM_MODE: pl_v2_weight=%.2f, platform_protect=%s, length_agnostic=%s", 
                        pl_v2_weight, platform_protect, length_agnostic)
             
@@ -3961,13 +3971,9 @@ class ClipScoreService:
             # Log enhanced run summary with platform context and payoff rescue info
             durs = [round(float(c.get("end", 0)) - float(c.get("start", 0)), 1) for c in final_clips]
             durs_str = "[" + ",".join(map(str, durs)) + "]"
-            pl_v2_weight = float(os.getenv("PL_V2_WEIGHT", "0.5"))
-            platform_protect = os.getenv("PLATFORM_PROTECT", "true").lower() == "true"
             mode = "platform-aware" if pl_v2_weight > 0 else "neutral"
             
-            # Check for length-agnostic mode
-            from services.payoff_rescue import is_length_agnostic_mode
-            length_agnostic = is_length_agnostic_mode()
+            # Update mode if length-agnostic
             if length_agnostic:
                 mode = "length-agnostic"
             
