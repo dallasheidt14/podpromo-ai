@@ -185,50 +185,6 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
     setPlayingClipId(null);
   }, [episodeId]);
 
-  useEffect(() => {
-    if (displayClips && displayClips.length > 0) {
-      // Auto-generate titles for clips that need them (only once per clip)
-      displayClips.forEach((clip, index) => {
-        if (processedClips.has(clip.id) || generatingClips.has(clip.id)) return; // Skip if already processed or generating
-        
-        const transcript = clip.text;
-        const isTranscriptSnippet = clip.title && clip.title.length > 50 && transcript && clip.title === transcript.substring(0, clip.title.length);
-
-        if (index === 0) {
-          generateNewTitle(clip.id);
-          setProcessedClips(prev => new Set([...Array.from(prev), clip.id]));
-        } else if ((!clip.title || isTranscriptSnippet) && transcript) {
-          generateNewTitle(clip.id);
-          setProcessedClips(prev => new Set([...Array.from(prev), clip.id]));
-        }
-      });
-    }
-  }, [displayClips, processedClips, generatingClips, generateNewTitle]);
-
-  // Initialize current title when selected clip changes
-  useEffect(() => {
-    if (selected) {
-      setCurrentTitle(selected.title || "");
-      setTitleVariants([]);
-      
-      // Auto-backfill title if missing or if it's just a transcript snippet
-      const transcript = selected.text;
-      const isTranscriptSnippet = selected.title && selected.title.length > 50 && transcript && selected.title === transcript.substring(0, selected.title.length);
-
-      if ((!selected.title || isTranscriptSnippet) && transcript && !processedClips.has(selected.id) && !generatingClips.has(selected.id)) {
-        generateNewTitle(selected.id);
-        setProcessedClips(prev => new Set([...Array.from(prev), selected.id]));
-      }
-    }
-  }, [selected, generateNewTitle, processedClips, generatingClips]);
-
-  const sorted = useMemo(
-    () =>
-      [...(clips || [])].sort((a, b) => (b.score ?? 0) - (a.score ?? 0)),
-    [clips]
-  );
-
-
   const generateNewTitle = useCallback(async (clipId: string) => {
     if (process.env.NODE_ENV === 'development') {
       console.log('Generating title for clip:', clipId);
@@ -322,6 +278,51 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
       });
     }
   }, [selected, onClipUpdate]);
+
+  useEffect(() => {
+    if (displayClips && displayClips.length > 0) {
+      // Auto-generate titles for clips that need them (only once per clip)
+      displayClips.forEach((clip, index) => {
+        if (processedClips.has(clip.id) || generatingClips.has(clip.id)) return; // Skip if already processed or generating
+        
+        const transcript = clip.text;
+        const isTranscriptSnippet = clip.title && clip.title.length > 50 && transcript && clip.title === transcript.substring(0, clip.title.length);
+
+        if (index === 0) {
+          generateNewTitle(clip.id);
+          setProcessedClips(prev => new Set([...Array.from(prev), clip.id]));
+        } else if ((!clip.title || isTranscriptSnippet) && transcript) {
+          generateNewTitle(clip.id);
+          setProcessedClips(prev => new Set([...Array.from(prev), clip.id]));
+        }
+      });
+    }
+  }, [displayClips, processedClips, generatingClips, generateNewTitle]);
+
+  // Initialize current title when selected clip changes
+  useEffect(() => {
+    if (selected) {
+      setCurrentTitle(selected.title || "");
+      setTitleVariants([]);
+      
+      // Auto-backfill title if missing or if it's just a transcript snippet
+      const transcript = selected.text;
+      const isTranscriptSnippet = selected.title && selected.title.length > 50 && transcript && selected.title === transcript.substring(0, selected.title.length);
+
+      if ((!selected.title || isTranscriptSnippet) && transcript && !processedClips.has(selected.id) && !generatingClips.has(selected.id)) {
+        generateNewTitle(selected.id);
+        setProcessedClips(prev => new Set([...Array.from(prev), selected.id]));
+      }
+    }
+  }, [selected, generateNewTitle, processedClips, generatingClips]);
+
+  const sorted = useMemo(
+    () =>
+      [...(clips || [])].sort((a, b) => (b.score ?? 0) - (a.score ?? 0)),
+    [clips]
+  );
+
+
 
   const copyTitle = (title: string) => {
     navigator.clipboard.writeText(title);
