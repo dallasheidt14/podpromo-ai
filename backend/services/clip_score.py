@@ -3151,8 +3151,43 @@ class ClipScoreService:
         
         return selected_moments[:target_count]
 
+    def _minimal_candidate_dict(self, clip):
+        """Lowest-common-denominator fields so the UI can render something."""
+        return {
+            "id": clip["id"],
+            "start": clip.get("start"),
+            "end": clip.get("end"),
+            "duration": round(clip.get("duration", (clip.get("end", 0) - clip.get("start", 0))), 1),
+            "display_score": int(round(clip.get("display_score", 50))),
+            "virality_pct": int(round(clip.get("virality_raw", 0.0) * 100)),
+            "platform_fit_pct": int(round(clip.get("platform_len", 0.0) * 100)),
+            "text": clip.get("text", "")[:240],
+        }
+
+    def _format_candidates_safe(self, finals, *args, **kwargs):
+        """Format candidates with fallback to minimal dicts on error."""
+        try:
+            # Try to use existing formatter if it exists
+            if hasattr(self, '_format_candidates'):
+                return self._format_candidates(finals, *args, **kwargs)
+            else:
+                # Fallback to minimal formatting
+                return [self._minimal_candidate_dict(c) for c in finals]
+        except Exception:
+            logger.exception("FORMAT_CANDIDATES_FAIL: falling back to minimal dicts")
+            return [self._minimal_candidate_dict(c) for c in finals]
+
     async def get_candidates(self, episode_id: str, platform: str = "tiktok_reels", genre: str = None) -> List[Dict]:
         """Get AI-scored clip candidates for an episode with platform-neutral selection and post-selection platform recommendations"""
+        
+        # Platform flags: always defined unconditionally at the start
+        pl_v2_weight, platform_protect, length_agnostic = _get_platform_mode()
+        logger.info("PLATFORM_MODE: pl_v2_weight=%.2f, platform_protect=%s, length_agnostic=%s", 
+                   pl_v2_weight, platform_protect, length_agnostic)
+        
+        # Initialize final_clips for salvage guard
+        final_clips = []
+        
         try:
             from services.secret_sauce_pkg import (
                 find_viral_clips_enhanced, resolve_platform, detect_podcast_genre
@@ -3684,10 +3719,7 @@ class ClipScoreService:
                 ranked_clips = mmr_select_semantic(ranked_clips, K=min(6, len(ranked_clips)), lam=0.7)
             
             
-            # Platform flags: always defined unconditionally at the start
-            pl_v2_weight, platform_protect, length_agnostic = _get_platform_mode()
-            logger.info("PLATFORM_MODE: pl_v2_weight=%.2f, platform_protect=%s, length_agnostic=%s", 
-                       pl_v2_weight, platform_protect, length_agnostic)
+            # Platform flags already defined at function start
             
             if length_agnostic:
                 logger.info("LENGTH_AGNOSTIC: enabled - best clip wins regardless of duration")
@@ -4047,7 +4079,7 @@ class ClipScoreService:
             return final_clips, meta
             
         except Exception as e:
-            logger.error(f"Failed to get candidates: {e}", exc_info=True)
+            logger.exception("CANDIDATE_PIPELINE_FAIL: returning finals as-is")
             meta = {
                 "reason": "exception",
                 "episode_id": episode_id,
@@ -4055,7 +4087,14 @@ class ClipScoreService:
                 "platform": platform,
                 "genre": genre
             }
-            return [], meta
+            # Return minimally formatted finals instead of zero.
+            # This guarantees: if we've already computed finals, we get clips back
+            if final_clips:
+                logger.info(f"SALVAGE_GUARD: returning {len(final_clips)} clips despite error")
+                return [self._minimal_candidate_dict(c) for c in final_clips], meta
+            else:
+                logger.warning("SALVAGE_GUARD: no finals to salvage, returning empty")
+                return [], meta
 
 async def score_episode(episode, segments):
     """
