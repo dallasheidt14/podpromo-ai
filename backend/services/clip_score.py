@@ -1513,9 +1513,9 @@ def _format_candidate(seg):
     """Format a single segment into a candidate with ft_status propagation"""
     c = {
         "id": seg.get("id"),
-        "start": float(seg["start"]),
-        "end": float(seg["end"]),
-        "duration": float(seg["end"] - seg["start"]),
+        "start": float(seg.get("start", 0)),
+        "end": float(seg.get("end", 0)),
+        "duration": float(seg.get("end", 0) - seg.get("start", 0)),
         "text": seg.get("text", ""),
         "ft_status": seg.get("ft_status"),   # <-- carry through
         "ft_meta": seg.get("ft_meta", {}),   # optional but useful for logging
@@ -3151,6 +3151,31 @@ class ClipScoreService:
         
         return selected_moments[:target_count]
 
+    def _safe_get(self, d, key, default=None):
+        """Safely get value from dict with normalization for common numeric fields."""
+        v = d.get(key, default)
+        # normalize common numeric fields
+        if key in ("virality_raw", "platform_len", "display_score") and v is None:
+            return 0
+        return v
+
+    def _format_one(self, c):
+        """Format a single clip with bulletproof field access."""
+        return {
+            "id": c["id"],
+            "start": c.get("start"),
+            "end": c.get("end"),
+            "duration": round(c.get("duration", (c.get("end", 0) - c.get("start", 0))), 1),
+            "display_score": int(round(self._safe_get(c, "display_score", 50))),
+            "virality_calibrated": float(self._safe_get(c, "virality_raw", 0.0)),
+            "virality_pct": int(round(self._safe_get(c, "virality_raw", 0.0) * 100)),
+            "platform_fit": float(self._safe_get(c, "platform_len", 0.0)),
+            "platform_fit_pct": int(round(self._safe_get(c, "platform_len", 0.0) * 100)),
+            "text": (c.get("text") or "")[:240],
+            # keep any extra fields safely
+            "meta": {k: v for k, v in c.items() if k not in {"id", "start", "end", "duration", "text"}}
+        }
+
     def _minimal_candidate_dict(self, clip):
         """Lowest-common-denominator fields so the UI can render something."""
         return {
@@ -3167,12 +3192,8 @@ class ClipScoreService:
     def _format_candidates_safe(self, finals, *args, **kwargs):
         """Format candidates with fallback to minimal dicts on error."""
         try:
-            # Try to use existing formatter if it exists
-            if hasattr(self, '_format_candidates'):
-                return self._format_candidates(finals, *args, **kwargs)
-            else:
-                # Fallback to minimal formatting
-                return [self._minimal_candidate_dict(c) for c in finals]
+            formatted = [self._format_one(c) for c in finals]
+            return formatted
         except Exception:
             logger.exception("FORMAT_CANDIDATES_FAIL: falling back to minimal dicts")
             return [self._minimal_candidate_dict(c) for c in finals]
@@ -4012,8 +4033,9 @@ class ClipScoreService:
             # Calculate additional summary metrics
             strict_finished = len([c for c in final_clips if c.get("ft_status") == "finished"])
             balanced_finished = len([c for c in final_clips if c.get("ft_status") in ["finished", "sparse_finished"]])
-            avg_virality = sum(c.get("virality_pct", c.get("display_score", 0)) for c in final_clips) / max(len(final_clips), 1)
-            avg_platform_fit = sum(c.get("platform_fit", 0) for c in final_clips) / max(len(final_clips), 1)
+            # Safe telemetry calculation with fallbacks
+            avg_virality = sum(c.get("virality_pct", c.get("display_score", 50)) for c in final_clips) / max(len(final_clips), 1)
+            avg_platform_fit = sum(c.get("platform_fit", c.get("platform_fit_pct", 0)) for c in final_clips) / max(len(final_clips), 1)
             
             # Count rescued clips
             rescued_count = sum(1 for c in final_clips if c.get("rescue_reason"))
