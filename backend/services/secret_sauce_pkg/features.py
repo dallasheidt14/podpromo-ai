@@ -4090,10 +4090,12 @@ def resolve_genre_from_tone(tone: str, auto_detected: str) -> str:
     """Map frontend tone to backend genre with fallback to auto-detected"""
     if tone and tone in TONE_TO_GENRE_MAP:
         mapped_genre = TONE_TO_GENRE_MAP[tone]
-        print(f"🎯 Tone '{tone}' mapped to genre: {mapped_genre}")
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            print(f"🎯 Tone '{tone}' mapped to genre: {mapped_genre}")
         return mapped_genre
     
-    print(f"🎯 No tone mapping found for '{tone}', using auto-detected: {auto_detected}")
+    if logging.getLogger().isEnabledFor(logging.DEBUG):
+        print(f"🎯 No tone mapping found for '{tone}', using auto-detected: {auto_detected}")
     return auto_detected
 
 def interpret_synergy(synergy_mult: float, features: Dict) -> Dict:
@@ -4232,12 +4234,14 @@ def find_viral_clips_with_genre(segments: List[Dict], audio_file: str, user_genr
     if user_genre is None:
         from .genres import detect_podcast_genre
         detected_genre = detect_podcast_genre(segments)
-        print(f"Auto-detected genre: {detected_genre}")
-        print("You can override this by selecting a specific genre")
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            print(f"Auto-detected genre: {detected_genre}")
+            print("You can override this by selecting a specific genre")
         genre = detected_genre
     else:
         genre = user_genre
-        print(f"Using user-selected genre: {genre}")
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            print(f"Using user-selected genre: {genre}")
     
     # Find viral clips with genre awareness
     result = find_viral_clips(segments, audio_file, genre=genre)
@@ -4437,8 +4441,9 @@ def find_viral_clips(segments: List[Dict], audio_file: str, genre: str = 'genera
         from .genres import GenreAwareScorer
         genre_scorer = GenreAwareScorer()
         detected_genre = genre_scorer.auto_detect_genre(sample_text)
-        print(f"Auto-detected genre: {detected_genre}")
-        print("You can override this by specifying a different genre")
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            print(f"Auto-detected genre: {detected_genre}")
+            print("You can override this by specifying a different genre")
         genre = detected_genre
     
     # Split mixed segments to separate intro from good content

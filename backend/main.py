@@ -11,6 +11,52 @@ from datetime import datetime
 from typing import List, Dict, Optional, Any
 from concurrent.futures import ProcessPoolExecutor
 
+# Configure logging for better readability
+def setup_logging():
+    """Configure logging with compact format and noise reduction."""
+    
+    # Compact single-line formatter
+    fmt = "%(levelname)s:%(name)s:%(message)s"
+    logging.basicConfig(level=logging.INFO, format=fmt, force=True)
+    
+    # Turn down noisy modules
+    logging.getLogger("services.clip_score").setLevel(logging.INFO)
+    logging.getLogger("services.quality_filters").setLevel(logging.INFO)
+    logging.getLogger("titles_service").setLevel(logging.INFO)
+    logging.getLogger("services.titles_service").setLevel(logging.WARNING)  # only warn on skips
+    
+    # Add truncation filter for large messages
+    def _truncate(s, n=200):
+        return s if len(s) <= n else s[:n] + "…"
+
+    class TruncateFormatter(logging.Formatter):
+        def format(self, record):
+            # Get the formatted message
+            msg = super().format(record)
+            # Truncate if too long
+            return _truncate(msg, 200)
+
+    # Apply truncation formatter to all handlers
+    for handler in logging.root.handlers:
+        handler.setFormatter(TruncateFormatter(fmt))
+    
+    # Rate-limit duplicate warnings
+    class OncePerKey(logging.Filter):
+        seen = set()
+        def filter(self, record):
+            # Create a more specific key that includes the message content
+            msg = record.getMessage()
+            key = (record.name, record.levelname, msg)
+            if key in self.seen: 
+                return False
+            self.seen.add(key)
+            return True
+
+    logging.getLogger("services.titles_service").addFilter(OncePerKey())
+
+# Initialize logging
+setup_logging()
+
 # Hard guard: prevent accidental Torch/CUDA usage on Windows
 os.environ.setdefault("ENABLE_TORCH_ALIGNMENT", "0")
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")  # prevents accidental torch cuda picks

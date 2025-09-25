@@ -8,6 +8,61 @@ import { onClipsReady } from "../src/shared/events";
 import { PreviewPlayer } from "../src/components/PreviewPlayer";
 import { fmtTimecode } from "../src/utils/timecode";
 
+// Utility functions for virality and platform fit
+function getViralityPct(clip: Clip): number {
+  // Check for new virality fields first
+  if (typeof clip.features?.virality_pct === 'number') return clip.features.virality_pct;
+  if (typeof clip.features?.virality_calibrated === 'number') return Math.round(clip.features.virality_calibrated * 100);
+  
+  // Fall back to legacy score conversion
+  if (typeof clip.score === 'number') {
+    const x = Math.max(0, Math.min(100, clip.score * 100));
+    return Math.round(x); // Already in 0-100 range
+  }
+  
+  return 0;
+}
+
+function getPlatformFitPct(clip: Clip): number {
+  if (typeof clip.features?.platform_fit_pct === 'number') return clip.features.platform_fit_pct;
+  if (typeof clip.features?.platform_fit === 'number') return Math.round(clip.features.platform_fit * 100);
+  return 0;
+}
+
+function getViralityTone(pct: number): 'ok' | 'good' | 'great' | 'fire' {
+  if (pct >= 85) return 'fire';
+  if (pct >= 70) return 'great';
+  if (pct >= 55) return 'good';
+  return 'ok';
+}
+
+function getViralityToneClasses(clip: Clip): string {
+  const pct = getViralityPct(clip);
+  const tone = getViralityTone(pct);
+  
+  switch (tone) {
+    case 'fire':  return 'bg-red-600/10 text-red-600 ring-1 ring-red-600/20';
+    case 'great': return 'bg-emerald-600/10 text-emerald-600 ring-1 ring-emerald-600/20';
+    case 'good':  return 'bg-amber-600/10 text-amber-700 ring-1 ring-amber-600/20';
+    default:      return 'bg-slate-600/10 text-slate-600 ring-1 ring-slate-600/20';
+  }
+}
+
+function MiniBar({ label, pct, title }: { label: string; pct: number; title?: string }) {
+  const safe = Math.max(0, Math.min(100, Math.round(pct)));
+  return (
+    <div className="space-y-1" title={title}>
+      <div className="flex items-center justify-between text-xs text-slate-500">
+        <span>{label}</span>
+        <span className="tabular-nums">{safe}%</span>
+      </div>
+      <div className="h-1.5 w-full rounded bg-slate-200">
+        <div className="h-1.5 rounded bg-slate-800" style={{ width: `${safe}%` }} />
+      </div>
+    </div>
+  );
+}
+
 function fallbackFromText(t?: string, max = 80) {
   const s = (t || '').replace(/\s+/g, ' ').trim();
   if (!s) return 'Untitled Clip';
@@ -51,13 +106,33 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
       start: simpleClip.start, // Alias for compatibility
       end: simpleClip.end,     // Alias for compatibility
       duration: simpleClip.end - simpleClip.start,
-      score: 0, // Default score
+      score: simpleClip.score || 0, // Use actual score if available
       title: simpleClip.title || '',
       text: simpleClip.raw_text || simpleClip.full_transcript || '',
       raw_text: simpleClip.raw_text || '',
       full_transcript: simpleClip.full_transcript || '',
       status: 'completed' as const,
-      features: {},
+      features: {
+        // Map new virality and platform fit fields
+        virality_calibrated: simpleClip.virality_calibrated,
+        virality_pct: simpleClip.virality_pct,
+        platform_fit: simpleClip.platform_fit,
+        platform_fit_pct: simpleClip.platform_fit_pct,
+        // Map other existing fields
+        display_score: simpleClip.display_score,
+        clip_score_100: simpleClip.clip_score_100,
+        confidence: simpleClip.confidence,
+        confidence_color: simpleClip.confidence_color,
+        // Map scoring features
+        hook_score: simpleClip.hook_score,
+        arousal_score: simpleClip.arousal_score,
+        emotion_score: simpleClip.emotion_score,
+        payoff_score: simpleClip.payoff_score,
+        question_score: simpleClip.question_score,
+        loopability: simpleClip.loopability,
+        info_density: simpleClip.info_density,
+        platform_len_match: simpleClip.platform_len_match,
+      },
       downloadUrl: null,
       previewUrl: null, // Will be handled by PreviewPlayer
       error: null,
@@ -128,7 +203,7 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
         }
       });
     }
-  }, [clips, processedClips, generatingClips]);
+  }, [displayClips, processedClips, generatingClips, generateNewTitle]);
 
   // Initialize current title when selected clip changes
   useEffect(() => {
@@ -145,7 +220,7 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
         setProcessedClips(prev => new Set([...Array.from(prev), selected.id]));
       }
     }
-  }, [selected]);
+  }, [selected, generateNewTitle, processedClips, generatingClips]);
 
   const sorted = useMemo(
     () =>
@@ -154,7 +229,7 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
   );
 
 
-  const generateNewTitle = async (clipId: string) => {
+  const generateNewTitle = useCallback(async (clipId: string) => {
     if (process.env.NODE_ENV === 'development') {
       console.log('Generating title for clip:', clipId);
     }
@@ -246,7 +321,7 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
         return newSet;
       });
     }
-  };
+  }, [selected, onClipUpdate]);
 
   const copyTitle = (title: string) => {
     navigator.clipboard.writeText(title);
@@ -326,11 +401,27 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
                   <h3 className="line-clamp-2 font-medium text-neutral-900">
                     {clip.title || fallbackFromText(clip.display_text || clip.text) || "Untitled clip"}
                   </h3>
-                  {typeof clip.score === "number" && (
-                    <span className="shrink-0 rounded-full bg-gradient-to-r from-blue-500 to-blue-600 px-3 py-1.5 text-xs font-bold text-white shadow-lg">
-                      ⭐ {Math.round(clip.score * 100)}/100
-                    </span>
-                  )}
+                  <div className="flex items-center gap-2">
+                    {/* New virality pill */}
+                    {(() => {
+                      const virality = getViralityPct(clip);
+                      return virality > 0 && (
+                        <span className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium ${getViralityToneClasses(clip)}`}>
+                          <span>Virality</span>
+                          <span className="tabular-nums">{virality}</span>
+                        </span>
+                      );
+                    })()}
+                    {/* Legacy score fallback */}
+                    {(() => {
+                      const virality = getViralityPct(clip);
+                      return typeof clip.score === "number" && virality === 0 && (
+                        <span className="shrink-0 rounded-full bg-gradient-to-r from-blue-500 to-blue-600 px-3 py-1.5 text-xs font-bold text-white shadow-lg">
+                          ⭐ {Math.round(clip.score * 100)}/100
+                        </span>
+                      );
+                    })()}
+                  </div>
                 </div>
 
                 {/* Timing Information */}
@@ -346,6 +437,26 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
                     </div>
                   </div>
                 )}
+
+                {/* New virality and platform fit bars */}
+                <div className="space-y-2">
+                  {(() => {
+                    const virality = getViralityPct(clip);
+                    const platformFit = getPlatformFitPct(clip);
+                    return (
+                      <>
+                        <MiniBar label="Virality" pct={virality} />
+                        {platformFit > 0 && (
+                          <MiniBar 
+                            label="Platform fit" 
+                            pct={platformFit} 
+                            title="Length-fit for Shorts/TikTok/Reels" 
+                          />
+                        )}
+                      </>
+                    );
+                  })()}
+                </div>
 
                 <div className="flex flex-wrap gap-2 relative z-10">
                   <button

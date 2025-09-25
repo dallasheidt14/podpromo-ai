@@ -200,6 +200,29 @@ export interface ClipSimple {
   video_url?: string;    // fallback
   raw_text?: string;
   full_transcript?: string;
+  
+  // Scoring fields
+  score?: number;
+  display_score?: number;
+  clip_score_100?: number;
+  confidence?: string;
+  confidence_color?: string;
+  
+  // New virality and platform fit fields
+  virality_calibrated?: number; // 0–1
+  virality_pct?: number;        // 0–100
+  platform_fit?: number;        // 0–1
+  platform_fit_pct?: number;    // 0–100
+  
+  // Scoring features
+  hook_score?: number;
+  arousal_score?: number;
+  emotion_score?: number;
+  payoff_score?: number;
+  question_score?: number;
+  loopability?: number;
+  info_density?: number;
+  platform_len_match?: number;
 }
 
 // This function is already updated above with parseClips

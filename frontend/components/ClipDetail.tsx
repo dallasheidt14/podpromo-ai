@@ -22,9 +22,9 @@ type Props = {
 };
 
 export default function ClipDetail({ clip, open, onClose }: Props) {
-  if (!clip) return null;
-  
   const mediaRef = useRef<HTMLVideoElement & HTMLAudioElement>(null as any);
+  
+  if (!clip) return null;
 
   const duration =
     clip.startTime != null && clip.endTime != null

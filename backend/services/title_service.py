@@ -6,9 +6,24 @@ import re, math, itertools, hashlib, time
 from collections import Counter
 from typing import List, Dict, Iterable, Tuple, Optional, Set, Any
 import logging
+from datetime import datetime, timezone
+from functools import lru_cache
 from config.settings import PLAT_LIMITS, TITLE_ENGINE_V2
 
 logger = logging.getLogger("titles_service")
+
+def _hash_text(s: str) -> str:
+    """Generate a short hash for text content"""
+    return hashlib.sha256((s or "").encode("utf-8")).hexdigest()[:16]
+
+def _cache_key(clip_id: str, platform: str, text: str, kw: list[str]) -> tuple:
+    """Generate cache key for title pack generation"""
+    return (clip_id or "", platform or "shorts", _hash_text(text or ""), tuple(sorted(kw or [])))
+
+@lru_cache(maxsize=512)
+def _cached_title_pack(key: tuple, *, _gen_fn):
+    """Cached title pack generation - key is produced by _cache_key"""
+    return _gen_fn()
 
 def _normalize_to_list_of_str(variants) -> list[str]:
     """Normalize variants to list of strings, handling both str and dict formats"""
@@ -54,6 +69,307 @@ def generate_titles_v2(text: str, platform: str) -> list[str]:
     cap = 80
     trimmed = [t[:cap].rstrip() for t in titles if t]
     return trimmed[:6]
+
+# Platform-specific budgets
+PLAT_BUDGETS = {
+    "shorts":  {"overlay": 32, "short": 32, "mid": 60, "long": 100},
+    "tiktok":  {"overlay": 32, "short": 32, "mid": 60, "long": 80},
+    "reels":   {"overlay": 32, "short": 32, "mid": 60, "long": 90},
+    "default": {"overlay": 32, "short": 32, "mid": 60, "long": 90},
+}
+
+# Filler/transition opener patterns to filter out
+FILLER_PREFIXES = (
+    "transitioning to", "first,", "second,", "third,", "in conclusion", "welcome back",
+    "in this episode", "today we'll", "today we will", "we'll explore", "we will explore",
+    "let's explore", "join us", "come along", "in this video", "in this clip",
+    "everything you need to know", "ultimate guide", "at the end of the day",
+    "an exploration of", "in an age where", "to begin,", "this episode will", 
+    "today we discuss", "let's dive into", "today we're going to", 
+    "in today's episode", "this week we", "in this segment"
+)
+
+# Expanded banlist for better quality
+_BANNED_OPENERS = {
+    "transitioning to", "first,", "second,", "third,", "in conclusion", "welcome back",
+    "in this episode", "today we'll", "today we will", "we'll explore", "we will explore",
+    "let's explore", "join us", "come along", "in this video", "in this clip",
+    "everything you need to know", "ultimate guide", "at the end of the day",
+    "an exploration of", "in an age where", "to begin,", "this episode will", 
+    "today we discuss", "let's dive into", "today we're going to", 
+    "in today's episode", "this week we", "in this segment"
+}
+
+def _is_filler_open(title: str) -> bool:
+    """Check if title starts with filler/transition phrases"""
+    t = (title or "").strip().lower()
+    return any(t.startswith(b) for b in _BANNED_OPENERS)
+
+def _force_keyword(title: str, keywords: list[str]) -> str:
+    """Inject the strongest keyword into title if not already present"""
+    if not keywords:
+        return title
+    
+    # Check if any keyword is already in title
+    title_lower = title.lower()
+    if any(k.lower() in title_lower for k in keywords):
+        return title
+    
+    # Inject the strongest keyword near the front
+    k = keywords[0]
+    # Try to insert after first word
+    words = title.split()
+    if len(words) > 1:
+        words.insert(1, k)
+        return " ".join(words)
+    else:
+        return f"{title} {k}"
+
+def _classify_style(title: str) -> str:
+    """Classify title style for better organization and A/B testing"""
+    t = title.strip()
+    low = t.lower()
+
+    if re.match(r"^\d+\s", t) or re.search(r"\b(top|ways|tips|mistakes|rules)\b", low):
+        return "list"
+    if re.search(r"\b(my|our)\b\s+(take|mistake|story|lesson)", low):
+        return "personal"
+    if re.search(r"\b(how to|how we|how i)\b", low):
+        return "how_to"
+    if low.startswith(("why ", "what ", "when ", "where ", "how ")):
+        return "question"
+    if re.search(r"\b(vs|versus)\b", low) and not re.search(r"\b(myth|truth)\b", low):
+        return "x_vs_y"
+    if re.search(r"\b(myth|truth)\b", low):
+        return "contrarian"
+    return "hook_short" if len(t) <= 32 else "general"
+
+def _title_case(s: str) -> str:
+    """Minimal title case: capitalize major words, preserve ALLCAPS acronyms"""
+    SMALL = {"a","an","and","or","the","to","of","in","on","for","with","at","by","from","is","are","was","were","be","been","being"}
+    words = s.split()
+    out = []
+    for i, w in enumerate(words):
+        if w.isupper() and len(w) > 1:
+            out.append(w)  # keep acronyms like AI, GPU
+        else:
+            lw = w.lower()
+            if i > 0 and i < len(words)-1 and lw in SMALL:
+                out.append(lw)
+            else:
+                out.append(lw.capitalize())
+    return " ".join(out)
+
+def _polish_title(title: str, style: str) -> str:
+    """Polish title with proper punctuation, case, and formatting"""
+    t = (title or "").strip()
+    # Remove trailing ellipses/multiple punctuation
+    t = re.sub(r"[\.…]+$", "", t)
+    t = re.sub(r"\s+([:!?])", r"\1", t)
+    # Allow at most one colon
+    parts = t.split(":")
+    if len(parts) > 2:
+        t = parts[0] + ": " + " ".join(p.strip() for p in parts[1:])
+    # Case strategy
+    if len(t) <= 32 or style in {"hook_short","question"}:
+        # sentence case for very short hooks
+        t = t[0:1].upper() + t[1:]
+    else:
+        t = _title_case(t)
+    return t.strip()
+
+def _hashtags_from_keywords(keywords: list[str], limit_total_chars: int = 45, max_tags: int = 3) -> list[str]:
+    """Generate hashtags from keywords with character budget"""
+    tags = []
+    total = 0
+    for k in keywords:
+        # Clean the keyword and create hashtag
+        clean_k = re.sub(r"[^A-Za-z0-9]+", "", k)
+        if len(clean_k) < 2:  # Skip very short keywords
+            continue
+        
+        # Preserve acronyms (all caps) or title case
+        if k.isupper() and len(k) > 1:
+            tag = "#" + clean_k
+        else:
+            tag = "#" + clean_k.title()
+        
+        # Check if we can add this tag
+        if len(tags) < max_tags:
+            new_total = total + len(tag) + (1 if total else 0)
+            if new_total <= limit_total_chars:
+                tags.append(tag)
+                total = new_total
+    return tags
+
+def _title_engine_v2(text: str, want: int = 6) -> list[str]:
+    """Title engine v2 facade with heuristic fallback"""
+    try:
+        # Try to use existing v2 engine
+        return generate_titles_v2(text, "default")
+    except Exception as e:
+        logger.warning("TITLE_ENGINE_V2: failed %s, using heuristic fallback", e)
+        return _heuristic_title_generator(text, want)
+
+def _heuristic_title_generator(text: str, want: int = 6) -> list[str]:
+    """Simple heuristic title generator as fallback"""
+    if not text or not text.strip():
+        return ["Untitled Content"]
+    
+    # Split into sentences
+    sentences = re.split(r'[.!?]+', text)
+    sentences = [s.strip() for s in sentences if s.strip()]
+    
+    if not sentences:
+        return ["Untitled Content"]
+    
+    titles = []
+    
+    # Use first sentence as base
+    first_sentence = sentences[0]
+    if len(first_sentence) > 10:
+        # Try different angles
+        titles.append(first_sentence)
+        
+        # Add "How to" version
+        if not first_sentence.lower().startswith(("how to", "how do", "what is", "why")):
+            titles.append(f"How to {first_sentence.lower()}")
+        
+        # Add "Why" version
+        if not first_sentence.lower().startswith(("why", "what", "how")):
+            titles.append(f"Why {first_sentence.lower()}")
+    
+    # Use other sentences if we need more
+    for sentence in sentences[1:]:
+        if len(sentence) > 10 and len(titles) < want:
+            titles.append(sentence)
+    
+    # Fallback if we still don't have enough
+    while len(titles) < want:
+        titles.append(f"Key Insight #{len(titles) + 1}")
+    
+    return titles[:want]
+
+def _generate_title_pack_uncached(clip_id: str, platform: str, text: str, episode_text: str | None = None, keywords: list[str] = None) -> dict:
+    """
+    Generate a complete title pack with labeled variants, overlay, and metadata.
+    Returns dict with variants, overlay, engine, generated_at, meta fields.
+    """
+    from .keyword_extraction import extract_salient_keywords
+    
+    # Extract keywords if not provided
+    if keywords is None:
+        keywords = extract_salient_keywords(text, limit=5) or extract_salient_keywords(episode_text or "", limit=5) or []
+    
+    budgets = PLAT_BUDGETS.get(platform, PLAT_BUDGETS["default"])
+    
+    # Generate raw titles using v2 engine
+    raw_titles = _title_engine_v2(text, want=6)
+    
+    # Post-process: filter filler, normalize, inject keywords, classify style, polish, enforce budgets
+    def norm_one(s: str, limit: int) -> str:
+        s = s.strip().rstrip(". ").replace("..", ".")
+        if _is_filler_open(s):
+            return ""  # Skip filler titles
+        s = _force_keyword(s, keywords)
+        # Enforce character limit AFTER keyword injection
+        s = s[:limit]
+        return s
+    
+    overlay = ""
+    variants = []
+    seen = set()
+    
+    for s in raw_titles:
+        overlay_c = norm_one(s, budgets["overlay"])
+        short_c   = norm_one(s, budgets["short"])
+        mid_c     = norm_one(s, budgets["mid"])
+        long_c    = norm_one(s, budgets["long"])
+        
+        # Create variants with different styles
+        for t, base_style, limit in [
+            (overlay_c, "hook_short", budgets["overlay"]),
+            (short_c,   "hook_mid",  budgets["short"]),
+            (mid_c,     "how_to",    budgets["mid"]),
+            (long_c,    "detailed",  budgets["long"])
+        ]:
+            if not t or t.lower() in seen:
+                continue
+            seen.add(t.lower())
+            
+            # Classify style and polish the title
+            style = _classify_style(t)
+            polished = _polish_title(t, style)
+            
+            variants.append({"title": polished, "style": style, "length": len(polished)})
+        
+        # Set overlay to first good short title
+        if not overlay and overlay_c:
+            overlay = overlay_c
+        
+        if len(variants) >= 5:
+            break
+    
+    # Fallback overlay if none found
+    if not overlay and variants:
+        overlay = variants[0]["title"][:budgets["overlay"]]
+    
+    # Generate hashtags from keywords
+    hashtags = _hashtags_from_keywords(keywords)
+    
+    # Use a fixed timestamp for caching consistency
+    now = datetime.now(timezone.utc).isoformat()
+    
+    meta = {
+        "keywords": keywords,
+        "analytics": {
+            "impressions": 0,
+            "clicks": 0,
+            "ctr": 0.0,
+            "last_updated": now,
+        }
+    }
+    
+    if hashtags:
+        meta["hashtags"] = hashtags
+    
+    return {
+        "variants": variants[:5],
+        "overlay": overlay,
+        "engine": "v2",
+        "generated_at": now,
+        "version": 1,
+        "meta": meta
+    }
+
+def generate_title_pack_v2(clip_id: str, platform: str, text: str, episode_text: str | None = None) -> dict:
+    """
+    Generate a complete title pack with LRU caching for performance (v2 API).
+    Returns dict with variants, overlay, engine, generated_at, meta fields.
+    """
+    from .keyword_extraction import extract_salient_keywords
+    
+    # Extract keywords for cache key (consistent with what's used in generation)
+    keywords = extract_salient_keywords(text, limit=5) or extract_salient_keywords(episode_text or "", limit=5) or []
+    
+    # Generate cache key
+    key = _cache_key(clip_id, platform, text, keywords)
+    
+    # Define the generation function with consistent keywords
+    def _gen():
+        return _generate_title_pack_uncached(clip_id, platform, text, episode_text, keywords)
+    
+    # Return cached result
+    return _cached_title_pack(key, _gen_fn=_gen)
+
+def generate_title_pack(text: str, platform: str, episode_text: str | None = None) -> dict:
+    """
+    Backward-compatible wrapper for existing callers (v1 API).
+    Old callers use (text, platform). We map to v2 with an empty clip_id.
+    Callers that have a real clip_id should prefer generate_title_pack_v2 for better caching/analytics.
+    """
+    clip_id = ""  # unknown here; callers like TitlesService don't pass it
+    return generate_title_pack_v2(clip_id=clip_id, platform=platform, text=text, episode_text=episode_text)
 
 # Generic scaffold patterns to penalize
 GENERIC_SCAFFOLD_RE = re.compile(
@@ -562,8 +878,7 @@ def _extract_keywords(text: str, k: int = 6) -> List[str]:
             break
     return out
 
-def _title_case(s: str) -> str:
-    return " ".join([w.capitalize() if w.lower() not in STOP else w.lower() for w in s.split()])
+# Removed duplicate _title_case function - using the one defined earlier
 
 def _variants_from_keywords(keys: List[str], platform: str) -> List[str]:
     # assemble 6 concise variants; prefer 4–8 words; title-case; avoid banned phrases

@@ -16,6 +16,7 @@ import threading
 import random
 from datetime import datetime, timezone
 from contextlib import contextmanager
+from functools import lru_cache
 from config.settings import UPLOAD_DIR, TITLES_INDEX_TTL_SEC
 import os
 
@@ -138,6 +139,43 @@ def _titles_path_for(clip_id: str) -> str:
         raise
 
 
+def _read_or_migrate_clips_json(target_file: pathlib.Path) -> Dict[str, Any]:
+    """
+    Read clips.json with self-healing migration from legacy list format to object format.
+    Returns dict with 'clips' key and 'version' field.
+    """
+    try:
+        raw = json.loads(target_file.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.exception("TitlesService: unreadable JSON at %s", target_file)
+        raise
+
+    # migrate legacy list -> object
+    if isinstance(raw, list):
+        logger.warning("TitlesService: migrating legacy list clips.json at %s", target_file)
+        data = {"version": 2, "clips": raw}
+        try:
+            _atomic_write_json(str(target_file), data)
+        except Exception as e:
+            logger.warning("TitlesService: migration write failed, using in-memory data: %s", e)
+        return data
+
+    if not isinstance(raw, dict):
+        raise ValueError("clips.json not a dict after read")
+
+    if "clips" not in raw or not isinstance(raw["clips"], list):
+        raw["clips"] = []
+    
+    # Ensure version field exists and is at least 2
+    if "version" not in raw or raw["version"] < 2:
+        raw["version"] = 2
+        try:
+            _atomic_write_json(str(target_file), raw)
+        except Exception as e:
+            logger.warning("TitlesService: version update write failed: %s", e)
+    
+    return raw
+
 def _load_clip(clip_id: str, uploads_dir: pathlib.Path) -> Optional[Dict[str, Any]]:
     """Load real clip data from clips.json file"""
     m = CLIP_ID_RE.match(clip_id)
@@ -153,13 +191,8 @@ def _load_clip(clip_id: str, uploads_dir: pathlib.Path) -> Optional[Dict[str, An
         return None
     
     try:
-        data = json.loads(clips_file.read_text(encoding="utf-8"))
-        
-        # Handle both formats: direct array or wrapped in object
-        if isinstance(data, list):
-            clips = data
-        else:
-            clips = data.get("clips", [])
+        data = _read_or_migrate_clips_json(clips_file)
+        clips = data.get("clips", [])
         
         # Find the specific clip
         for clip in clips:
@@ -178,13 +211,16 @@ class TitlesService:
     
     def __init__(self):
         self.clips_cache = {}  # Simple in-memory cache
+        self._skip_warnings = set()  # Track warned clip_ids to prevent spam
+        self._skip_lock = threading.Lock()  # Thread safety for skip warnings
     
     # In-process debounce cache
     _debounce: Dict[str, Tuple[float, str]] = {}
     _debounce_window_sec = 60.0
     
+    @lru_cache(maxsize=256)
     def get_clip(self, clip_id: str) -> Optional[Dict[str, Any]]:
-        """Get clip data by ID - loads real data from clips.json"""
+        """Get clip data by ID - loads real data from clips.json (cached)"""
         uploads_dir = pathlib.Path(os.getenv("UPLOADS_DIR", UPLOAD_DIR))
         
         # Try to load real clip data
@@ -348,19 +384,15 @@ class TitlesService:
             logger.warning("TitlesService.save_titles: clip_id=%s not found in uploads; creating fallback titles file", clip_id)
             return self._save_titles_fallback(clip_id, platform, variants, chosen, meta, uploads_dir)
 
-        # Load, mutate, write atomically
+        # Load, mutate, write atomically with self-healing migration
         try:
-            data = json.loads(target_file.read_text(encoding="utf-8"))
+            data = _read_or_migrate_clips_json(target_file)
         except Exception as e:
             logger.exception("TitlesService.save_titles: failed to read %s: %s", target_file, e)
             return False
 
-        # Determine original structure and extract clips
-        is_original_list = isinstance(data, list)
-        if is_original_list:
-            clips = data
-        else:
-            clips = data.get("clips", [])
+        # Extract clips from migrated data
+        clips = data.get("clips", [])
 
         updated = False
         now = datetime.now(timezone.utc).isoformat()
@@ -368,13 +400,27 @@ class TitlesService:
             if c.get("id") != clip_id:
                 continue
             titles_obj = c.get("titles") or {}
-            titles_obj[platform] = {
-                "variants": variants,
-                "chosen": chosen if chosen else (variants[0] if variants else None),
-                "generated_at": now,
-                "engine": "v2",
-                "meta": meta or {},
-            }
+            
+            # Convert old variants format to new schema if needed
+            if isinstance(variants, list) and variants and isinstance(variants[0], str):
+                # Old format: convert to new schema
+                from .title_service import generate_title_pack
+                text = c.get("transcript") or c.get("text") or ""
+                title_pack = generate_title_pack(text=text, platform=platform)
+                titles_obj[platform] = title_pack
+                if chosen:
+                    titles_obj[platform]["chosen"] = chosen
+                    titles_obj[platform]["chosen_at"] = now
+            else:
+                # New format: use as-is
+                titles_obj[platform] = {
+                    "variants": variants,
+                    "chosen": chosen if chosen else (variants[0] if variants else None),
+                    "generated_at": now,
+                    "engine": "v2",
+                    "meta": meta or {},
+                }
+            
             c["titles"] = titles_obj
             updated = True
             break
@@ -383,14 +429,9 @@ class TitlesService:
             logger.warning("TitlesService.save_titles: clip_id=%s not present in %s after reload", clip_id, target_file)
             return False
 
-        # Preserve original structure when saving
-        if is_original_list:
-            # Save back as list (original format)
-            save_data = clips
-        else:
-            # Save back as dict with "clips" key (original format)
-            save_data = data
-            save_data["clips"] = clips
+        # Always save in new object format
+        save_data = data
+        save_data["clips"] = clips
 
         # Use Windows-safe atomic write with lock file
         lock_path = str(target_file) + ".lock"
@@ -472,7 +513,186 @@ class TitlesService:
             return False
 
     def set_chosen_title(self, clip_id: str, platform: str, title: str) -> bool:
-        """Set the chosen title for a clip"""
-        logger.info(f"TitlesService.set_chosen_title({clip_id}, {platform}, {title})")
-        # In a real app, this would update the database
-        return True
+        """Set the chosen title for a clip and persist it to clips.json"""
+        uploads_dir = pathlib.Path(os.getenv("UPLOADS_DIR", UPLOAD_DIR))
+        
+        try:
+            episode_id = _episode_id_from_clip_id(clip_id)
+            target_file = uploads_dir / episode_id / "clips.json"
+        except Exception as e:
+            logger.error(f"TitlesService.set_chosen_title: failed to parse episode_id from clip_id {clip_id}: {e}")
+            return False
+
+        if not target_file.exists():
+            logger.warning("TitlesService.set_chosen_title: clips.json not found for %s", clip_id)
+            return False
+
+        try:
+            data = _read_or_migrate_clips_json(target_file)
+        except Exception as e:
+            logger.exception("TitlesService.set_chosen_title: failed to read %s: %s", target_file, e)
+            return False
+
+        now = datetime.now(timezone.utc).isoformat()
+        updated = False
+        
+        for c in data["clips"]:
+            if c.get("id") == clip_id:
+                titles = c.setdefault("titles", {})
+                entry = titles.setdefault(platform, {
+                    "variants": [], 
+                    "chosen": None, 
+                    "engine": "v2", 
+                    "generated_at": now,
+                    "meta": {}
+                })
+                entry["chosen"] = title
+                entry["chosen_at"] = now
+                
+                # Update analytics placeholder
+                meta = entry.setdefault("meta", {})
+                analytics = meta.setdefault("analytics", {
+                    "impressions": 0,
+                    "clicks": 0,
+                    "ctr": 0.0,
+                    "last_updated": now
+                })
+                analytics["last_updated"] = now
+                
+                updated = True
+                break
+
+        if not updated:
+            logger.warning("TitlesService.set_chosen_title: clip not found: %s", clip_id)
+            return False
+
+        # Write back atomically
+        lock_path = str(target_file) + ".lock"
+        try:
+            with _file_lock(lock_path):
+                _atomic_write_json(str(target_file), data)
+            logger.info("TitlesService.set_chosen_title: persisted for %s/%s", clip_id, platform)
+            return True
+        except Exception as e:
+            logger.exception("TitlesService.set_chosen_title: failed to write %s: %s", target_file, e)
+            return False
+
+    def ensure_titles_for_clip(self, clip_or_id, *, force=False, platform="shorts"):
+        """
+        Idempotent: if clip already has titles for this platform, do nothing.
+        Otherwise, generate + persist.
+        Accepts either a clip dict or a clip_id string.
+        """
+        # Normalize input: turn clip_or_id into a dict via get_clip() if it's a string
+        clip = clip_or_id
+        if isinstance(clip_or_id, str):
+            clip = self.get_clip(clip_or_id)
+        
+        if not isinstance(clip, dict):
+            # Throttle warnings to once per clip (thread-safe)
+            with self._skip_lock:
+                if clip_or_id not in self._skip_warnings:
+                    logger.warning("AUTO_TITLE: load_failed %r", clip_or_id)
+                    self._skip_warnings.add(clip_or_id)
+                else:
+                    logger.info("AUTO_TITLE: throttled load_failed %r", clip_or_id)
+            return None  # skip cleanly
+
+        cid = clip.get("id")
+        if not cid:
+            # Throttle warnings to once per clip (thread-safe)
+            with self._skip_lock:
+                if clip_or_id not in self._skip_warnings:
+                    logger.warning("AUTO_TITLE: no_id %r", clip_or_id)
+                    self._skip_warnings.add(clip_or_id)
+                else:
+                    logger.info("AUTO_TITLE: throttled no_id %r", clip_or_id)
+            return None
+
+        # Skip if already generated for this platform (unless force=True)
+        if not force and clip.get("titles", {}).get(platform):
+            return clip["titles"][platform]
+
+        # Build prompt inputs robustly
+        text = clip.get("text") or ""
+        if not text and isinstance(clip.get("transcript"), dict):
+            text = clip.get("transcript", {}).get("text", "")
+        elif not text and isinstance(clip.get("transcript"), str):
+            text = clip.get("transcript", "")
+        
+        if not text:
+            # Fallback: try to extract from words
+            words = clip.get("words") or []
+            if isinstance(words, list) and words:
+                text = " ".join(w.get("word", "") for w in words if isinstance(w, dict) and w.get("word"))
+        
+        if not text:
+            # Throttle warnings to once per clip (thread-safe)
+            with self._skip_lock:
+                if cid not in self._skip_warnings:
+                    logger.warning("AUTO_TITLE: no_text %s", cid)
+                    self._skip_warnings.add(cid)
+                else:
+                    logger.info("AUTO_TITLE: throttled no_text %s", cid)
+            return None
+
+        # Create snippet for title generation (cheap, safe)
+        words = text.split()
+        snippet = " ".join(words[:80])  # First 80 words
+        
+        # Normalize whitespace and trim trailing punctuation
+        snippet = re.sub(r'\s+', ' ', snippet.strip())  # Normalize whitespace
+        snippet = re.sub(r'[:;\.]{2,}$', '.', snippet)  # Remove multiple colons/semicolons/periods
+        snippet = re.sub(r'\.{3,}$', '...', snippet)    # Normalize ellipses
+        snippet = snippet.rstrip('.,;:')                # Remove trailing punctuation
+        
+        try:
+            # Check for ad content
+            features = clip.get("features", {})
+            is_ad = features.get("is_advertisement", False)
+            if is_ad:
+                logger.info("AUTO_TITLE: skipping ad content %s", cid)
+                return None
+            
+            # Get language hint if available
+            language = features.get("language", "en")
+            
+            # Generate title pack using v1 API
+            from .title_service import generate_title_pack
+            pack = generate_title_pack(text=snippet, platform=platform)
+            
+            # Extract variants from the pack with fallback
+            variants = [v["title"] for v in pack.get("variants", [])] if pack.get("variants") else []
+            chosen = pack.get("overlay", "")
+            
+            # Fallback if no variants generated
+            if not variants:
+                logger.warning("AUTO_TITLE: no variants generated for %s", cid)
+                variants = [snippet[:50] + "..." if len(snippet) > 50 else snippet]  # Use snippet as fallback
+                chosen = variants[0]
+            
+            # Save titles
+            self.save_titles(clip_id=cid, platform=platform, variants=variants, chosen=chosen, meta={"autogen": True})
+            
+            return {
+                "variants": variants,
+                "chosen": chosen,
+                "overlay": chosen,
+                "meta": {"autogen": True}
+            }
+        except Exception as e:
+            # Throttle warnings to once per clip (thread-safe)
+            with self._skip_lock:
+                if cid not in self._skip_warnings:
+                    logger.warning("AUTO_TITLE: generation_failed %s (%s)", cid, e)
+                    self._skip_warnings.add(cid)
+                else:
+                    logger.info("AUTO_TITLE: throttled generation_failed %s", cid)
+            return None
+
+    def ensure_titles_for_clip_legacy(self, episode: dict, clip: dict, platform: str = "shorts") -> None:
+        """
+        Deprecated: Legacy wrapper for backward compatibility.
+        TODO: Remove once all callers pass ids or dicts intentionally.
+        """
+        return self.ensure_titles_for_clip(clip, platform=platform)

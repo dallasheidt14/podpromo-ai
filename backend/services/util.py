@@ -399,11 +399,41 @@ def extend_to_natural_end(clip: Dict, words: List[Dict], max_extend_sec: float =
     return clip
 
 
-def calculate_finish_confidence(clip: Dict, words: List[Dict] = None) -> float:
+def _coerce_words_list(words):
     """
-    Calculate confidence that a clip represents a finished thought.
-    Returns value between 0.0 and 1.0.
+    Return a list[dict] of words with keys ('t' or 'start', 'd' or 'end', 'w' or 'text', 'prob' optional).
+    If words is invalid (None/str/other), return [] so callers can proceed safely.
     """
+    if not isinstance(words, list):
+        return []
+    out = []
+    for w in words:
+        if not isinstance(w, dict):
+            continue
+        txt = (w.get("w") or w.get("word") or w.get("text") or "").strip()
+        t0  = float(w.get("t", w.get("start", 0.0)) or 0.0)
+        d   = float(w.get("d", (w.get("end", t0) - t0)) or 0.0)
+        prob = float(w.get("prob", w.get("p", w.get("confidence", 0.7)))) or 0.7
+        out.append({"text": txt, "start": t0, "dur": d, "end": t0 + max(0.0, d), "prob": prob})
+    return out
+
+def _nearest_eos_after(end_t: float, eos_markers: list[float] | None) -> float | None:
+    if not eos_markers:
+        return None
+    after = [t for t in eos_markers if t >= end_t]
+    return (min(after) - end_t) if after else None
+
+def calculate_finish_confidence(
+    clip: dict,
+    words: list | None = None,
+    eos_markers: list[float] | None = None,
+) -> float:
+    """
+    Returns [0..1] confidence a clip is a finished thought.
+    Robust to bad 'words' inputs (None/str/etc).
+    """
+    words_coerced = _coerce_words_list(words)
+    
     text = (clip.get("text") or "").strip()
     if not text:
         return 0.0
@@ -415,12 +445,12 @@ def calculate_finish_confidence(clip: Dict, words: List[Dict] = None) -> float:
         confidence += 0.6
         
         # Check for proper sentence structure (capitalization after period)
-        if words:
+        if words_coerced:
             clip_end = float(clip.get("end", 0.0))
-            for w in words:
+            for w in words_coerced:
                 w_start = float(w.get("start", 0.0))
                 if w_start > clip_end + 0.1:  # Next word after clip
-                    w_text = (w.get("word") or w.get("text") or "").strip()
+                    w_text = (w.get("text") or "").strip()
                     if w_text and w_text[0].isupper():
                         confidence += 0.2
                     break
@@ -435,9 +465,9 @@ def calculate_finish_confidence(clip: Dict, words: List[Dict] = None) -> float:
         confidence += 0.4
     
     # Pause after end (if words available)
-    if words:
+    if words_coerced:
         clip_end = float(clip.get("end", 0.0))
-        for i, w in enumerate(words):
+        for i, w in enumerate(words_coerced):
             w_start = float(w.get("start", 0.0))
             if w_start > clip_end:
                 gap = w_start - clip_end
@@ -448,6 +478,13 @@ def calculate_finish_confidence(clip: Dict, words: List[Dict] = None) -> float:
     # Weak punctuation (low confidence)
     if text.endswith((",", ";", ":")):
         confidence += 0.1
+    
+    # EOS proximity boost (if eos_markers provided)
+    end_t = float(clip.get("end", 0.0))
+    nearest = _nearest_eos_after(end_t, eos_markers)
+    if nearest is not None and 0.0 <= nearest <= 1.2:
+        # Gentle, capped boost (up to +0.10) for very close EOS
+        confidence = min(1.0, confidence + (0.10 * (1.2 - nearest) / 1.2))
     
     return min(1.0, confidence)
 

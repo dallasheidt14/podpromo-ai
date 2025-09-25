@@ -826,8 +826,10 @@ class EpisodeService:
                                         serializable_clip[key] = str(value)
                                 serializable_clips.append(serializable_clip)
                             
-                            with open(clips_file, 'w', encoding='utf-8') as f:
-                                json.dump(serializable_clips, f, indent=2, ensure_ascii=False)
+                            # Save clips as object with atomic write
+                            from services.util import atomic_write_json
+                            payload = {"clips": serializable_clips}
+                            atomic_write_json(str(clips_file), payload)
                             
                             logger.info(f"Saved existing {len(clips)} clips to {clips_file}")
                     except Exception as e:
@@ -973,10 +975,23 @@ class EpisodeService:
                         
                         serializable_clips.append(serializable_clip)
                     
-                    with open(clips_file, 'w', encoding='utf-8') as f:
-                        json.dump(serializable_clips, f, indent=2, ensure_ascii=False)
+                    # Save clips as object with atomic write
+                    from services.util import atomic_write_json
+                    payload = {"clips": serializable_clips}
+                    atomic_write_json(str(clips_file), payload)
                     
                     logger.info(f"Saved {len(clips)} clips to {clips_file}")
+                    
+                    # Fire-and-forget auto-titling so the UI always has options on first load
+                    try:
+                        from services.titles_service import TitlesService
+                        ts = TitlesService()
+                        # pick a default platform; you can make this configurable
+                        platform = "shorts"
+                        for clip in serializable_clips:
+                            ts.ensure_titles_for_clip(clip, platform=platform)
+                    except Exception as e:
+                        logger.warning("AUTO_TITLE: episode-level failure (%s)", e)
                 except Exception as e:
                     logger.error(f"Failed to save clips to file: {e}")
             except Exception as e:

@@ -108,7 +108,7 @@ export default function EpisodeUploadSimple({
       />
       <div className="text-center">
         <h3 className="text-xl font-semibold text-gray-800 mb-2">Upload Your Episode</h3>
-        <p className="text-gray-600">Choose how you'd like to upload your content</p>
+        <p className="text-gray-600">Choose how you&apos;d like to upload your content</p>
       </div>
 
       {/* Mode Selection */}

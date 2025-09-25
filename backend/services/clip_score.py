@@ -688,11 +688,13 @@ def _log_finals_summary(finals: list, logger) -> None:
     reasons_str = ", ".join([f"{k}={v}" for k, v in top_reasons])
     
     # Log structured summary (one-liner per stage)
-    logger.info("FINALS: n=%d | durs=[%.1f,%.1f,%.1f,%.1f] | virality=[%.3f,%.3f,%.3f]",
-                n, dur_stats["min"], dur_stats["p50"], dur_stats["p90"], dur_stats["max"],
-                max([c.get("display_score", 0) for c in finals]) if finals else 0,
-                sorted([c.get("display_score", 0) for c in finals])[len(finals)//2] if finals else 0,
-                min([c.get("display_score", 0) for c in finals]) if finals else 0)
+    def _fmt_list(arr, k=6):
+        s = ", ".join(str(x) for x in arr[:k])
+        return f"[{s}{', …' if len(arr) > k else ''}]"
+    
+    durs = [round(float(c.get("end",0))-float(c.get("start",0)), 1) for c in finals]
+    virs = [round(float(c.get("display_score", c.get("score", 0.0))), 3) for c in finals]
+    logger.info("FINALS: n=%d | durs=%s | virality=%s", len(finals), _fmt_list(durs), _fmt_list(virs))
 
 def _log_pick_trace(finals: list, logger) -> None:
     """Log pick trace for each final clip"""
@@ -1580,6 +1582,90 @@ def is_on(_): return True  # temporary until flags are unified
 
 logger = logging.getLogger(__name__)
 
+def _normalize_episode_words(maybe_words):
+    """Accept: list[dict], dict with 'words', or anything else → []"""
+    if isinstance(maybe_words, list):
+        return [w for w in maybe_words if isinstance(w, dict)]
+    if isinstance(maybe_words, dict) and isinstance(maybe_words.get("words"), list):
+        return [w for w in maybe_words["words"] if isinstance(w, dict)]
+    return []
+
+def _safe_eos(list_or_none):
+    return list_or_none if isinstance(list_or_none, list) else []
+
+def _word_end_times(words):
+    """words: list[dict] with ('t'/'start','d'/'end')"""
+    out = []
+    if isinstance(words, list):
+        for w in words:
+            if not isinstance(w, dict):
+                continue
+            t0 = float(w.get("t", w.get("start", 0.0)) or 0.0)
+            d  = float(w.get("d", (w.get("end", t0) - t0)) or 0.0)
+            out.append(t0 + max(0.0, d))
+    return out
+
+def _telemetry_density(episode_words, eos_times):
+    we = _word_end_times(episode_words)
+    et = _safe_eos(eos_times)
+    wc = len(we)
+    ec = len(et)
+    # Avoid bogus density; prefer 0.0 over inflated value
+    dens = (ec / wc) if wc > 0 else 0.0
+    return wc, ec, dens
+
+def apply_length_bucket_cap(finals, *, length_agnostic: bool) -> list:
+    """
+    Apply length bucket cap safely - never returns empty list if input had clips.
+    Only enforces 'max 1 long' policy when truly length-agnostic.
+    """
+    if not finals:
+        return finals
+
+    try:
+        short, mid, long = [], [], []
+        for c in finals:
+            d = float(c.get("duration", c.get("end", 0) - c.get("start", 0)))
+            (short if d < 13 else mid if d <= 30 else long).append(c)
+
+        # Only enforce the "max 1 long" policy when truly length-agnostic
+        if length_agnostic and len(long) > 1:
+            # Keep the best long, demote the rest
+            long_sorted = sorted(long, key=lambda x: x.get("final_score", x.get("score", 0)), reverse=True)
+            keep_long = [long_sorted[0]]
+            drop_longs = set(id(x) for x in long_sorted[1:])
+
+            # Rebuild finals, backfilling with next best short/mid
+            keep_pool = [c for c in finals if id(c) not in drop_longs]
+            logger.info("LENGTH_CAP: kept 1 long, dropped %d longs, total kept=%d", 
+                       len(long_sorted) - 1, len(keep_pool))
+            return keep_pool
+
+        return finals
+
+    except Exception as e:
+        logger.exception("LENGTH_CAP_ERROR: %s", e)
+        # On any error, DO NOT change finals
+        return finals
+
+
+def _log_final_summary(finals, logger):
+    total = len(finals)
+    strict_finished = sum(
+        1 for c in finals
+        if c.get("finished_thought") is True
+        or c.get("finished") is True
+        or c.get("ft_status") == "finished"
+    )
+    sparse_finished = sum(1 for c in finals if c.get("ft_status") == "sparse_finished")
+    longest = max((float(c.get("end",0))-float(c.get("start",0)) for c in finals), default=0.0)
+    ratio_strict = (strict_finished / total) if total else 0.0
+    ratio_sparse_ok = ((strict_finished + sparse_finished) / total) if total else 0.0
+    logger.info(
+        "FT_SUMMARY_FINAL: finished=%d sparse=%d total=%d ratio_strict=%.2f ratio_sparse_ok=%.2f longest=%.1fs",
+        strict_finished, sparse_finished, total, ratio_strict, ratio_sparse_ok, longest
+    )
+
 def choose_default_clip(clips: List[Dict[str, Any]]) -> Optional[str]:
     """Choose the default clip for UI display"""
     if not clips:
@@ -1696,22 +1782,26 @@ def final_safety_pass(clips: List[Dict[str, Any]], eos_times: List[float], word_
             logger.info(f"SAFETY_UPDATE: clip {clip.get('id', 'unknown')} -> {result}")
     
     # Calculate telemetry
-    word_count = len(word_end_times)
-    eos_count = len(eos_times)
-    eos_density = eos_count / max(word_count, 1)
-    fallback_mode = word_count < 500 or eos_count == 0
+    # Calculate episode-level telemetry (defensive)
+    wc = len(word_end_times) if word_end_times else 0
+    ec = len(eos_times) if eos_times else 0
+    # Note: episode-level fallbacks are handled in the calling function
+    # Avoid bogus density; prefer 0.0 over inflated value
+    eos_density = (ec / wc) if wc > 0 else 0.0
+    fallback_mode = wc < 500 or ec == 0
     
     # Count finish thought results
     finished_count = sum(1 for c in clips if c.get("finished_thought", 0) == 1)
     finished_ratio = finished_count / max(len(clips), 1)
     
+    
     # Log episode-level telemetry
-    logger.info(f"TELEMETRY: word_count={word_count}, eos_count={eos_count}, eos_density={eos_density:.3f}")
+    logger.info(f"TELEMETRY: word_count={wc}, eos_count={ec}, eos_density={eos_density:.3f}")
     logger.info(f"TELEMETRY: fallback_mode={fallback_mode}, finished_ratio={finished_ratio:.2f}")
     logger.info(f"SAFETY_PASS: updated {safety_updated}, dropped {safety_dropped}, protected {safety_protected} clips")
     
     # Episode-level thresholds
-    if word_count < 500 or eos_count == 0:
+    if wc < 500 or ec == 0:
         logger.warning("EOS_SPARSE: word_count < 500 or eos_count == 0")
     if finished_ratio < 0.95:
         logger.warning(f"FINISH_RATIO_LOW: {finished_ratio:.2f}")
@@ -2249,7 +2339,15 @@ class ClipScoreService:
             seg["display_score"] = calibrated_score["score"]
             seg["clip_score_100"] = calibrated_score["score"]  # Set clip_score_100 for frontend
             seg["confidence"] = calibrated_score["confidence"]
+            # Expose full virality values for frontend
+            seg["virality_calibrated"] = calibrated_score.get("virality_calibrated", raw_score)
+            seg["virality_pct"] = calibrated_score.get("virality_pct", int(round(raw_score * 100)))
             seg["confidence_color"] = calibrated_score["color"]
+            
+            # Add platform fit information
+            platform_fit = seg.get("platform_length_score_v2", 0.0)
+            seg["platform_fit"] = round(platform_fit, 2)
+            seg["platform_fit_pct"] = int(round(platform_fit * 100))
             
             seg["score"] = seg["raw_score"]  # For backward compatibility
             
@@ -2346,7 +2444,9 @@ class ClipScoreService:
             return {
                 "score": calibrated,
                 "confidence": confidence,
-                "color": color
+                "color": color,
+                "virality_calibrated": raw_score,  # 0-1 range
+                "virality_pct": int(round(raw_score * 100))  # 0-100 range
             }
 
     def _find_topic_boundaries(self, transcript: List[TranscriptSegment]) -> List[int]:
@@ -3424,7 +3524,7 @@ class ClipScoreService:
                 display_dur = apply_micro_jitter_to_display(dur)
                 prot = "prot=True" if c.get("protected", False) else ""
                 final_info.append(f"{display_dur}s {prot}".strip())
-            logger.info(f"FINAL_SAVE: n={len(finals)} :: [{', '.join(final_info)}]")
+            logger.info(f"FINAL_PICK_BEFORE_LIMITS: n={len(finals)} :: [{', '.join(final_info)}]")
             
             # Tighten selection after gating
             finals = tighten_selection(finals)
@@ -3440,7 +3540,7 @@ class ClipScoreService:
             candidates_after = len(finals)
             
             # Pre-save logging
-            logger.info(f"PRE_SAVE: final_count={candidates_after} ids={[c.get('id', 'unknown') for c in finals]}")
+            logger.info(f"PRE_SAVE: final_count={len(finals)} ids={[c.get('id', 'unknown') for c in finals]}")
             
             # Remove hard assert on zero; degrade gracefully
             if candidates_after == 0:
@@ -3528,6 +3628,23 @@ class ClipScoreService:
             # Add ranking and default clip selection (platform-neutral)
             ranked_clips = rank_clips(finals, platform_neutral=PLATFORM_NEUTRAL_SELECTION)
             
+            # Apply payoff rescue to boost clips with strong CTAs, punchlines, or insights
+            from services.payoff_rescue import apply_payoff_rescue
+            rescue_items = [{"calibrated": c.get("final_score", 0.0), "features": c.get("features", {}), "clip": c} for c in ranked_clips]
+            rescue_items.sort(key=lambda x: x["calibrated"], reverse=True)
+            rescue_items = apply_payoff_rescue(rescue_items)
+            
+            # Update clips with rescued scores and re-sort
+            for item in rescue_items:
+                clip = item["clip"]
+                if "calibrated_rescued" in item:
+                    clip["final_score_rescued"] = item["calibrated_rescued"]
+                    clip["rescue_reason"] = item.get("rescue_reason")
+            
+            # Re-sort by rescued score if any rescues were applied
+            if any("calibrated_rescued" in item for item in rescue_items):
+                ranked_clips.sort(key=lambda c: c.get("final_score_rescued", c.get("final_score", 0.0)), reverse=True)
+            
             # Apply anti-uniform tiebreak if we have a reserve pool
             if hasattr(self, 'reserve_pool') and self.reserve_pool:
                 ranked_clips = _anti_uniform_tiebreak(ranked_clips, self.reserve_pool, window=0.5, LOG=logger)
@@ -3535,14 +3652,47 @@ class ClipScoreService:
             # Add platform recommendations after selection
             ranked_clips = add_platform_recommendations_to_clips(ranked_clips)
             
-            # Apply semantic MMR for diversity
+            # Apply semantic MMR for diversity (content-based only in length-agnostic mode)
             from services.quality_filters import mmr_select_semantic
-            ranked_clips = mmr_select_semantic(ranked_clips, K=min(6, len(ranked_clips)), lam=0.7)
+            if length_agnostic:
+                # In length-agnostic mode, use content diversity only (no duration bias)
+                ranked_clips = mmr_select_semantic(ranked_clips, K=min(6, len(ranked_clips)), lam=0.8)  # Higher content diversity
+            else:
+                ranked_clips = mmr_select_semantic(ranked_clips, K=min(6, len(ranked_clips)), lam=0.7)
             
             
-            # Log platform-neutral selection info
+            # Platform flags (always defined up front to prevent undefined variable errors)
+            try:
+                pl_v2_weight = float(os.getenv("PL_V2_WEIGHT", "0.5"))
+            except Exception:
+                pl_v2_weight = 0.5
+
+            try:
+                platform_protect = os.getenv("PLATFORM_PROTECT", "true").lower() == "true"
+            except Exception:
+                platform_protect = True
+
+            # Length-agnostic means "don't let platform length affect scores"
+            length_agnostic = (pl_v2_weight == 0.0 and not platform_protect)
+            
+            # Log platform mode for debugging
+            logger.info("PLATFORM_MODE: pl_v2_weight=%.2f, platform_protect=%s, length_agnostic=%s", 
+                       pl_v2_weight, platform_protect, length_agnostic)
+            
+            if length_agnostic:
+                logger.info("LENGTH_AGNOSTIC: enabled - best clip wins regardless of duration")
+            
+            # Apply platform length scoring if enabled
+            if pl_v2_weight > 0:
+                for clip in ranked_clips:
+                    pl_v2 = clip.get("platform_length_score_v2", 0.0)
+                    # Blend platform score with final score
+                    clip["final_score"] = clip.get("final_score", 0) * (1 - pl_v2_weight) + pl_v2 * pl_v2_weight
+                    clip["display_score"] = clip["final_score"]
+            
+            # Log platform-aware selection info
             logger.info(f"SELECTION: platform_neutral={PLATFORM_NEUTRAL_SELECTION}")
-            logger.info(f"NEUTRAL_MODE: pl_v2_weight=0, platform_protect=False")
+            logger.info(f"PLATFORM_MODE: pl_v2_weight={pl_v2_weight}, platform_protect={platform_protect}")
             if ranked_clips:
                 logger.info(f"PLATFORM_REC: {ranked_clips[0].get('platform_recommendations', [])[:3]}")
             
@@ -3637,6 +3787,30 @@ class ClipScoreService:
             
             logger.info("BOUNDARY_REFINEMENT: refined=%d/%d", len(refined), len(ranked_clips))
             
+            # Normalize episode words for consistent processing
+            episode_words_raw = _episode_words_or_empty(episode)
+            episode_words = _normalize_episode_words(episode_words_raw)
+            
+            # Normalize eos_times early to prevent NoneType crashes
+            eos_times = _safe_eos(eos_times)
+            
+            # Universal micro-extension (≤3s tail snap) - safe and cheap
+            # This runs BEFORE gates to rescue borderline unfinished clips
+            from services.util import extend_to_natural_end
+            tail_snap_count = 0
+            for clip in ranked_clips:
+                try:
+                    # Universal micro-tail snap (idempotent: only extends to clean EOS)
+                    original_end = clip.get("end", 0.0)
+                    extend_to_natural_end(clip, episode_words, max_extension=3.0)
+                    if clip.get("end", 0.0) != original_end:
+                        tail_snap_count += 1
+                except Exception as e:
+                    logger.debug("TAIL_SNAP: skipped for %s due to %s", clip.get("id"), e)
+            
+            if tail_snap_count > 0:
+                logger.info("TAIL_SNAP: extended %d/%d clips to natural endings", tail_snap_count, len(ranked_clips))
+            
             # EOS confidence scoring and smart extension (post-boundary refinement)
             from services.util import calculate_finish_confidence, finish_threshold_for, extend_to_natural_end
             
@@ -3652,7 +3826,13 @@ class ClipScoreService:
                         clip["eos_confidence"] = end_confidence
                         
                         # Smart extension to natural end if confidence is low
-                        threshold = finish_threshold_for(final_genre, platform)
+                        # Build indicators for adaptive thresholding
+                        speech_stats = (viral_result or {}).get("speech_stats") or {}
+                        indicators = {
+                            "conversational_ratio": float(speech_stats.get("conversational_ratio", 0.0)),
+                            "interview_format": bool(speech_stats.get("interview_format", False)),
+                        }
+                        threshold = finish_threshold_for(final_genre, indicators)
                         if end_confidence < threshold:
                             extended_end = extend_to_natural_end(
                                 clip.get("end", 0.0),
@@ -3717,21 +3897,94 @@ class ClipScoreService:
                 # Use both text-based and EOS confidence-based detection
                 text_finished = likely_finished_text(clip.get("text", ""))
                 eos_confidence = clip.get("eos_confidence", 0.5)
-                threshold = finish_threshold_for(final_genre, platform)
-                eos_finished = 1 if eos_confidence >= threshold else 0
                 
-                # Combine both signals (either can indicate finished)
-                clip["finished_thought"] = max(text_finished, eos_finished)
-                clip["text_finished"] = text_finished
-                clip["eos_finished"] = eos_finished
+                # Calculate finish confidence with EOS proximity boost
+                # eos_times should already be normalized by _safe_eos
+                try:
+                    finish_conf = calculate_finish_confidence(clip, episode_words, eos_times)
+                except Exception as e:
+                    logger.warning("EOS_CONFIDENCE: failed to calculate for clip %s: %s", clip.get("id"), e)
+                    finish_conf = 0.0
                 
-                # Set ft_status based on the combined result
-                if clip.get("finished_thought", 0) == 1:
+                # Finish confidence + sparse-finish promotion
+                if finish_conf >= 0.75:
+                    clip["finished_thought"] = True
                     clip["ft_status"] = "finished"
                 else:
-                    clip["ft_status"] = "unresolved"
+                    # Check for sparse-finish (near EOS + decent payoff)
+                    from services.util import _nearest_eos_after
+                    nearest = _nearest_eos_after(float(clip.get("end", 0.0)), eos_times)
+                    payoff = clip.get("features", {}).get("payoff", 0.0)
+                    if nearest is not None and 0.0 <= nearest <= 1.2 and payoff >= 0.45:
+                        clip["ft_status"] = "sparse_finished"
+                        clip["finished_thought"] = False
+                    else:
+                        # Build indicators for adaptive thresholding
+                        speech_stats = (viral_result or {}).get("speech_stats") or {}
+                        indicators = {
+                            "conversational_ratio": float(speech_stats.get("conversational_ratio", 0.0)),
+                            "interview_format": bool(speech_stats.get("interview_format", False)),
+                        }
+                        threshold = finish_threshold_for(final_genre, indicators)
+                        eos_finished = 1 if eos_confidence >= threshold else 0
+                        
+                        # Combine both signals (either can indicate finished)
+                        clip["finished_thought"] = max(text_finished, eos_finished)
+                        clip["text_finished"] = text_finished
+                        clip["eos_finished"] = eos_finished
+                        
+                        # Set ft_status based on the combined result
+                        if clip.get("finished_thought", 0) == 1:
+                            clip["ft_status"] = "finished"
+                        else:
+                            clip["ft_status"] = "unresolved"
                 
                 final_clips.append(clip)
+            
+            # Apply length bucket cap safely with fallback
+            finals_before_limits = list(final_clips)  # shallow copy before caps
+            
+            try:
+                final_clips = apply_length_bucket_cap(final_clips, length_agnostic=length_agnostic)
+            except Exception as e:
+                logger.exception("LIMITS_PIPE_ERROR: %s", e)
+                final_clips = finals_before_limits
+            
+            # Hard guarantee: never end up empty due to post-pick logic
+            if not final_clips and finals_before_limits:
+                logger.warning("LIMITS_PIPE_EMPTY: restoring %d finals", len(finals_before_limits))
+                final_clips = finals_before_limits
+            
+            # Log final summary from the actual finals we're saving
+            _log_final_summary(final_clips, logger)
+            
+            # Log enhanced run summary with platform context and payoff rescue info
+            durs = [round(float(c.get("end", 0)) - float(c.get("start", 0)), 1) for c in final_clips]
+            durs_str = "[" + ",".join(map(str, durs)) + "]"
+            pl_v2_weight = float(os.getenv("PL_V2_WEIGHT", "0.5"))
+            platform_protect = os.getenv("PLATFORM_PROTECT", "true").lower() == "true"
+            mode = "platform-aware" if pl_v2_weight > 0 else "neutral"
+            
+            # Check for length-agnostic mode
+            from services.payoff_rescue import is_length_agnostic_mode
+            length_agnostic = is_length_agnostic_mode()
+            if length_agnostic:
+                mode = "length-agnostic"
+            
+            # Calculate additional summary metrics
+            strict_finished = len([c for c in final_clips if c.get("ft_status") == "finished"])
+            balanced_finished = len([c for c in final_clips if c.get("ft_status") in ["finished", "sparse_finished"]])
+            avg_virality = sum(c.get("virality_pct", c.get("display_score", 0)) for c in final_clips) / max(len(final_clips), 1)
+            avg_platform_fit = sum(c.get("platform_fit", 0) for c in final_clips) / max(len(final_clips), 1)
+            
+            # Count rescued clips
+            rescued_count = sum(1 for c in final_clips if c.get("rescue_reason"))
+            
+            logger.info(
+                "RUN_SUMMARY: seeds=%d strict=%d balanced=%d finals=%d durs=%s eos=%d dens=%.3f pl_v2_w=%.2f protect=%s mode=%s fallback=%s avg_virality=%.1f avg_platform_fit=%.2f rescued=%d",
+                len(ranked_clips), strict_finished, balanced_finished, len(final_clips), durs_str, ec, eos_density, 
+                pl_v2_weight, platform_protect, mode, episode_fallback_mode, avg_virality, avg_platform_fit, rescued_count
+            )
             
             # Final sanity check before save
             assert len(final_clips) > 0, "Should have at least one clip"
@@ -3739,19 +3992,11 @@ class ClipScoreService:
             # Calculate longest clip duration
             longest_dur = max((c.get("end", 0) - c.get("start", 0)) for c in final_clips) if final_clips else 0.0
             
-            # Compute FT summary from final_clips (post-refinement, post-extension)
-            finished_count = sum(1 for c in final_clips if c.get('ft_status') == 'finished')
-            sparse_count = sum(1 for c in final_clips if c.get('ft_status') == 'sparse_finished')
-            total = len(final_clips)
-            ratio_strict = finished_count / max(total, 1)
-            ratio_sparse_ok = (finished_count + sparse_count) / max(total, 1) if episode_fallback_mode else ratio_strict
-            
-            logger.info("FT_SUMMARY: finished=%d sparse=%d total=%d ratio_strict=%.2f ratio_sparse_ok=%.2f longest=%.1fs",
-                        finished_count, sparse_count, total, ratio_strict, ratio_sparse_ok, longest_dur)
+            # FT summary already logged above via _log_final_summary
             
             # Telemetry that can't disagree with itself
-            wc, ec, dens = len(word_end_times), len(eos_times), len(eos_times)/max(len(word_end_times), 1)
-            logger.info(f"TELEMETRY: word_count={wc}, eos_count={ec}, eos_density={dens:.3f}")
+            wc, ec, dens = _telemetry_density(episode_words, eos_times)
+            logger.info("TELEMETRY: word_count=%d, eos_count=%d, eos_density=%.3f", wc, ec, dens)
             logger.info(f"TELEMETRY: fallback_mode={episode_fallback_mode} (authoritative)")
             
             # Candidate-level FT summary (post-refinement, post-extension)
@@ -3773,12 +4018,8 @@ class ClipScoreService:
             elif episode_fallback_mode and cand_ratio_sparse_ok < warn_min_fallback:
                 logger.warning("FINISH_RATIO_LOW_CAND: %.2f < %.2f (fallback)", cand_ratio_sparse_ok, warn_min_fallback)
             
-            # Upstream/auth summary should be informational only now:
-            if viral_result and "ft" in viral_result:
-                ft_data = viral_result["ft"]
-                logger.info("FT_SUMMARY_AUTH: total=%d finished=%d sparse=%d ratio_strict=%.2f ratio_sparse_ok=%.2f",
-                            ft_data["total"], ft_data["finished"], ft_data["sparse_finished"], 
-                            ft_data["ratio_strict"], ft_data["ratio_sparse_ok"])
+            # Upstream/auth summary removed to avoid telemetry confusion
+            # Use _log_final_summary() for authoritative reporting
             
             # Build metadata for return
             meta = {
@@ -3789,7 +4030,12 @@ class ClipScoreService:
                 "fallback_mode": episode_fallback_mode,
                 "eos_density": eos_density,
                 "candidate_count": len(final_clips),
-                "default_clip_id": default_clip_id
+                "default_clip_id": default_clip_id,
+                # Platform flags for debugging
+                "platform_neutral": True,
+                "pl_v2_weight": pl_v2_weight,
+                "platform_protect": platform_protect,
+                "length_agnostic": length_agnostic,
             }
             
             return final_clips, meta

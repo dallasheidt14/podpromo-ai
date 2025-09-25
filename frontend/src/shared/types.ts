@@ -86,6 +86,12 @@ export interface Clip {
     bonuses_applied?: number;
     bonus_reasons?: string;
     
+    // New virality and platform fit fields
+    virality_calibrated?: number; // 0–1
+    virality_pct?: number;        // 0–100
+    platform_fit?: number;        // 0–1
+    platform_fit_pct?: number;    // 0–100
+    
     // Ad detection
     _ad_flag?: boolean;
     _ad_penalty?: number;
