@@ -43,12 +43,7 @@ class EpisodeWordsEmpty(Exception):
         super().__init__(f"Episode {episode_id} has no words after ASR normalization")
 
 
-def atomic_write_json(path: Path, obj: dict) -> None:
-    """Atomically write JSON to file using temp file + rename"""
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.parent.mkdir(parents=True, exist_ok=True)
-    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2))
-    os.replace(tmp, path)
+# Use centralized atomic_write_json from util.py
 
 
 class EnhancedProgressTracker:
@@ -827,7 +822,6 @@ class EpisodeService:
                                 serializable_clips.append(serializable_clip)
                             
                             # Save clips as object with atomic write
-                            from services.util import atomic_write_json
                             payload = {"clips": serializable_clips}
                             atomic_write_json(str(clips_file), payload)
                             
@@ -976,7 +970,6 @@ class EpisodeService:
                         serializable_clips.append(serializable_clip)
                     
                     # Save clips as object with atomic write
-                    from services.util import atomic_write_json
                     payload = {"clips": serializable_clips}
                     atomic_write_json(str(clips_file), payload)
                     

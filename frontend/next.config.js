@@ -1,19 +1,20 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  images: {
-    domains: ['localhost'],
-  },
   async rewrites() {
+    const target = process.env.BACKEND_ORIGIN || 'http://localhost:8000';
     return [
-      {
-        source: '/api/:path*',
-        destination: 'http://localhost:8000/api/:path*',
-      },
-      {
-        source: '/health',
-        destination: 'http://localhost:8000/health',
-      },
+      { source: '/api/:path*', destination: `${target}/api/:path*` },
+      { source: '/health', destination: `${target}/health` },
     ];
+  },
+  images: {
+    remotePatterns: [
+      { protocol: 'http', hostname: 'backend', port: '8000' },
+      { protocol: 'http', hostname: 'localhost', port: '8000' },
+      // add prod hosts when ready:
+      // { protocol: 'https', hostname: 'app.yourdomain.com' },
+      // { protocol: 'https', hostname: 'cdn.yourdomain.com' },
+    ],
   },
 };
 

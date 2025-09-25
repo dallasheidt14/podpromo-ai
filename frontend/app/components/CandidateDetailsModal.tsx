@@ -27,7 +27,18 @@ export default function CandidateDetailsModal({
   if (!open || !cand) return null;
   const f = cand.features || {};
   return (
-    <div style={{position:"fixed",inset:0, background:"rgba(0,0,0,.45)", display:"flex",alignItems:"center",justifyContent:"center", padding:16, zIndex:50}}>
+    <div
+      style={{
+        position: "fixed",
+        inset: 0,
+        background: "rgba(0,0,0,0.65)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: 16,
+        zIndex: 50,
+      }}
+    >
       <div style={{background:"#fff", borderRadius:12, width:"min(820px, 96vw)", maxHeight:"90vh", overflow:"auto", padding:16}}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
           <h3 style={{margin:0}}>Clip details {cand.start?.toFixed(1)}–{cand.end?.toFixed(1)}s</h3>

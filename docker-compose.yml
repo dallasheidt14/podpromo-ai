@@ -13,7 +13,8 @@ services:
     environment:
       - UPLOAD_DIR=/app/uploads
       - OUTPUT_DIR=/app/outputs
-      - MAX_FILE_SIZE=500MB
+      - MAX_FILE_BYTES=524288000  # 500 MB
+      - CORS_ORIGINS_JSON=["http://frontend:3000","http://localhost:3000","http://127.0.0.1:3000"]
     networks:
       - podpromo
 
@@ -26,7 +27,8 @@ services:
       - /app/node_modules
       - /app/.next
     environment:
-      - NEXT_PUBLIC_API_URL=http://localhost:8000
+      - NEXT_PUBLIC_API_BASE=http://backend:8000
+      - BACKEND_ORIGIN=http://backend:8000
     depends_on:
       - backend
     networks:
