@@ -1584,16 +1584,17 @@ def is_on(_): return True  # temporary until flags are unified
 logger = logging.getLogger(__name__)
 
 def _get_platform_mode():
-    """Get platform mode flags unconditionally - always defined."""
-    try:
-        pl_v2_weight = float(os.getenv("PL_V2_WEIGHT", "0.5"))
-    except Exception:
-        pl_v2_weight = 0.5
-    try:
-        platform_protect = bool(strtobool(os.getenv("PLATFORM_PROTECT", "true")))
-    except Exception:
-        platform_protect = True
-    length_agnostic = (pl_v2_weight == 0.0 and not platform_protect)
+    """
+    Decide platform-mode flags from config/env in one place.
+    Returns: (pl_v2_weight: float, platform_protect: bool, length_agnostic: bool)
+    """
+    import os
+    # v2 weighting (0..1)
+    pl_v2_weight = float(os.getenv("PL_V2_WEIGHT", "0.5") or 0.5)
+    # keep at least one long clip in traditional/platform-biased modes
+    platform_protect = os.getenv("PLATFORM_PROTECT", "1") in ("1", "true", "True")
+    # when TRUE we treat all lengths neutrally and cap long-count
+    length_agnostic = os.getenv("LENGTH_AGNOSTIC", "0") in ("1", "true", "True")
     return pl_v2_weight, platform_protect, length_agnostic
 
 def test_limits_never_nameerror_or_empty():
