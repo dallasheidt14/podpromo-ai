@@ -1595,6 +1595,11 @@ def _get_platform_mode():
     platform_protect = os.getenv("PLATFORM_PROTECT", "1") in ("1", "true", "True")
     # when TRUE we treat all lengths neutrally and cap long-count
     length_agnostic = os.getenv("LENGTH_AGNOSTIC", "0") in ("1", "true", "True")
+    
+    logger.info(
+        "PLATFORM_MODE: pl_v2_weight=%s, platform_protect=%s, length_agnostic=%s",
+        pl_v2_weight, platform_protect, length_agnostic
+    )
     return pl_v2_weight, platform_protect, length_agnostic
 
 def test_limits_never_nameerror_or_empty():
