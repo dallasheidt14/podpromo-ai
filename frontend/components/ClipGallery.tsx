@@ -8,20 +8,12 @@ import { onClipsReady } from "../src/shared/events";
 import { PreviewPlayer } from "../src/components/PreviewPlayer";
 import { fmtTimecode } from "../src/utils/timecode";
 import { toPct } from "../app/lib/metrics";
+import { buildScoreBundle } from "../app/lib/score";
 
 // Utility functions for virality and platform fit
 function getViralityPct(clip: Clip): number {
-  // Check for new virality fields first
-  if (typeof clip.features?.virality_pct === 'number') return clip.features.virality_pct;
-  if (typeof clip.features?.virality_calibrated === 'number') return Math.round(clip.features.virality_calibrated * 100);
-  
-  // Fall back to legacy score conversion
-  if (typeof clip.score === 'number') {
-    const x = Math.max(0, Math.min(100, clip.score * 100));
-    return Math.round(x); // Already in 0-100 range
-  }
-  
-  return 0;
+  const ui = clip.uiScores ?? buildScoreBundle(clip);
+  return ui.viralityPct;
 }
 
 function getPlatformFitPct(clip: Clip): number {
@@ -498,14 +490,17 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
       <Modal open={open} onClose={() => setOpen(false)}>
         <div>
           <h4 className="text-xl font-semibold mb-4">{currentTitle || selected?.title || "Clip Details"}</h4>
-          {selected?.score && (
-            <div className="mb-6">
-              <div className="text-4xl font-bold text-gray-900">
-                {toPct(selected.score)}
-                <span className="text-2xl text-gray-500">/100</span>
+          {selected && (() => {
+            const ui = selected.uiScores ?? buildScoreBundle(selected);
+            return ui.viralityPct > 0 && (
+              <div className="mb-6">
+                <div className="text-4xl font-bold text-gray-900">
+                  {ui.viralityPct}
+                  <span className="text-2xl text-gray-500">/100</span>
+                </div>
               </div>
-            </div>
-          )}
+            );
+          })()}
 
           {/* Timing Information */}
           {selected?.startTime != null && selected?.endTime != null && (

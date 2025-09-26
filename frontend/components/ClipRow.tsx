@@ -1,11 +1,12 @@
 // components/ClipRow.tsx
 import { ScorePill } from '../ui/ScorePill';
 import { MiniBar } from '../ui/MiniBar';
-import { getViralityPct, getPlatformFitPct } from '../ui/score';
+import { getPlatformFitPct } from '../ui/score';
+import { buildScoreBundle } from '../app/lib/score';
 import type { Clip } from '../types/Clip';
 
 export const ClipRow: React.FC<{ clip: Clip; onClick?: () => void }> = ({ clip, onClick }) => {
-  const virality = getViralityPct(clip);
+  const ui = clip.uiScores ?? buildScoreBundle(clip);
   const platform = getPlatformFitPct(clip);
 
   return (
@@ -26,7 +27,7 @@ export const ClipRow: React.FC<{ clip: Clip; onClick?: () => void }> = ({ clip, 
         
         {/* single virality bar */}
         <div className="w-32">
-          <MiniBar label="Virality" pct={virality} title={`Platform fit: ${platform}%`} />
+          <MiniBar label="Virality" pct={ui.viralityPct} title={`Platform fit: ${platform}%`} />
         </div>
       </div>
 

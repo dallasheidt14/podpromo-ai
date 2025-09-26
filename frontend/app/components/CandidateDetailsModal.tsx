@@ -1,5 +1,6 @@
 "use client";
 import React from "react";
+import { buildScoreBundle } from "../lib/score";
 
 const LABELS: Record<string,string> = {
   hook_score:"Hook", arousal_score:"Arousal", payoff_score:"Payoff",
@@ -21,11 +22,22 @@ function Bar({label, value}:{label:string; value:number}) {
   );
 }
 
+function Row({ label, value }: { label: string; value: string }) {
+  return (
+    <div style={{display:"flex",justifyContent:"space-between",fontSize:12,margin:"4px 0"}}>
+      <span style={{opacity:0.8}}>{label}</span>
+      <span style={{fontWeight:500}}>{value}</span>
+    </div>
+  );
+}
+
 export default function CandidateDetailsModal({
   open, onClose, cand
 }:{ open:boolean; onClose:()=>void; cand:any }) {
   if (!open || !cand) return null;
   const f = cand.features || {};
+  const ui = cand.uiScores ?? buildScoreBundle(cand);
+  
   return (
     <div
       style={{
@@ -46,6 +58,16 @@ export default function CandidateDetailsModal({
         </div>
 
         {cand.why_summary && <p style={{marginTop:8, fontWeight:500}}>{cand.why_summary}</p>}
+
+        <h4 style={{margin:"12px 0 6px"}}>Scores</h4>
+        <div style={{background:"#f8f9fa", padding:12, borderRadius:8, marginBottom:12}}>
+          <Row label="Virality" value={`${ui.viralityPct}%`} />
+          <Row label="Hook" value={`${ui.hookPct}%`} />
+          <Row label="Arousal" value={`${ui.arousalPct}%`} />
+          <Row label="Payoff" value={`${ui.payoffPct}%`} />
+          <Row label="Info Density" value={`${ui.infoPct}%`} />
+          <Row label="Q-list" value={`${ui.qlistPct}%`} />
+        </div>
 
         <h4 style={{margin:"12px 0 6px"}}>Transcript</h4>
         <pre style={{whiteSpace:"pre-wrap", fontSize:14, background:"#fafafa", padding:12, borderRadius:8, border:"1px solid #eee"}}>

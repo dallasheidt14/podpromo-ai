@@ -1583,6 +1583,63 @@ def is_on(_): return True  # temporary until flags are unified
 
 logger = logging.getLogger(__name__)
 
+def _soft_relax_on_zero(pool, min_keep=3):
+    """
+    If gating/pick produced zero, rescue top-K by score.
+    Prefer display_score → fs → score as fallbacks, and use dur, finished, refined, 
+    and terminal punctuation in text to define "finished-like."
+    """
+    if not pool:
+        return []
+    
+    # Score field priority: display_score → fs → score
+    key = None
+    for score_field in ["display_score", "fs", "score"]:
+        if score_field in pool[0]:
+            key = score_field
+            break
+    
+    if key is None:
+        # Last resort: keep incoming order
+        logger.warning("SOFT_RELAX: no score field found, keeping original order")
+        return pool[:min_keep]
+    
+    # Sort by score (descending) and take top-K
+    sorted_pool = sorted(pool, key=lambda c: float(c.get(key, 0.0)), reverse=True)
+    rescued = sorted_pool[:min_keep]
+    
+    logger.info(f"SOFT_RELAX: rescued {len(rescued)} items using {key} field")
+    return rescued
+
+# Environment variable for soft-relax
+import os
+_SOFT_RELAX = os.getenv("FT_SOFT_RELAX_ON_ZERO", "1") != "0"
+
+# Terminal punctuation patterns for finished-like detection
+_TERMINAL_PUNCT = ('.', '!', '?', '…', '."', '!"', '?"')
+
+def _score_of(x):
+    """Best available display score first, then fs, then raw score"""
+    return (x.get('display_score')
+            or x.get('fs')
+            or x.get('score')
+            or 0.0)
+
+def _is_finished_like(x):
+    """Check if a candidate is finished-like based on various indicators"""
+    if x.get('finished') or x.get('refined') or x.get('finished_thought'):
+        return True
+    txt = (x.get('text') or '').rstrip()
+    if not txt:
+        return False
+    if txt.endswith(_TERMINAL_PUNCT):
+        return True
+    # Some pipelines annotate "terminal punctuation kept" as a cap/flag
+    caps = x.get('caps') or []
+    if isinstance(caps, (list, tuple)) and any('TERMINAL_PUNCT' in str(c).upper() for c in caps):
+        return True
+    return False
+
 def _get_platform_mode():
     """
     Decide platform-mode flags from config/env in one place.
@@ -3249,7 +3306,7 @@ class ClipScoreService:
             logger.exception("FORMAT_CANDIDATES_FAIL: falling back to minimal dicts")
             return [self._minimal_candidate_dict(c) for c in finals]
 
-    async def get_candidates(self, episode_id: str, platform: str = "tiktok_reels", genre: str = None) -> List[Dict]:
+    async def get_candidates(self, episode_id: str, platform: str = "tiktok_reels", genre: str = None) -> Tuple[List[Dict], Dict]:
         """Get AI-scored clip candidates for an episode with platform-neutral selection and post-selection platform recommendations"""
         
         # Platform flags: always defined unconditionally at the start
@@ -3345,7 +3402,7 @@ class ClipScoreService:
             
             # Debug: log ft_status from enhanced pipeline
             if viral_result and "clips" in viral_result:
-                ft_statuses = [c.get("ft_status", "missing") for c in viral_result["clips"]]
+                ft_statuses = [c.get("ft_status", "missing") for c in viral_result.get("clips", [])]
                 logger.info(f"Enhanced pipeline ft_statuses: {ft_statuses}")
             
             # Use authoritative fallback mode from enhanced pipeline
@@ -3368,8 +3425,8 @@ class ClipScoreService:
             }
             
             if "error" in viral_result:
-                logger.error(f"Enhanced viral clips pipeline failed: {viral_result['error']}")
-                return []
+                logger.error(f"Enhanced viral clips pipeline failed: {viral_result.get('error', 'Unknown error')}")
+                return [], {"reason": "viral_pipeline_error", "error": viral_result.get('error', 'Unknown error'), "episode_id": episode_id}
             
             clips = viral_result.get('clips', [])
             logger.info(f"Found {len(clips)} viral clips using enhanced pipeline")
@@ -3561,6 +3618,9 @@ class ClipScoreService:
             if len(quality_filtered) >= 6 and len(set(durs)) < 2:
                 logger.warning("DIVERSITY: all candidates have same duration=%s; favoring longer pl_v2 ties", durs[0] if durs else "unknown")
             
+            # Snapshot after quality filtering, before selection
+            post_nms = list(quality_filtered) if quality_filtered else []
+            
             # Log length policy
             logger.info("LENGTH_POLICY: max=90.0, quotas=off, gaussian_weight=0.00, notch_weight=0.00")
             
@@ -3569,6 +3629,9 @@ class ClipScoreService:
             
             # Enforce final soft floor after all gates
             finals = enforce_soft_floor(finals, min_count=3)
+            
+            # Snapshot after selection, before later transforms
+            finals_pre_limits = list(finals) if finals else []
             
             # Soft relax for empty results
             if not finals:
@@ -3589,7 +3652,7 @@ class ClipScoreService:
                     logger.warning("SOFT_SALVAGE: rescued %d clips", len(finals))
                 else:
                     logger.warning("REASON=EMPTY_AFTER_SALVAGE: returning empty list")
-                    return []
+                    return [], {"reason": "empty_after_salvage", "episode_id": episode_id}
             
             # ---- FINISHED-THOUGHT BACKSTOP -----------------------------------------
             # If finals contain zero "finished_thought", promote the best finished clip
@@ -3669,13 +3732,55 @@ class ClipScoreService:
             # Safety pass already completed before quality gate
             candidates_after = len(finals)
             
-            # Pre-save logging
+            # Pre-limit backup: stash finals before any potential zero-out
+            pre_limit_finals = list(finals) if finals else []
+            
+            # Compute finished-like for resilience when finished_required is True but none are marked finished
+            finished_like = [c for c in finals if _is_finished_like(c)]
+            
+            # Check if we require finished but ended with none
+            finals_finished = [c for c in finals if c.get("finished_thought", False)]
+            finished_required = FINISHED_THOUGHT_REQUIRED
+            
+            # If we require finished but ended with none, try finished-like first
+            if finished_required and not finals_finished:
+                if finished_like:
+                    logger.warning("FINISHED_LIKE_RESCUE: using finished-like items when finished_required=True but finished=0")
+                    finals = finished_like
+                    finals_finished = finished_like  # treat as finished-like for return symmetry
+                else:
+                    # Optional safety net via env flag
+                    if _SOFT_RELAX:
+                        logger.warning("SOFT_RELAX_RESCUE: finished_required=True but no finished-like items, applying soft relax")
+                        finals = _soft_relax_on_zero(pre_limit_finals, min_keep=3)
+                        finals_finished = []  # still be honest: these aren't truly "finished"
+            
+            # If still empty, fall back to what we had before any post-limit gates
+            if not finals and pre_limit_finals:
+                logger.warning("FALLBACK_RESCUE: using pre-limit finals as last resort")
+                finals = pre_limit_finals
+                # finals_finished can remain as-is; downstream code should not crash if empty
+            
+            # Pre-save logging with enhanced diagnostics
             logger.info(f"PRE_SAVE: final_count={len(finals)} ids={[c.get('id', 'unknown') for c in finals]}")
+            logger.info(f"PRE_SAVE_DEBUG: finals={len(finals)} finished={len(finals_finished)} finished_like={len([c for c in finals if _is_finished_like(c)])} finished_required={finished_required}")
+            logger.debug(f"PRE_SAVE_DEBUG: pre_limit_backup={len(pre_limit_finals)}, soft_relax_enabled={_SOFT_RELAX}")
             
             # Remove hard assert on zero; degrade gracefully
             if candidates_after == 0:
-                logger.error("NO_CANDIDATES: returning empty set after gating; consider enabling FT_SOFT_RELAX_ON_ZERO=1")
-                return []
+                logger.error("NO_CANDIDATES: returning empty set after gating")
+                
+                # Try soft-relax rescue if enabled
+                if _SOFT_RELAX and pre_limit_finals:
+                    logger.warning("SOFT_RELAX: attempting rescue from pre-limit finals")
+                    rescued = _soft_relax_on_zero(pre_limit_finals, min_keep=3)
+                    if rescued:
+                        logger.warning("SOFT_RELAX: rescued %d finals from pre-limit pool", len(rescued))
+                        # Calculate finished count for rescued items
+                        rescued_finished = [c for c in rescued if c.get("finished_thought", False)]
+                        return rescued, rescued_finished
+                
+                return [], []
             
             # Check finished count and apply early salvage if needed
             pool_finished_count = sum(1 for c in finals if c.get("finished_thought", False))
@@ -3747,8 +3852,7 @@ class ClipScoreService:
                 # If still 0, apply FT_SOFT_RELAX_ON_ZERO
                 if pool_finished_count == 0:
                     logger.warning("SOFT_RELAX: still 0 finished, applying FT_SOFT_RELAX_ON_ZERO")
-                    from services.quality_filters import _is_finished_like
-                    finished_like = [c for c in finals if _is_finished_like(c, fallback=True, tail_close_sec=1.5)[0]]
+                    finished_like = [c for c in finals if _is_finished_like(c)]
                     # Filter out ads from finished_like
                     finished_like = [c for c in finished_like if not c.get("features", {}).get("ad", False)]
                     if finished_like:
@@ -3813,17 +3917,8 @@ class ClipScoreService:
             # Save guard - never crash on empty clips
             if not ranked_clips:
                 logger.warning(f"FINAL_SAVE_EMPTY: episode={episode_id}")
-                meta = {
-                    "reason": "empty_after_salvage",
-                    "episode_id": episode_id,
-                    "platform": platform,
-                    "genre": final_genre,
-                    "fallback_mode": episode_fallback_mode,
-                    "eos_density": eos_density,
-                    "candidate_count": 0,
-                    "default_clip_id": None
-                }
-                return [], meta
+                # still return the correct shape (two lists)
+                return [], []
             
             # Log final summary with pick trace
             finals_finished = sum(1 for c in ranked_clips if c.get("finished_thought", False))
@@ -4069,24 +4164,54 @@ class ClipScoreService:
                 logger.warning("LIMITS_PIPE_EMPTY: restoring %d finals", len(finals_before_limits))
                 final_clips = finals_before_limits
             
+            # Backend compatibility shim: ensure canonical score fields for frontend
+            for clip in final_clips:
+                # Canonicalize virality field (0-1 range)
+                v = clip.get("display_score", clip.get("final_score", clip.get("score", 0.0)))
+                try:
+                    v = float(v)
+                except Exception:
+                    v = 0.0
+                clip["virality"] = v  # 0–1 canonical
+                clip["virality_pct"] = int(round(v * 100))  # convenience for UI
+                
+                # Optional: expose other scores similarly for UI convenience
+                for k in ("hook_score", "arousal_score", "payoff_score", "info_density", "q_list_score"):
+                    if k in clip:
+                        try:
+                            clip[f"{k}_pct"] = int(round(float(clip[k]) * 100))
+                        except Exception:
+                            clip[f"{k}_pct"] = 0
+            
             # Log final summary from the actual finals we're saving
-            _log_final_summary(final_clips, logger)
+            try:
+                _log_final_summary(final_clips, logger)
+            except Exception as e:
+                logger.warning("FINAL_SUMMARY_LOG_ERROR: %s", e)
             
             # Log enhanced run summary with platform context and payoff rescue info
-            durs = [round(float(c.get("end", 0)) - float(c.get("start", 0)), 1) for c in final_clips]
-            durs_str = "[" + ",".join(map(str, durs)) + "]"
-            mode = "platform-aware" if pl_v2_weight > 0 else "neutral"
-            
-            # Update mode if length-agnostic
-            if length_agnostic:
-                mode = "length-agnostic"
-            
-            # Calculate additional summary metrics
-            strict_finished = len([c for c in final_clips if c.get("ft_status") == "finished"])
-            balanced_finished = len([c for c in final_clips if c.get("ft_status") in ["finished", "sparse_finished"]])
-            # Safe telemetry calculation with fallbacks
-            avg_virality = sum(c.get("virality_pct", c.get("display_score", 50)) for c in final_clips) / max(len(final_clips), 1)
-            avg_platform_fit = sum(c.get("platform_fit", c.get("platform_fit_pct", 0)) for c in final_clips) / max(len(final_clips), 1)
+            try:
+                durs = [round(float(c.get("end", 0)) - float(c.get("start", 0)), 1) for c in final_clips]
+                durs_str = "[" + ",".join(map(str, durs)) + "]"
+                mode = "platform-aware" if pl_v2_weight > 0 else "neutral"
+                
+                # Update mode if length-agnostic
+                if length_agnostic:
+                    mode = "length-agnostic"
+                
+                # Calculate additional summary metrics
+                strict_finished = len([c for c in final_clips if c.get("ft_status") == "finished"])
+                balanced_finished = len([c for c in final_clips if c.get("ft_status") in ["finished", "sparse_finished"]])
+                # Safe telemetry calculation with fallbacks
+                avg_virality = sum(c.get("virality_pct", c.get("display_score", 50)) for c in final_clips) / max(len(final_clips), 1)
+                avg_platform_fit = sum(c.get("platform_fit", c.get("platform_fit_pct", 0)) for c in final_clips) / max(len(final_clips), 1)
+            except Exception as e:
+                logger.warning("TELEMETRY_CALC_ERROR: %s", e)
+                # Safe fallbacks
+                durs_str = "[]"
+                mode = "neutral"
+                strict_finished = balanced_finished = 0
+                avg_virality = avg_platform_fit = 0.0
             
             # Count rescued clips
             rescued_count = sum(1 for c in final_clips if c.get("rescue_reason"))
@@ -4149,7 +4274,9 @@ class ClipScoreService:
                 "length_agnostic": length_agnostic,
             }
             
-            return final_clips, meta
+            # Calculate finals_finished for consistent return type
+            finals_finished = [c for c in final_clips if c.get("finished_thought", False)]
+            return final_clips, finals_finished
             
         except Exception as e:
             logger.exception("CANDIDATE_PIPELINE_FAIL: returning finals as-is")
@@ -4164,10 +4291,11 @@ class ClipScoreService:
             # This guarantees: if we've already computed finals, we get clips back
             if final_clips:
                 logger.info(f"SALVAGE_GUARD: returning {len(final_clips)} clips despite error")
-                return [self._minimal_candidate_dict(c) for c in final_clips], meta
+                rescued_finished = [c for c in final_clips if c.get("finished_thought", False)]
+                return [self._minimal_candidate_dict(c) for c in final_clips], rescued_finished
             else:
                 logger.warning("SALVAGE_GUARD: no finals to salvage, returning empty")
-                return [], meta
+                return [], []
 
 async def score_episode(episode, segments):
     """

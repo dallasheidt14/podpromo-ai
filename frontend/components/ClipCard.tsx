@@ -1,12 +1,24 @@
 // components/ClipCard.tsx
 import { ScorePill } from '../ui/ScorePill';
 import { MiniBar } from '../ui/MiniBar';
-import { getViralityPct, getPlatformFitPct } from '../ui/score';
+import { getPlatformFitPct } from '../ui/score';
+import { buildScoreBundle } from '../app/lib/score';
 import type { Clip } from '../types/Clip';
+import { useEffect } from 'react';
 
 export const ClipCard: React.FC<{ clip: Clip; onClick?: () => void }> = ({ clip, onClick }) => {
-  const virality = getViralityPct(clip);
+  const ui = clip.uiScores ?? buildScoreBundle(clip);
   const platform = getPlatformFitPct(clip);
+
+  // Debug logs - remove after testing
+  useEffect(() => {
+    console.log('score fields', {
+      display_score: clip.display_score,
+      final_score: clip.final_score,
+      virality: clip.virality,
+      uiScores: clip.uiScores ?? buildScoreBundle(clip),
+    });
+  }, [clip]);
 
   return (
     <div className="group rounded-2xl border border-slate-200 bg-white shadow-sm hover:shadow-md transition p-3">
@@ -32,8 +44,24 @@ export const ClipCard: React.FC<{ clip: Clip; onClick?: () => void }> = ({ clip,
 
       {/* bars */}
       <div className="space-y-2">
-        <MiniBar label="Virality" pct={virality} />
+        <MiniBar label="Virality" pct={ui.viralityPct} />
         <MiniBar label="Platform fit" pct={platform} title="Length-fit for Shorts/TikTok/Reels" />
+      </div>
+
+      {/* Additional score breakdown */}
+      <div className="grid grid-cols-3 gap-2 mt-2 text-xs">
+        <div className="text-center">
+          <div className="text-gray-500">Hook</div>
+          <div className="font-semibold">{ui.hookPct}%</div>
+        </div>
+        <div className="text-center">
+          <div className="text-gray-500">Arousal</div>
+          <div className="font-semibold">{ui.arousalPct}%</div>
+        </div>
+        <div className="text-center">
+          <div className="text-gray-500">Payoff</div>
+          <div className="font-semibold">{ui.payoffPct}%</div>
+        </div>
       </div>
 
       {/* actions (existing) */}

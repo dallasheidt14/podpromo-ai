@@ -117,7 +117,15 @@ export async function getClips(episodeId: string): Promise<ApiResult<{ clips: Cl
   );
   if (!r.ok) throw new Error(r.error || `clips_http_${r.status ?? "unknown"}`);
   const clips = parseClips<Clip>(r.data);
-  return { ok: true, data: { clips } };
+  
+  // Add uiScores bundle for consistent score display
+  const { buildScoreBundle } = await import("../../app/lib/score");
+  const clipsWithScores = clips.map((c: any) => ({
+    ...c,
+    uiScores: buildScoreBundle(c),
+  }));
+  
+  return { ok: true, data: { clips: clipsWithScores } };
 }
 
 export async function getClipsSimple(episodeId: string): Promise<Clip[]> {
@@ -130,10 +138,15 @@ export async function getClipsSimple(episodeId: string): Promise<Clip[]> {
   // Normalize media URLs to absolute backend URLs (handles "/clips/..." etc.)
   const absolutize = (u?: string) =>
     !u ? u : (u.startsWith("http://") || u.startsWith("https://")) ? u : apiUrl(u);
+  
+  // Add uiScores bundle for consistent score display
+  const { buildScoreBundle } = await import("../../app/lib/score");
+  
   return clips.map((c: any) => ({
     ...c,
     preview_url: absolutize(c.preview_url || c.previewUrl || c.video_url),
     audio_url: absolutize(c.audio_url || c.audioUrl),
+    uiScores: buildScoreBundle(c),
   }));
 }
 
