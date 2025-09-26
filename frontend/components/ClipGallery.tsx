@@ -7,6 +7,7 @@ import { getClipsSimple, apiUrl, type ClipSimple } from "../src/shared/api";
 import { onClipsReady } from "../src/shared/events";
 import { PreviewPlayer } from "../src/components/PreviewPlayer";
 import { fmtTimecode } from "../src/utils/timecode";
+import { toPct } from "../app/lib/metrics";
 
 // Utility functions for virality and platform fit
 function getViralityPct(clip: Clip): number {
@@ -418,7 +419,7 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
                       const virality = getViralityPct(clip);
                       return typeof clip.score === "number" && virality === 0 && (
                         <span className="shrink-0 rounded-full bg-gradient-to-r from-blue-500 to-blue-600 px-3 py-1.5 text-xs font-bold text-white shadow-lg">
-                          ⭐ {Math.round(clip.score * 100)}/100
+                          ⭐ {toPct(clip.score)}/100
                         </span>
                       );
                     })()}
@@ -500,7 +501,7 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
           {selected?.score && (
             <div className="mb-6">
               <div className="text-4xl font-bold text-gray-900">
-                {Math.round((selected.score * 100))}
+                {toPct(selected.score)}
                 <span className="text-2xl text-gray-500">/100</span>
               </div>
             </div>
@@ -537,7 +538,7 @@ export default function ClipGallery({ clips, emptyMessage = "No clips yet.", onC
                 ].map(({ key, name, weight, description }) => {
                   // Get score from features object (normalized in normalize.ts)
                   const score = selected.features?.[key] || 0;
-                  const percentage = Math.round(score * 100);
+                  const percentage = toPct(score);
                   
                   return (
                     <div
