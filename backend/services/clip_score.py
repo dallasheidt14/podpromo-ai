@@ -3167,17 +3167,62 @@ class ClipScoreService:
 
     def _format_one(self, c):
         """Format a single clip with bulletproof field access."""
+        # Extract virality and individual scores
+        virality = float(self._safe_get(c, "virality_raw", 0.0))
+        
+        # Individual score fields (0-1)
+        scores = {
+            "hook_score": float(self._safe_get(c, "hook_score", 0.0)),
+            "arousal_score": float(self._safe_get(c, "arousal_score", 0.0)),
+            "emotion_score": float(self._safe_get(c, "emotion_score", 0.0)),
+            "question_score": float(self._safe_get(c, "question_score", 0.0)),
+            "payoff_score": float(self._safe_get(c, "payoff_score", 0.0)),
+            "info_density": float(self._safe_get(c, "info_density", 0.0)),
+            "loopability": float(self._safe_get(c, "loopability", 0.0)),
+            "platform_len_match": float(self._safe_get(c, "platform_len_match", 0.0)),
+        }
+        
+        # Generate eager title
+        title = None
+        title_suggestions = []
+        try:
+            from services.titles_service import TitlesService
+            ts = TitlesService()
+            # Use the existing ensure_titles_for_clip method
+            title_data = ts.ensure_titles_for_clip(c, platform="shorts")
+            if title_data:
+                title = title_data.get("chosen") or title_data.get("overlay")
+                title_suggestions = title_data.get("variants", [])
+        except Exception as e:
+            logger.warning("TITLE_GEN_FAIL %s: %s", c.get("id", "unknown"), e)
+        
         return {
             "id": c["id"],
             "start": c.get("start"),
             "end": c.get("end"),
             "duration": round(c.get("duration", (c.get("end", 0) - c.get("start", 0))), 1),
             "display_score": int(round(self._safe_get(c, "display_score", 50))),
-            "virality_calibrated": float(self._safe_get(c, "virality_raw", 0.0)),
-            "virality_pct": int(round(self._safe_get(c, "virality_raw", 0.0) * 100)),
+            "text": (c.get("text") or "")[:240],
+            
+            # Virality fields (both 0-1 and 0-100)
+            "virality": virality,
+            "virality_calibrated": virality,
+            "virality_pct": int(round(virality * 100)),
+            
+            # Platform fit fields
             "platform_fit": float(self._safe_get(c, "platform_len", 0.0)),
             "platform_fit_pct": int(round(self._safe_get(c, "platform_len", 0.0) * 100)),
-            "text": (c.get("text") or "")[:240],
+            
+            # Individual scores (0-1)
+            **scores,
+            
+            # Score percentages (belt-and-suspenders)
+            "score_pct": {k: int(round(v * 100)) for k, v in scores.items()},
+            
+            # Title fields
+            "title": title,
+            "title_suggestions": title_suggestions,
+            
             # keep any extra fields safely
             "meta": {k: v for k, v in c.items() if k not in {"id", "start", "end", "duration", "text"}}
         }
