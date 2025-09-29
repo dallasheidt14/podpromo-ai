@@ -94,11 +94,23 @@ def score_hook_v5_enhanced(
     cfg = get_config().get("hook_v5", {})
     _compile_family_patterns(cfg)
 
+    # Import hook constants
+    from services.secret_sauce_pkg.features import (
+        HOOK_FIRST_CLAUSE_WINDOW,
+        HOOK_MICRO_RETRIM_MAX_TOKENS, HOOK_MICRO_RETRIM_STEP_BONUS, HOOK_MICRO_RETRIM_MAX_BONUS,
+        HOOK_HEDGE_LOOKAHEAD_TOKENS, HOOK_HEDGE_SOFTEN_FACTOR,
+        HOOK_START_FILLERS, HOOK_STRONG_STARTERS,
+    )
+
     k = float(cfg.get("proximity_k_words", 5.0))
     maxw = int(cfg.get("max_words_considered", 40))
     syn_cfg = cfg.get("synergy", {})
     anti_pen = float(cfg.get("anti_intro", {}).get("penalty", 0.05))
     need_after = int(cfg.get("evidence", {}).get("require_after_words", 12))
+    
+    # Use the new first clause window
+    clause_window = cfg.get("first_clause_window", HOOK_FIRST_CLAUSE_WINDOW)
+    print(f"HOOK: clause_window={clause_window}")
 
     toks = TOKS_EARLY.findall(t_lower)[:maxw]
     early = " ".join(toks[:need_after])
@@ -123,7 +135,52 @@ def score_hook_v5_enhanced(
     for name, val in fam_scores.items():
         base += float(family_weights.get(name, 0.15)) * float(val)
 
+    # Micro re-trim: find peak hook cue within first N tokens
+    peak_j = None
+    max_j = min(HOOK_MICRO_RETRIM_MAX_TOKENS, max(0, len(toks) - 1))
+    for j in range(0, max_j + 1):
+        t = toks[j].lower()
+        # allow matching multi-word phrases cheaply by also peeking at j+1
+        t2 = (t + " " + toks[j+1].lower()) if j + 1 < len(toks) else t
+        if (t in HOOK_STRONG_STARTERS) or ("truth" in t2) or ("need" in t2) or ("nobody" in t2):
+            peak_j = j
+            break
+
+    micro_retrim_bonus = 0.0
+    if peak_j is not None and peak_j > 0:
+        micro_retrim_bonus = min(HOOK_MICRO_RETRIM_MAX_BONUS, HOOK_MICRO_RETRIM_STEP_BONUS * peak_j)
+        base += micro_retrim_bonus
+        print(f"HOOK: micro_retrim j={peak_j} +{micro_retrim_bonus:.3f}")
+
     reasons: List[str] = []
+    
+    # Hedge penalty softening: if a hedge appears among the first 3 tokens but the next few tokens
+    # contain a strong, non-filler word, reduce the penalty.
+    try:
+        first_tokens = [t.lower() for t in toks[:3]]
+        lookahead = [t.lower() for t in toks[3:3 + HOOK_HEDGE_LOOKAHEAD_TOKENS]]
+        has_early_hedge = any(t in HOOK_START_FILLERS for t in first_tokens)
+        has_strong_follow = any(
+            (len(t) > 2 and t not in HOOK_START_FILLERS) or (t in HOOK_STRONG_STARTERS)
+            for t in lookahead
+        )
+        
+        hedge_pen = float(cfg.get("anti_intro", {}).get("hedge_penalty", 0.03))
+        if has_early_hedge and has_strong_follow and hedge_pen > 0:
+            hedge_pen *= HOOK_HEDGE_SOFTEN_FACTOR
+            reasons.append("hedge_softened")
+            print(f"HOOK: hedge_soften applied (lookahead strong) "
+                  f"-{hedge_pen/HOOK_HEDGE_SOFTEN_FACTOR:.3f}→-{hedge_pen:.3f}")
+        elif has_early_hedge:
+            reasons.append("hedge_penalty")
+            print(f"HOOK: hedge_penalty applied")
+        
+        if has_early_hedge:
+            base = max(0.0, base - hedge_pen)
+    except Exception:
+        # fail-safe: don't break scoring if tokenization differs
+        pass
+    
     dbg: Dict = {
         "fam_scores": {k: round(float(v), 4) for k, v in fam_scores.items()},
         "fam_hits": fam_spans,
@@ -131,6 +188,8 @@ def score_hook_v5_enhanced(
         "evidence_score": round(evidence_score, 4),
         "evidence_types": evidence_types,
         "early_token_count": len(toks[:need_after]),
+        "micro_retrim_bonus": round(micro_retrim_bonus, 4),
+        "peak_j": peak_j,
     }
 
     first_clause = re.split(r"[.!?]\s+", text, maxsplit=1)[0][:180]
@@ -143,12 +202,7 @@ def score_hook_v5_enhanced(
         reasons.append("evidence_cap_0.20")
     dbg["evidence_ok"] = evidence_ok
 
-    if HEDGE_RE.search(t_lower):
-        base *= 0.95
-        reasons.append("hedge_soften")
-        dbg["hedge_soften"] = True
-    else:
-        dbg["hedge_soften"] = False
+    # Hedge logic moved to earlier in the function (hedge softening)
 
     syn_bonus = 0.0
     if arousal >= float(syn_cfg.get("arousal_gate", 0.60)):
@@ -160,6 +214,7 @@ def score_hook_v5_enhanced(
     syn_bonus = min(syn_bonus, float(syn_cfg.get("cap_total", 0.08)))
     if syn_bonus:
         base += syn_bonus
+        print(f"HOOK: synergy bonus q_or_list={q_or_list:.3f} arousal={arousal:.3f} +{syn_bonus:.3f}")
     dbg["synergy"] = {"arousal": round(arousal, 3), "q_or_list": round(q_or_list, 3), "bonus": round(syn_bonus, 4)}
 
     if audio_data is not None and sr is not None:

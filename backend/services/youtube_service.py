@@ -46,7 +46,7 @@ def _ydl_opts_base() -> dict:
         'no_warnings': True,
         'extract_flat': False,
         'socket_timeout': YOUTUBE_TIMEOUT,
-        'format': 'best[height<=720]/best',
+        'format': 'best[height<=720]/best[height<=1080]/best',
         'writesubtitles': False,
         'writeautomaticsub': False,
         # Safe headers to look like a real browser
@@ -100,6 +100,9 @@ def _opts_for(mode: str) -> dict:
             o["cookiefile"] = src
         elif kind == "browser":
             o["cookiesfrombrowser"] = (src,)
+    
+    # Add more flexible format selection
+    o['format_sort'] = ['res:720', 'ext:mp4:m4a', 'res:480', 'ext:webm', 'res:360']
     return o
 
 _COOKIE_ERRORS = (
@@ -144,6 +147,9 @@ def probe(url: str) -> VideoMeta:
         except (DownloadError, ExtractorError) as e:
             last_err = str(e)
             logger.warning("Probe attempt failed [%s]: %s", mode, last_err)
+            # Log more details for format errors
+            if "format is not available" in last_err:
+                logger.warning("Format error detected - YouTube may have changed available formats")
             continue
         except ValueError:
             raise
@@ -175,7 +181,7 @@ def download_and_prepare(url: str, episode_id: str) -> dict:
             opts = _opts_for(mode)
             opts.update({
                 'outtmpl': f'{UPLOAD_DIR}/{episode_id}.%(ext)s',
-                'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
+                'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]/best'
             })
             
             with YoutubeDL(opts) as ydl:

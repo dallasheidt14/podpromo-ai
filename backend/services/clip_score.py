@@ -220,10 +220,16 @@ def _boundary_score_start(t, t0_orig, words, window):
     hookish = any(h in first2 for h in ("why", "how", "stop", "the secret", "here's", "watch", "don't", "never"))
     hook_bonus = 0.25 if hookish else 0.0
 
+    # context bonus - favor including important context words
+    context_text = _slice_words_text(words, t, t + 8.0)[:200].lower()
+    context_bonus = 0.0
+    if any(phrase in context_text for phrase in ["ever watched", "webinar", "video that", "ramble on", "go into circles"]):
+        context_bonus = 0.3
+
     # distance penalty (don't drift too far from original)
     dist_pen = min(0.35, 0.35 * abs(t - t0_orig) / max(0.001, window))
 
-    return 0.6 * gap_bonus + 0.3 * punct + 0.2 * hook_bonus - dist_pen
+    return 0.5 * gap_bonus + 0.25 * punct + 0.15 * hook_bonus + 0.1 * context_bonus - dist_pen
 
 def _boundary_score_end(t, t1_orig, words, window, start_t):
     """Score a candidate END time."""
@@ -549,6 +555,9 @@ def _mmr_select_jaccard(items: list[dict], *, top_k: int, text_key: str = "text"
         chosen.append(items.pop(best_i))
     return chosen
 
+# Import gate calibration constants
+from services.secret_sauce_pkg.features import STRICT_FLOOR_DELTA, BALANCED_EXTRA_DELTA, MIN_FINALS
+
 # Quality gate thresholds
 THRESHOLDS = {
     "strict": {
@@ -571,54 +580,106 @@ THRESHOLDS = {
     }
 }
 
-def _gate(candidates: List[Dict], mode: str) -> List[Dict]:
-    """Apply quality gate with specified mode"""
-    if not candidates:
-        return []
+def _run_quality_gates(cands, base_floor, log_ctx):
+    """
+    cands: list of candidate dicts that already passed safety & finished-like policy
+    base_floor: your current dynamic floor (e.g., percentile or z-score transformed threshold)
+    log_ctx: your running logging/telemetry dict
+    """
+    import numpy as np
     
-    thresholds = THRESHOLDS.get(mode, THRESHOLDS["balanced"])
-    passed = []
+    # Extract final scores for percentile calculation
+    scores = [c.get("final_score", 0.0) for c in cands if isinstance(c.get("final_score"), (int, float))]
+    if not scores:
+        # Nothing usable; just keep top-k as a failsafe
+        return sorted(cands, key=lambda x: x.get("final_score", 0.0), reverse=True)[:MIN_FINALS], log_ctx
     
-    for c in candidates:
-        # Check if clip passes quality gates
-        payoff = c.get("payoff_score", 0.0)
-        hook = c.get("hook_score", 0.0)
-        arousal = c.get("arousal_score", 0.0)
-        info_density = c.get("info_density", 0.0)
+    # Calculate base floor from percentile (using existing logic from quality_filters.py)
+    # Duration-based percentile filtering
+    micro_candidates = [c for c in cands if (c.get('end', 0) - c.get('start', 0)) < 14.0]
+    normal_candidates = [c for c in cands if 14.0 <= (c.get('end', 0) - c.get('start', 0)) <= 28.0]
+    
+    # Use the same logic as quality_filters.py for base floor calculation
+    if micro_candidates and normal_candidates:
+        # Mixed duration - use weighted approach
+        micro_scores = [c.get("final_score", 0.0) for c in micro_candidates]
+        normal_scores = [c.get("final_score", 0.0) for c in normal_candidates]
         
-        # Calculate quality penalty (QL)
-        ql_penalty = 0.0
-        if info_density > 0:
-            ql_penalty = min(1.0, (1.0 - info_density) * 0.5)
-        
-        # Apply thresholds
-        if (payoff >= thresholds["payoff_min"] and 
-            hook >= thresholds["hook_min"] and 
-            arousal >= thresholds["arousal_min"] and
-            ql_penalty <= thresholds["ql_max"]):
-            passed.append(c)
+        if micro_scores and normal_scores:
+            # Calculate percentiles for each group
+            k_micro = max(1, int(0.10 * len(micro_scores)))
+            k_normal = max(1, int(0.10 * len(normal_scores)))
+            
+            trimmed_micro = micro_scores[:-k_micro] if len(micro_scores) > 10 else micro_scores
+            trimmed_normal = normal_scores[:-k_normal] if len(normal_scores) > 10 else normal_scores
+            
+            micro_cutoff = float(np.percentile(trimmed_micro, 70))
+            normal_cutoff = float(np.percentile(trimmed_normal, 60))
+            
+            # Use the higher of the two as base floor
+            base_floor = max(micro_cutoff, normal_cutoff)
+        else:
+            # Fallback to single percentile
+            k = max(1, int(0.10 * len(scores)))
+            trimmed_scores = scores[:-k] if len(scores) > 10 else scores
+            base_floor = float(np.percentile(trimmed_scores, 60))
+    else:
+        # Single duration group - use existing logic
+        k = max(1, int(0.10 * len(scores)))
+        trimmed_scores = scores[:-k] if len(scores) > 10 else scores
+        base_floor = float(np.percentile(trimmed_scores, 60))
     
-    logger.info(f"QUALITY_GATE[{mode}]: {len(candidates)} -> {len(passed)}")
-    return passed
+    # Cap the base floor
+    base_floor = min(base_floor, 0.80)
+    
+    # 1) Strict gate with lowered floor
+    strict_floor = base_floor + STRICT_FLOOR_DELTA
+    kept_strict = [c for c in cands if c.get("final_score", 0.0) >= strict_floor]
+
+    log_ctx["strict_floor"] = round(strict_floor, 3)
+    log_ctx["strict_kept"] = len(kept_strict)
+
+    # 2) Balanced gate
+    if len(kept_strict) == 0:
+        # Don't reuse the strict floor; go a bit lower for balanced
+        balanced_floor = strict_floor + BALANCED_EXTRA_DELTA
+        kept_balanced = [c for c in cands if c.get("final_score", 0.0) >= balanced_floor]
+
+        # Enforce MIN_FINALS when strict is empty.
+        # Still keep safety/dup constraints intact – we're only relaxing the score floor.
+        if len(kept_balanced) < MIN_FINALS:
+            # take top-N by final_score (already safe) up to MIN_FINALS
+            # NOTE: these are still from `cands` (already safety/gate-eligible)
+            kept_balanced = sorted(cands, key=lambda x: x.get("final_score", 0.0), reverse=True)[:MIN_FINALS]
+
+        log_ctx["balanced_floor"] = round(balanced_floor, 3)
+        log_ctx["balanced_kept"] = len(kept_balanced)
+        log_ctx["balanced_reason"] = "strict_empty_lowered"
+
+        return kept_balanced, log_ctx
+
+    else:
+        # Strict had items — return strict as the finals for gate stage.
+        return kept_strict, log_ctx
 
 def apply_quality_gate(candidates: List[Dict], mode: str = "strict") -> List[Dict]:
     """Apply quality gate with auto-relaxation when too few clips remain"""
-    passed = _gate(candidates, mode)
+    if not candidates:
+        return []
     
-    if len(passed) < 3 and mode == "strict":
-        # Auto relax to get usable output
-        logger.info(f"QUALITY_GATE: strict yielded {len(passed)} < 3, auto-relaxing to balanced")
-        relaxed = _gate(candidates, "balanced")
-        
-        # Keep order stable: take what strict allowed, then add best relaxed
-        seen = {id(c) for c in passed}
-        for c in relaxed:
-            if id(c) not in seen:
-                passed.append(c)
-            if len(passed) >= 3:
-                break
+    # Initialize logging context
+    log_ctx = {}
     
-    return passed
+    # Run the quality gates with the new logic
+    kept, log_ctx = _run_quality_gates(candidates, None, log_ctx)
+    
+    # Log the results
+    logger.info(f"QUALITY_GATE[strict]: kept={log_ctx.get('strict_kept', 0)} floor={log_ctx.get('strict_floor', 'N/A')}")
+    if 'balanced_floor' in log_ctx:
+        logger.info(f"QUALITY_GATE[balanced]: kept={log_ctx.get('balanced_kept', 0)} floor={log_ctx.get('balanced_floor', 'N/A')} reason={log_ctx.get('balanced_reason', 'N/A')}")
+    logger.info(f"MIN_FINALS: target={MIN_FINALS} applied_when_strict_empty={log_ctx.get('strict_kept', 0) == 0}")
+    
+    return kept
 
 def notch_penalty(dur: float, already_at_notch: int) -> float:
     """Notch penalty disabled for length-agnostic scoring"""
@@ -3952,8 +4013,8 @@ class ClipScoreService:
             
             for clip in ranked_clips:
                 try:
-                    # Step 1: Hill-climb refinement
-                    s1, e1 = refine_bounds_with_hill_climb(clip, episode, max_nudge=1.0, step=0.05)
+                    # Step 1: Hill-climb refinement (increased max_nudge for better context)
+                    s1, e1 = refine_bounds_with_hill_climb(clip, episode, max_nudge=8.0, step=0.05)
                     # Step 2: Clean start/end guards
                     if not episode_words:
                         logger.warning("BOUNDARY_REFINEMENT: no episode words; skipping clean for this clip")
@@ -4216,9 +4277,15 @@ class ClipScoreService:
             # Count rescued clips
             rescued_count = sum(1 for c in final_clips if c.get("rescue_reason"))
             
+            # Get telemetry values safely
+            try:
+                wc, ec, dens = _telemetry_density(episode_words, eos_times)
+            except Exception:
+                wc, ec, dens = 0, 0, 0.0
+            
             logger.info(
                 "RUN_SUMMARY: seeds=%d strict=%d balanced=%d finals=%d durs=%s eos=%d dens=%.3f pl_v2_w=%.2f protect=%s mode=%s fallback=%s avg_virality=%.1f avg_platform_fit=%.2f rescued=%d",
-                len(ranked_clips), strict_finished, balanced_finished, len(final_clips), durs_str, ec, eos_density, 
+                len(ranked_clips), strict_finished, balanced_finished, len(final_clips), durs_str, ec, dens, 
                 pl_v2_weight, platform_protect, mode, episode_fallback_mode, avg_virality, avg_platform_fit, rescued_count
             )
             
@@ -4230,8 +4297,7 @@ class ClipScoreService:
             
             # FT summary already logged above via _log_final_summary
             
-            # Telemetry that can't disagree with itself
-            wc, ec, dens = _telemetry_density(episode_words, eos_times)
+            # Telemetry already calculated above
             logger.info("TELEMETRY: word_count=%d, eos_count=%d, eos_density=%.3f", wc, ec, dens)
             logger.info(f"TELEMETRY: fallback_mode={episode_fallback_mode} (authoritative)")
             

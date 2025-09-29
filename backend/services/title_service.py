@@ -1113,7 +1113,145 @@ def fix_title(title: str) -> str:
     
     return title
 
-# ---------- Title generation templates ----------
+# ---------- Content Analysis Functions ----------
+def _analyze_content_insights(text: str) -> dict:
+    """Extract specific insights, emotions, and key concepts from content"""
+    insights = {
+        'emotion': 'neutral',  # excited, concerned, confident, etc.
+        'urgency': 'low',      # high, medium, low
+        'specifics': [],       # numbers, names, concrete details
+        'contrast': [],        # before/after, right/wrong, etc.
+        'actionable': []       # steps, tips, advice
+    }
+    
+    text_lower = text.lower()
+    
+    # Detect emotional tone
+    if any(word in text_lower for word in ['amazing', 'incredible', 'shocking', 'surprising', 'breakthrough', 'revolutionary']):
+        insights['emotion'] = 'excited'
+    elif any(word in text_lower for word in ['concerned', 'worried', 'problem', 'issue', 'failing', 'struggling']):
+        insights['emotion'] = 'concerned'
+    elif any(word in text_lower for word in ['confident', 'proven', 'successful', 'effective', 'works']):
+        insights['emotion'] = 'confident'
+    
+    # Detect urgency
+    if any(word in text_lower for word in ['urgent', 'immediately', 'right now', 'critical', 'emergency', 'asap']):
+        insights['urgency'] = 'high'
+    elif any(word in text_lower for word in ['soon', 'quickly', 'fast', 'rapid', 'swift']):
+        insights['urgency'] = 'medium'
+    
+    # Extract specific numbers, percentages, timeframes
+    specifics = re.findall(r'\b(\d+%?|\$\d+[kmb]?|\d+\s*(?:years?|months?|days?|hours?|minutes?))\b', text_lower)
+    insights['specifics'] = specifics[:3]  # Limit to top 3
+    
+    # Detect contrast patterns
+    contrast_words = ['vs', 'versus', 'instead', 'rather', 'but', 'however', 'although', 'while']
+    if any(word in text_lower for word in contrast_words):
+        insights['contrast'] = ['contrast_detected']
+    
+    # Detect actionable content
+    action_words = ['how to', 'steps', 'method', 'process', 'technique', 'approach', 'strategy']
+    if any(phrase in text_lower for phrase in action_words):
+        insights['actionable'] = ['actionable_detected']
+    
+    return insights
+
+def _extract_meaningful_keywords(text: str, max_terms: int = 5) -> List[str]:
+    """Extract keywords that actually matter for titles"""
+    if not text:
+        return []
+    
+    # Remove filler and normalize
+    clean_text = normalize_text(text)
+    keywords = []
+    
+    # 1. Numbers and specific values (highest priority)
+    numbers = re.findall(r'\b\d+[%$kmb]?\b', clean_text)
+    keywords.extend(numbers[:2])
+    
+    # 2. Action words and outcomes (prioritize these)
+    action_words = re.findall(r'\b(?:achieve|create|build|solve|improve|increase|reduce|eliminate|master|learn|develop|know|want|do|think|feel|believe|understand|realize|discover|creating|building|solving|improving|learning|developing|converting|selling|marketing|growing|scaling)\w*\b', clean_text.lower())
+    keywords.extend([w.title() for w in action_words[:3]])
+    
+    # 3. Domain-specific terms
+    domain_terms = re.findall(r'\b(?:strategy|method|approach|system|process|framework|model|technique|principle|school|education|career|life|identity|self|purpose|passion|dream|goal|future)\b', clean_text.lower())
+    keywords.extend([w.title() for w in domain_terms[:2]])
+    
+    # 4. Important concepts (longer words that aren't stop words) - prioritize these
+    words = re.findall(r'\b[A-Za-z]{4,}\b', clean_text.lower())
+    important_words = [w for w in words if w not in STOP_WORDS and len(w) > 4]
+    # Filter out generic words that aren't meaningful for titles
+    generic_words = {'does', 'again', 'honestly', 'really', 'actually', 'basically', 'literally', 'obviously', 'clearly', 'definitely', 'probably', 'maybe', 'sometimes', 'always', 'never', 'often', 'usually', 'normally', 'typically', 'generally', 'mostly', 'mainly', 'primarily', 'especially', 'particularly', 'specifically', 'exactly', 'precisely', 'absolutely', 'completely', 'totally', 'entirely', 'perfectly', 'exactly', 'precisely', 'absolutely', 'completely', 'totally', 'entirely', 'perfectly'}
+    meaningful_words = [w for w in important_words if w not in generic_words]
+    # Take the most frequent meaningful words
+    word_counts = Counter(meaningful_words)
+    top_words = [word.title() for word, count in word_counts.most_common(3)]
+    keywords.extend(top_words)
+    
+    # 5. Proper nouns and entities (only if they're meaningful, not common words)
+    entities = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', clean_text)
+    # Filter out common words that happen to be capitalized
+    common_caps = {'But', 'You', 'I', 'The', 'This', 'That', 'What', 'When', 'Where', 'Why', 'How', 'Always', 'Never', 'Sometimes', 'Really', 'Actually', 'Exactly', 'Definitely', 'Probably', 'Maybe', 'Just', 'Only', 'Even', 'Still', 'Already', 'Also', 'Too', 'Very', 'Really', 'Quite', 'Pretty', 'Rather', 'Fairly', 'Somewhat', 'Kind', 'Sort', 'Type', 'Way', 'Thing', 'Things', 'Stuff', 'Something', 'Anything', 'Nothing', 'Everything', 'Someone', 'Anyone', 'Noone', 'Everyone'}
+    meaningful_entities = [e for e in entities if e not in common_caps and len(e) > 3]
+    keywords.extend(meaningful_entities[:2])
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_keywords = []
+    for kw in keywords:
+        if kw.lower() not in seen and len(kw) > 2:
+            seen.add(kw.lower())
+            unique_keywords.append(kw)
+    
+    return unique_keywords[:max_terms]
+
+# ---------- Content-Aware Title Templates ----------
+CONTENT_AWARE_TEMPLATES = {
+    'excited': [
+        "The {specific} That Changed Everything",
+        "Why {topic} Is {specific} (And Why It Matters)",
+        "The {topic} Breakthrough Nobody Saw Coming",
+        "How {topic} Just Got {specific}",
+        "The {topic} Revolution That's Here"
+    ],
+    'concerned': [
+        "The {topic} Problem Everyone's Ignoring",
+        "Why {topic} Is Failing (And How to Fix It)",
+        "The Hidden Risk in {topic}",
+        "What's Really Wrong With {topic}",
+        "The {topic} Crisis Nobody Talks About"
+    ],
+    'confident': [
+        "The {topic} Method That Actually Works",
+        "Why {topic} Is the {specific} Solution",
+        "The {topic} Approach That Gets Results",
+        "How {topic} Delivers {specific}",
+        "The {topic} Strategy That Never Fails"
+    ],
+    'actionable': [
+        "The {number} {topic} Rules That Actually Work",
+        "How to {action} in {timeframe}",
+        "The {topic} Method That Saves {benefit}",
+        "Step-by-Step: {topic} That Works",
+        "The {topic} Process Everyone Should Know"
+    ],
+    'contrast': [
+        "Why {old_way} Fails (And {new_way} Works)",
+        "The {topic} Difference Between Success and Failure",
+        "What {topic} Experts Do Differently",
+        "The {topic} Truth vs. The {topic} Myth",
+        "Why {topic} A Works But {topic} B Doesn't"
+    ],
+    'default': [
+        "The {topic} Insight That Changes Everything",
+        "Why {topic} Matters More Than You Think",
+        "The {topic} Approach That Actually Works",
+        "What {topic} Really Means",
+        "The {topic} Method That Gets Results"
+    ]
+}
+
+# ---------- Legacy Title Templates (kept for fallback) ----------
 TITLE_TEMPLATES = [
     # Decision-focused
     "Ask This Before You Decide",
@@ -1188,40 +1326,110 @@ def extract_topic(text: str) -> str:
     # Use the first filtered term as topic
     return filtered_terms[0].title()
 
+def _generate_dynamic_titles(text: str, platform: str) -> List[str]:
+    """Generate titles based on actual content analysis"""
+    if not text:
+        return ["Quick Tip", "Coach's Insight", "One Thing Most Players Miss"]
+    
+    insights = _analyze_content_insights(text)
+    keywords = _extract_meaningful_keywords(text)
+    
+    titles = []
+    
+    # Use the most specific keyword as the main topic
+    main_topic = keywords[0] if keywords else "This Strategy"
+    
+    # Get template category based on insights
+    template_category = 'default'
+    if insights['actionable']:
+        template_category = 'actionable'
+    elif insights['contrast']:
+        template_category = 'contrast'
+    elif insights['emotion'] != 'neutral':
+        template_category = insights['emotion']
+    
+    # Generate titles using content-aware templates
+    templates = CONTENT_AWARE_TEMPLATES.get(template_category, CONTENT_AWARE_TEMPLATES['default'])
+    
+    for template in templates[:3]:  # Use top 3 templates
+        try:
+            # Replace placeholders with actual content
+            title = template.format(
+                topic=main_topic,
+                specific=insights['specifics'][0] if insights['specifics'] else "Game-Changing",
+                number=insights['specifics'][0] if insights['specifics'] and insights['specifics'][0].isdigit() else "3",
+                action=keywords[1] if len(keywords) > 1 else "Succeed",
+                timeframe=insights['specifics'][0] if insights['specifics'] else "30 Days",
+                benefit="Time" if 'time' in text.lower() else "Results",
+                old_way=keywords[0] if keywords else "Old Method",
+                new_way=keywords[1] if len(keywords) > 1 else "New Method"
+            )
+            titles.append(title)
+        except (KeyError, IndexError):
+            # If template formatting fails, use a simple fallback
+            titles.append(f"The {main_topic} Approach That Works")
+    
+    # Add question-based titles if content has questions
+    if '?' in text:
+        titles.append(f"What {main_topic} Really Means")
+        titles.append(f"Why {main_topic} Matters More Than You Think")
+    
+    # Add specific number-based titles if we have specifics
+    if insights['specifics']:
+        specific = insights['specifics'][0]
+        titles.append(f"The {specific} {main_topic} That Actually Works")
+    
+    # Remove duplicates and limit
+    seen = set()
+    unique_titles = []
+    for title in titles:
+        if title.lower() not in seen:
+            seen.add(title.lower())
+            unique_titles.append(title)
+    
+    return unique_titles[:6]
+
 def make_titles(text: str) -> List[str]:
     """Generate titles using improved heuristics with real text"""
     if not text:
         return ["Quick Tip", "Coach's Insight", "One Thing Most Players Miss"]
     
-    # Normalize contractions first
-    normalized_text = _normalize_contractions(text)
-    terms = key_terms(normalized_text, max_terms=4)
-    options = []
+    # Use the new dynamic title generation
+    dynamic_titles = _generate_dynamic_titles(text, "default")
     
-    if terms:
-        head = " ".join(t.capitalize() for t in terms[:2])
-        options += [
-            f"Stop Ignoring {head}",
-            f"{head}: The Mistake Everyone Makes",
-            f"Do This to Improve {terms[0].capitalize()}",
-            f"Why {terms[0].capitalize()} Matters More Than You Think",
-        ]
+    # Fallback to old method if dynamic generation fails
+    if not dynamic_titles:
+        # Normalize contractions first
+        normalized_text = _normalize_contractions(text)
+        terms = key_terms(normalized_text, max_terms=4)
+        options = []
+        
+        if terms:
+            head = " ".join(t.capitalize() for t in terms[:2])
+            options += [
+                f"Stop Ignoring {head}",
+                f"{head}: The Mistake Everyone Makes",
+                f"Do This to Improve {terms[0].capitalize()}",
+                f"Why {terms[0].capitalize()} Matters More Than You Think",
+            ]
+        
+        # Add a direct, cleaned sentence if present
+        sentences = text.strip().split(".")
+        if sentences:
+            s = sentences[0].strip()[:80]
+            if len(s) > 12:
+                options.append(s.strip() + "…")
+        
+        # Dedupe & cap to 6
+        seen, deduped = set(), []
+        for t in options:
+            if t not in seen:
+                seen.add(t)
+                deduped.append(t)
+        
+        return deduped[:6]
     
-    # Add a direct, cleaned sentence if present
-    sentences = text.strip().split(".")
-    if sentences:
-        s = sentences[0].strip()[:80]
-        if len(s) > 12:
-            options.append(s.strip() + "…")
-    
-    # Dedupe & cap to 6
-    seen, deduped = set(), []
-    for t in options:
-        if t not in seen:
-            seen.add(t)
-            deduped.append(t)
-    
-    return deduped[:6]
+    return dynamic_titles
 
 # Ad detection markers (moved to _looks_like_ad function)
 
@@ -1271,10 +1479,10 @@ def generate_titles(
                 limit = PLAT_LIMITS.get(platform, PLAT_LIMITS["default"])
                 cleaned = [_soft_clean(x["title"] if isinstance(x, dict) else str(x)) for x in v2_results]
                 cleaned = [t[:limit].rstrip(" .,!?;:") for t in cleaned]  # hard clip to limit
-                # Rank by social score + coherence with clip content
+                # Rank by new quality scoring + coherence with clip content
                 ranked = sorted(
                     cleaned,
-                    key=lambda t: 0.85*_score_social(t, platform) + 0.15*_coherence(t, text),
+                    key=lambda t: 0.7*_score_title_quality(t, text, platform) + 0.3*_coherence(t, text),
                     reverse=True
                 )
                 ranked = _dedup_ci(ranked)
@@ -1307,43 +1515,50 @@ def generate_titles(
             if filtered_titles:
                 return filtered_titles[:n]
     
-    # Extract keywords from actual text
-    keys = _extract_keywords(clean_text, k=6)
-    variants = _variants_from_keywords(keys, platform=platform)
-    
-    if not variants:
-        # Check if we need fallback (banned boilerplate or < 3 meaningful tokens)
-        needs_fallback = False
-        if clean_text:
-            # Check for banned boilerplate
-            boilerplate = re.compile(r'\b(what it means|explained|key takeaways|the truth about|everything you need to know)\b', re.I)
-            if boilerplate.search(clean_text):
-                needs_fallback = True
-            
-            # Check for < 3 meaningful tokens
-            meaningful_tokens = [w for w in clean_text.split() if w.lower() not in STOP and len(w) > 2]
-            if len(meaningful_tokens) < 3:
-                needs_fallback = True
+    # Use dynamic title generation as the PRIMARY method
+    dynamic_titles = _generate_dynamic_titles(clean_text, platform)
+    if dynamic_titles:
+        variants = dynamic_titles
+        # Extract keywords for logging
+        keys = _extract_meaningful_keywords(clean_text, max_terms=6)
+    else:
+        # Fallback to improved keyword-based method
+        keys = _extract_meaningful_keywords(clean_text, max_terms=6)
+        variants = _variants_from_keywords(keys, platform=platform)
         
-        if needs_fallback and clean_text:
-            base_title = _title_fallback(clean_text, platform)
-            variants = [
-                base_title,
-                f"{base_title}: Key Takeaway",
-                f"Why {base_title}",
-            ]
-        elif clean_text:
-            # Use improved title function
-            base_title = _title_from_text(clean_text)
-            variants = [
-                base_title,
-                f"{base_title}: Key Takeaway",
-                f"Why {base_title}",
-            ]
-        else:
-            # Safe fallback
-            title_hint = clean_text[:60] if clean_text else "This Moment"
-            variants = _safe_fallback(title_hint, platform)
+        if not variants:
+            # Check if we need fallback (banned boilerplate or < 3 meaningful tokens)
+            needs_fallback = False
+            if clean_text:
+                # Check for banned boilerplate
+                boilerplate = re.compile(r'\b(what it means|explained|key takeaways|the truth about|everything you need to know)\b', re.I)
+                if boilerplate.search(clean_text):
+                    needs_fallback = True
+                
+                # Check for < 3 meaningful tokens
+                meaningful_tokens = [w for w in clean_text.split() if w.lower() not in STOP and len(w) > 2]
+                if len(meaningful_tokens) < 3:
+                    needs_fallback = True
+            
+            if needs_fallback and clean_text:
+                base_title = _title_fallback(clean_text, platform)
+                variants = [
+                    base_title,
+                    f"{base_title}: Key Takeaway",
+                    f"Why {base_title}",
+                ]
+            elif clean_text:
+                # Use improved title function
+                base_title = _title_from_text(clean_text)
+                variants = [
+                    base_title,
+                    f"{base_title}: Key Takeaway",
+                    f"Why {base_title}",
+                ]
+            else:
+                # Safe fallback
+                title_hint = clean_text[:60] if clean_text else "This Moment"
+                variants = _safe_fallback(title_hint, platform)
         
         # title-case lightly
         variants = [v[:1].upper() + v[1:] for v in variants if len(v) > 0]
@@ -1375,9 +1590,12 @@ def generate_titles(
                         sanitized_title = "Important Insight"
             sanitized = sanitized_title != title
             
+            # Use new quality scoring
+            quality_score = _score_title_quality(sanitized_title, clean_text, platform)
+            
             result.append({
                 "title": sanitized_title,
-                "score": 1.0 - (i * 0.1),  # Decreasing score
+                "score": quality_score,
                 "reasons": ["Generated from text analysis"]
             })
             
@@ -1391,43 +1609,69 @@ def generate_titles(
     
     return result
 
-def score_title(title: str, platform: str, topic: str, text: str) -> float:
-    """Score a title based on various factors"""
-    score = 1.0
+def _score_title_quality(title: str, text: str, platform: str) -> float:
+    """Score title based on engagement potential and content relevance"""
+    score = 0.0
     
-    # Length scoring
+    # Content relevance (most important - 40% of score)
+    title_words = set(re.findall(r'\w+', title.lower()))
+    text_words = set(re.findall(r'\w+', text.lower()))
+    overlap = len(title_words & text_words)
+    if text_words:
+        relevance_score = min(0.4, overlap / len(text_words) * 2)
+        score += relevance_score
+    
+    # Engagement factors (30% of score)
+    if re.search(r'\b(why|how|what|when|where)\b', title.lower()):
+        score += 0.15  # Questions are engaging
+    
+    if re.search(r'\b\d+[%$kmb]?\b', title):
+        score += 0.1  # Specific numbers
+    
+    if re.search(r'\b(you|your)\b', title.lower()):
+        score += 0.05  # Second person
+    
+    # Length optimization (20% of score)
     length = len(title)
     platform_limit = PLAT_LIMITS.get(platform, PLAT_LIMITS["default"])
-    
-    if length <= platform_limit:
-        score += 0.2
+    if 20 <= length <= platform_limit:
+        score += 0.1  # Good length
+    elif length < 20:
+        score += 0.05  # Too short but acceptable
     else:
-        # Penalty for being too long
         overage = length - platform_limit
-        score -= min(0.5, overage * 0.01)
+        score -= min(0.1, overage * 0.01)  # Penalty for too long
     
-    # Topic relevance
+    # Avoid generic phrases (10% penalty)
+    generic_penalty = 0.0
+    if re.search(r'\b(truth|secret|hidden|amazing|incredible)\b', title.lower()):
+        generic_penalty += 0.05
+    if re.search(r'\b(everyone|nobody|everybody)\b', title.lower()):
+        generic_penalty += 0.03
+    if re.search(r'\b(ultimate|complete|everything you need)\b', title.lower()):
+        generic_penalty += 0.05
+    
+    score -= generic_penalty
+    
+    return max(0.0, min(1.0, score))
+
+def score_title(title: str, platform: str, topic: str, text: str) -> float:
+    """Score a title based on various factors (legacy function)"""
+    # Use the new quality scoring as primary
+    quality_score = _score_title_quality(title, text, platform)
+    
+    # Add some legacy factors for backward compatibility
+    score = quality_score
+    
+    # Topic relevance bonus
     if topic.lower() in title.lower():
-        score += 0.3
-    
-    # Question titles
-    if title.endswith('?'):
-        score += 0.2
-    
-    # Number/percentage
-    if re.search(r'\b\d+%?\b', title):
-        score += 0.2
-    
-    # Second person
-    if re.search(r'\b(you|your|you\'re)\b', title, re.IGNORECASE):
-        score += 0.15
-    
-    # Action words
-    action_words = ['do', 'stop', 'start', 'avoid', 'fix', 'master', 'learn', 'change']
-    if any(word in title.lower() for word in action_words):
         score += 0.1
     
-    return round(score, 2)
+    # Question titles bonus
+    if title.endswith('?'):
+        score += 0.05
+    
+    return round(min(1.0, score), 2)
 
 def get_score_reasons(title: str, platform: str, topic: str) -> List[str]:
     """Get reasons for the score"""

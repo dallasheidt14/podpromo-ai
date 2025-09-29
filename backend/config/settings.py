@@ -130,7 +130,7 @@ PLAT_LIMITS = {
     "neutral": 80,
     "default": 80,
 }
-TITLE_ENGINE_V2 = os.getenv("TITLE_ENGINE_V2", "true").lower() == "true"
+TITLE_ENGINE_V2 = os.getenv("TITLE_ENGINE_V2", "false").lower() == "true"
 
 # Title persistence settings
 TITLES_INDEX_TTL_SEC = int(os.getenv("TITLES_INDEX_TTL_SEC", "60"))

@@ -305,11 +305,19 @@ class TitlesService:
         # Validate chosen index if provided
         if chosen is not None:
             if isinstance(chosen, str):
+                # Normalize both chosen and variants for comparison (strip whitespace, normalize case)
+                chosen_normalized = chosen.strip().lower()
                 try:
+                    # Try exact match first
                     chosen = variants.index(chosen)
                 except ValueError:
-                    logger.warning("TitlesService.save_titles: chosen string '%s' not found in variants; resetting to None", chosen)
-                    chosen = None
+                    # Try normalized match
+                    try:
+                        chosen = next(i for i, v in enumerate(variants) if v.strip().lower() == chosen_normalized)
+                    except StopIteration:
+                        logger.warning("TitlesService.save_titles: chosen string '%s' not found in variants; resetting to None", chosen)
+                        logger.debug("TitlesService.save_titles: variants were: %s", [v.strip() for v in variants])
+                        chosen = None
             elif isinstance(chosen, int):
                 if not (0 <= chosen < len(variants)):
                     logger.warning("TitlesService.save_titles: chosen index %d out of range [0, %d); resetting to None", chosen, len(variants))

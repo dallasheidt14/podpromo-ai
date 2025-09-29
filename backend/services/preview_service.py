@@ -139,6 +139,8 @@ def ensure_preview(
                 "-c:a", "aac", "-b:a", audio_bitrate, "-ar", str(sample_rate),
                 "-movflags", "+faststart", dst,
             ]
+            _run_ffmpeg(argv)
+            return out_path.name  # Return filename only, not URL path
         else:
             # Audio-only → audiogram with fallback system
             # 1) Try waveform lines (most compatible)

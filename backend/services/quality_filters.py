@@ -6,6 +6,13 @@ import math
 from collections import Counter
 from math import sqrt
 
+# Import unfinished policy constants
+from services.secret_sauce_pkg.features import (
+    FINISHED_THOUGHT_REQUIRED,
+    UNFINISHED_HARD_DROP, UNFINISHED_MALUS, UNFINISHED_CONF_HARD,
+    END_GAP_MS_OK, END_CONF_OK, SOFT_ENDING_MALUS,
+)
+
 _AD_PATTERNS = [
     r"\b(visit|go to|use code|promo code|sponsored by|brought to you by)\b",
     r"\b(dot com|\.com|/pricing|/app)\b",
@@ -169,6 +176,35 @@ def _normalize_range(s, e):
     if e - s <= 0.0:
         return None
     return s, e
+
+def _apply_unfinished_policy(cand) -> bool:
+    """
+    Returns True to keep (possibly with penalty), False to hard-drop.
+    Expects these booleans/floats already present on cand (as you currently compute them):
+      - cand['has_terminal_punct']   -> bool
+      - cand['last_conf']            -> float in [0,1]
+    """
+    if not FINISHED_THOUGHT_REQUIRED:
+        return True
+
+    has_punct = bool(cand.get('has_terminal_punct', False))
+    last_conf = float(cand.get('last_conf', 0.0))
+
+    if has_punct:
+        # finished enough — keep with no penalty
+        return True
+
+    # No terminal punctuation
+    # Only *truly* bad tails are hard-dropped (kill-switch + very low conf)
+    if UNFINISHED_HARD_DROP and last_conf < UNFINISHED_CONF_HARD:
+        cand.setdefault('gate_flags', []).append('DROP_UNFINISHED_HARD')
+        return False
+
+    # Otherwise, keep and attach a small penalty to virality
+    cand.setdefault('penalties', {})
+    cand['penalties']['unfinished_pen'] = UNFINISHED_MALUS
+    cand.setdefault('gate_flags', []).append('UNFINISHED_SOFT')
+    return True
 
 def iou_time(a, b):
     """
@@ -676,13 +712,7 @@ def _is_finished_like(cand: dict, *, fallback: bool, tail_close_sec: float = 0.7
         cand["finish_reason"] = "eos_hit"
         return True, "KEEP_TAIL_CLOSE"
     
-    # Accept if last token is terminal punct .?! or discourse closer
-    if ended_with_punct:
-        cand["finished_thought"] = True
-        cand["finish_reason"] = "terminal_punct"
-        return True, "KEEP_TERMINAL_PUNCT"
-    
-    # Check for discourse closers
+    # Check for discourse closers first (highest priority)
     discourse_closers = ["and that's why", "so we", "that's why", "which is why", "this is why"]
     text_lower = text.lower()
     if any(closer in text_lower for closer in discourse_closers):
@@ -702,25 +732,50 @@ def _is_finished_like(cand: dict, *, fallback: bool, tail_close_sec: float = 0.7
     words = cand.get("words") or []
     confidence = calculate_finish_confidence(cand, words)
     
-    # Adaptive threshold based on genre and content indicators
-    genre = cand.get("genre", "general")
-    indicators = {
-        "conversational_ratio": cand.get("conversational_ratio", 0.0),
-        "interview_format": cand.get("interview_format", False)
-    }
-    from services.util import finish_threshold_for
-    threshold = finish_threshold_for(genre, indicators)
+    # Convert gap to milliseconds for comparison
+    tail_gap_ms = (gap or 0.0) * 1000.0
     
-    if confidence >= threshold:
+    # Priority 1: Terminal punctuation → accept, no malus
+    if ended_with_punct:
         cand["finished_thought"] = True
-        cand["finish_reason"] = "confidence_based"
-        cand["finish_confidence"] = confidence
-        cand["finish_threshold"] = threshold
-        logger.debug("FINISH_CONF: clip=%s conf=%.2f thr=%.2f finished=%s", 
-                    cand.get("id", "unknown"), confidence, threshold, confidence >= threshold)
-        return True, "KEEP_CONFIDENCE"
-
-    return False, "DROP_UNFINISHED"
+        cand["finish_reason"] = "terminal_punct"
+        return True, "KEEP_TERMINAL_PUNCT"
+    
+    # Priority 2: Soft ending via gap or confidence
+    if tail_gap_ms >= END_GAP_MS_OK or (confidence is not None and confidence >= END_CONF_OK):
+        cand["finished_thought"] = True
+        cand["finish_reason"] = "soft_ending"
+        # Apply soft ending malus
+        cand.setdefault('penalties', {})
+        cand['penalties']['soft_ending'] = SOFT_ENDING_MALUS
+        cand.setdefault('gate_flags', []).append('SOFT_ENDING_OK')
+        
+        # Track which path triggered for logging
+        if tail_gap_ms >= END_GAP_MS_OK:
+            cand.setdefault('gate_flags', []).append('SOFT_ENDING_VIA_GAP')
+        if confidence is not None and confidence >= END_CONF_OK:
+            cand.setdefault('gate_flags', []).append('SOFT_ENDING_VIA_CONF')
+            
+        return True, "SOFT_ENDING_OK"
+    
+    # Priority 3: Unfinished policy (unchanged from previous implementation)
+    # Prepare the candidate with required fields for the policy
+    cand["has_terminal_punct"] = ended_with_punct
+    cand["last_conf"] = confidence
+    
+    # Hard drop only if (no punctuation) AND (confidence < UNFINISHED_CONF_HARD)
+    if (confidence is not None) and (confidence < UNFINISHED_CONF_HARD):
+        cand.setdefault('gate_flags', []).append('DROP_UNFINISHED_HARD')
+        logger.debug("DROP_UNFINISHED_HARD (conf=%.2f < %.2f)", confidence, UNFINISHED_CONF_HARD)
+        return False, "DROP_UNFINISHED_HARD"
+    
+    # Otherwise soft unfinished → keep with unfinished malus
+    cand["finished_thought"] = True
+    cand["finish_reason"] = "unfinished_soft"
+    cand.setdefault('penalties', {})
+    cand['penalties']['unfinished_pen'] = UNFINISHED_MALUS
+    cand.setdefault('gate_flags', []).append('UNFINISHED_SOFT')
+    return True, "UNFINISHED_SOFT"
 
 def _apply_quality_gates_fallback_aware(candidates, *, fallback: bool, tail_close_sec: float, cfg=None):
     kept = []
@@ -731,6 +786,19 @@ def _apply_quality_gates_fallback_aware(candidates, *, fallback: bool, tail_clos
         if ok:
             kept.append(c)
     logger.info("GATES: kept=%d/%d, reasons=%s", len(kept), len(candidates), dict(reasons))
+    
+    # Log unfinished policy statistics
+    soft = sum(1 for c in kept if 'UNFINISHED_SOFT' in c.get('gate_flags', []))
+    hard = reasons.get('DROP_UNFINISHED_HARD', 0)
+    logger.info("UNFINISHED_POLICY: soft=%d hard=%d malus=%.3f", soft, hard, UNFINISHED_MALUS)
+    
+    # Log soft ending policy statistics
+    soft_ending_ok = sum(1 for c in kept if 'SOFT_ENDING_OK' in c.get('gate_flags', []))
+    via_gap = sum(1 for c in kept if 'SOFT_ENDING_VIA_GAP' in c.get('gate_flags', []))
+    via_conf = sum(1 for c in kept if 'SOFT_ENDING_VIA_CONF' in c.get('gate_flags', []))
+    logger.info("SOFT_ENDING_POLICY: ok=%d via_gap=%d via_conf=%d malus=%.3f", 
+                soft_ending_ok, via_gap, via_conf, SOFT_ENDING_MALUS)
+    
     return kept, dict(reasons)
 
 # Public API expected by clip_score.py (compat layer)

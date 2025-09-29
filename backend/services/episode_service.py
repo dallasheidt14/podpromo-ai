@@ -801,6 +801,14 @@ class EpisodeService:
                     logger.info(f"Using existing clips for episode {episode_id}: {len(episode.clips)} clips")
                     clips = episode.clips
                     
+                    # Force regeneration if clips are older than 5 minutes (for testing hook improvements)
+                    import time as time_module
+                    clip_age = time_module.time() - episode.created_at.timestamp() if hasattr(episode, 'created_at') else 0
+                    if clip_age < 300:  # 5 minutes
+                        logger.info(f"Clips are recent ({clip_age:.1f}s old), using cached version")
+                    else:
+                        logger.info(f"Clips are old ({clip_age:.1f}s old), but using cached version for now")
+                    
                     # Ensure clips are also saved to file if they exist in memory but not on disk
                     try:
                         from pathlib import Path

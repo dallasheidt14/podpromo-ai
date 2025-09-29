@@ -1308,7 +1308,7 @@ async def head_episode_clips(episode_id: str):
         return Response(status_code=202, headers={"Retry-After": "15", "Cache-Control": "no-store"})
 
 @app.get("/api/episodes/{episode_id}/clips")
-async def get_episode_clips(episode_id: str, regenerate: bool = False, background_tasks: BackgroundTasks = None, request: Request = None):
+async def get_episode_clips(episode_id: str, regenerate: bool = False, force_regenerate: bool = False, background_tasks: BackgroundTasks = None, request: Request = None):
     """Get clips for a specific episode - returns 202 if not ready, 200 with data if ready"""
     try:
         # Check readiness first using progress service
@@ -1348,13 +1348,16 @@ async def get_episode_clips(episode_id: str, regenerate: bool = False, backgroun
         # Get the episode from the service
         episode = await episode_service.get_episode(episode_id)
         if not episode:
-            return {
-                "ok": False,
-                "clips": [],
-                "count": 0,
-                "episode_id": episode_id,
-                "message": "Episode not found"
-            }
+            return
+            
+        # Force regeneration if requested (for testing hook improvements)
+        if force_regenerate:
+            logger.info(f"Force regeneration requested for episode {episode_id}, clearing cache")
+            # Clear the episode from cache to force regeneration
+            if hasattr(episode_service, 'episodes'):
+                episode_service.episodes.pop(episode_id, None)
+            # Re-fetch the episode (will trigger regeneration)
+            episode = await episode_service.get_episode(episode_id)
         
         # Get clips from episode (already generated during processing)
         try:
@@ -1461,13 +1464,26 @@ async def get_episode_clips(episode_id: str, regenerate: bool = False, backgroun
                     except:
                         pass
                 
+                # Prefer virality if present, then display_score, finally final_score
+                display_score = clip.get("display_score", clip.get("final_score", 0.0))
+                virality = clip.get("virality", display_score)
+                virality_pct = round(virality * 100) if isinstance(virality, (int, float)) else 0
+                
                 formatted_clips.append({
                     "id": clip_id,
                     "title": clip.get("title", f"Clip {i+1}"),
                     "text": clip.get("text", ""),
+                    "transcript": clip.get("transcript", ""),  # Add transcript field for frontend
+                    "full_transcript": clip.get("full_transcript", ""),  # Add full_transcript field
                     "score": clip.get("score", 0),
+                    "display_score": float(display_score),
+                    "final_score": float(clip.get("final_score", 0.0)),
+                    "virality": float(virality),
+                    "virality_pct": virality_pct,
                     "start_time": start_sec,
                     "end_time": end_sec,
+                    "startTime": start_sec,  # Add camelCase for frontend compatibility
+                    "endTime": end_sec,     # Add camelCase for frontend compatibility
                     "duration": duration_s,
                     "duration_s": duration_s,  # Explicit field for frontend
                     "preview_duration_s": preview_duration_s,  # Server-measured duration

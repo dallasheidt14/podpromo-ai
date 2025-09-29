@@ -359,6 +359,11 @@ def compute_virality(seg: dict, start_s: float, end_s: float, pl_v2: float, flag
     # soft length prior (only penalizes <8s or >45s)
     virality += 0.40 * _length_prior(dur)
     
+    # Apply penalties from quality gates
+    penalties = seg.get('penalties', {})
+    penalty_sum = sum(penalties.values())
+    virality = max(0.0, virality - penalty_sum)
+    
     return virality
 
 def compute_v_core(seg: dict, start_s: float, end_s: float) -> float:
@@ -405,6 +410,11 @@ def compute_v_core(seg: dict, start_s: float, end_s: float) -> float:
     # Ultra-short guard
     if dur <= 10.0 and (hook < 0.92 or payoff < 0.60):
         v_core -= 0.50
+    
+    # Apply penalties from quality gates
+    penalties = seg.get('penalties', {})
+    penalty_sum = sum(penalties.values())
+    v_core = max(0.0, v_core - penalty_sum)
     
     return v_core
 
@@ -619,6 +629,21 @@ PLATFORM_NEUTRAL_SELECTION = True
 FINISHED_THOUGHT_REQUIRED = True
 SALVAGE_MAX_EXTEND_S = 8.0
 SALVAGE_MODE = "punct_or_boundary_to_EOS"
+
+# Unfinished ending policy configuration
+UNFINISHED_HARD_DROP = False   # keep as a safety kill-switch
+UNFINISHED_MALUS = 0.06        # subtract from virality (≈ 6 pts on 0–100 scale)
+UNFINISHED_CONF_HARD = 0.20    # only hard-drop if no terminal punct *and* conf below this (lowered from 0.30)
+
+# Soft ending policy configuration
+END_GAP_MS_OK = 300            # accept if last silence >= 300 ms (lowered from 400ms)
+END_CONF_OK = 0.80             # accept if last-word (or finish) confidence >= 0.80 (lowered from 0.85)
+SOFT_ENDING_MALUS = 0.02       # tiny malus for punctuation-less "good" endings
+
+# Gate calibration configuration
+STRICT_FLOOR_DELTA = -0.04     # Lower strict floor by ~4 points
+BALANCED_EXTRA_DELTA = -0.02   # If strict is empty, lower balanced by an additional 2 points
+MIN_FINALS = 4                 # Raise from 3 → 4 to reduce "empty" episodes
 
 # Finish-Thought Gate Configuration
 FINISH_THOUGHT_CONFIG = {
@@ -1427,6 +1452,33 @@ SPELLOUT_RE = re.compile(
 )
 
 CTA_TOKENS = {"shop", "buy", "save", "order", "visit", "subscribe", "download", "sign", "sign up"}
+
+# -----------------------
+# Hook scoring constants
+# -----------------------
+# Micro re-trim: scan first N tokens for a stronger start and give a tiny bonus
+HOOK_MICRO_RETRIM_MAX_TOKENS = 6          # how far we're allowed to "slide" the start
+HOOK_MICRO_RETRIM_STEP_BONUS = 0.008      # per-token step bonus (j * step)
+HOOK_MICRO_RETRIM_MAX_BONUS = 0.015       # cap so we don't distort ordering
+
+# Hedge softening: if a hedge ("uh", "you know…") is immediately followed by strong content,
+# reduce its penalty so good cold-opens aren't nuked.
+HOOK_HEDGE_LOOKAHEAD_TOKENS = 5           # look ahead after hedge in first 3 tokens
+HOOK_HEDGE_SOFTEN_FACTOR = 0.50           # multiply the hedge penalty by this if softened
+
+# First clause window: give the first substantive clause a chance to register
+HOOK_FIRST_CLAUSE_WINDOW = 20             # was typically ~15 in older configs
+
+# Words considered weak/filler at start; keep short and conservative
+HOOK_START_FILLERS = {
+    "uh", "um", "er", "ah", "like", "you", "know", "so", "well", "okay", "ok",
+}
+
+# Tokens that hint at a strong, actionable opener (helps the micro re-trim)
+HOOK_STRONG_STARTERS = {
+    "what", "why", "how", "here's", "listen", "the", "truth", "nobody", "you",
+    "let", "here", "this", "stop", "remember",
+}
 
 # Safe defaults for when config is not passed
 _DEFAULTS = dict(
@@ -2256,7 +2308,8 @@ def _hook_score_v5(text: str, cfg: Dict = None, segment_index: int = 0, audio_mo
     hv5 = cfg.get("hook_v5", {}) if cfg else {}
     a_sig = float(hv5.get("sigmoid_a", 1.6))
     need_words = int(hv5.get("require_after_words", 12))
-    clause_words = int(hv5.get("first_clause_max_words", 24))
+    clause_words = int(hv5.get("first_clause_max_words", 20))
+    print(f"HOOK: clause_window={clause_words}")
     k = float(hv5.get("time_decay_k", 5))
     early_bonus_scale = float(hv5.get("early_pos_bonus", 0.25))
     audio_cap = float(hv5.get("audio_cap", 0.05))
@@ -2288,12 +2341,14 @@ def _hook_score_v5(text: str, cfg: Dict = None, segment_index: int = 0, audio_mo
     syn = hv5.get("synergy", {}) or {}
     syn_bonus = 0.0
     if arousal >= float(syn.get("arousal_gate", 0.60)):
-        syn_bonus += float(syn.get("bonus_each", 0.01))
+        syn_bonus += float(syn.get("bonus_each", 0.015))
     if q_or_list >= float(syn.get("q_or_list_gate", 0.60)):
-        syn_bonus += float(syn.get("bonus_each", 0.01))
-    syn_bonus = min(syn_bonus, float(syn.get("cap_total", 0.02)))
+        syn_bonus += float(syn.get("bonus_each", 0.015))
+    syn_bonus = min(syn_bonus, float(syn.get("cap_total", 0.04)))
     base = max(0.0, base) + syn_bonus
-    if syn_bonus > 0: reasons.append(f"synergy+{syn_bonus:.2f}")
+    if syn_bonus > 0: 
+        reasons.append(f"synergy+{syn_bonus:.2f}")
+        print(f"HOOK: synergy bonus q_or_list={q_or_list:.3f} arousal={arousal:.3f} +{syn_bonus:.3f}")
 
     raw = min(1.0, max(0.0, base))
 
