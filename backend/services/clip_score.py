@@ -39,6 +39,14 @@ def _nz(x, default=0.0) -> float:
     except Exception:
         return float(default)
 
+def _score_of(it: dict) -> float:
+    # Prefer enhanced score names, but never crash or return None
+    s = it.get("rank_score", it.get("score", it.get("raw_score", 0.0)))
+    try:
+        return float(s) if s is not None else 0.0
+    except Exception:
+        return 0.0
+
 def _ensure_clip_fields(c: dict) -> dict:
     c.setdefault("features", {})
     c["start"]    = _nz(c.get("start", c.get("start_time", 0.0)))
@@ -62,23 +70,28 @@ def _blend_final_score(c: dict) -> float:
     return c["final_score"]
 
 # Word schema adapters (normalize different transcript word formats)
-def _w_start(w) -> float:
-    if "start" in w: return float(w["start"])
-    if "ts"    in w: return float(w["ts"])
-    if "t0"    in w: return float(w["t0"]) / 1000.0
-    if "s"     in w: return float(w["s"])
-    raise KeyError("word start time missing")
+def _w_start(w: dict) -> float:
+    if "t" in w:  # whisper
+        return float(w.get("t", 0.0))
+    if "start" in w:  # whisperX
+        return float(w.get("start", 0.0))
+    if "start_time" in w:  # legacy
+        return float(w.get("start_time", 0.0))
+    # last resort
+    return float(w.get("ts", 0.0))
 
-def _w_end(w) -> float:
-    if "end" in w: return float(w["end"])
-    if "te"  in w: return float(w["te"])
-    if "t1"  in w: return float(w["t1"]) / 1000.0
-    if "e"   in w: return float(w["e"])
-    if "dur" in w: return _w_start(w) + float(w["dur"])
-    raise KeyError("word end time missing")
+def _w_end(w: dict) -> float:
+    if "d" in w and "t" in w:
+        return float(w.get("t", 0.0)) + float(w.get("d", 0.0))
+    if "end" in w:
+        return float(w.get("end", 0.0))
+    if "duration" in w and "start_time" in w:
+        return float(w.get("start_time", 0.0)) + float(w.get("duration", 0.0))
+    # last resort: start + (len(word)*~0.06s)
+    return _w_start(w) + (len((w.get("word") or w.get("w") or w.get("text") or "")) * 0.06)
 
-def _w_text(w) -> str:
-    return (w.get("w") or w.get("text") or w.get("token") or "").strip()
+def _w_text(w: dict) -> str:
+    return str(w.get("word") or w.get("w") or w.get("text") or "").strip()
 
 # Phase 3: Precision patches
 FILLER_RE = re.compile(r"^(uh|um|well|so|you know)[\s,]+", re.I)
@@ -438,18 +451,14 @@ def _is_terminal_char(ch: str) -> bool:
     return ch and ch[-1] in _TERMINALS
 
 def _gap_after(words, i) -> float:
-    """gap from end of words[i] to start of words[i+1]"""
-    if i < 0 or i+1 >= len(words): return 9999.0
-    end_i = _w_end(words[i])
-    start_next = _w_start(words[i+1])
-    return max(0.0, start_next - end_i)
+    if i < 0 or i >= len(words) - 1: 
+        return 0.0
+    return max(0.0, _w_start(words[i+1]) - _w_end(words[i]))
 
 def _gap_before(words, i) -> float:
-    """gap from end of words[i-1] to start of words[i]"""
-    if i <= 0 or i >= len(words): return 9999.0
-    end_prev = _w_end(words[i-1])
-    start_i = _w_start(words[i])
-    return max(0.0, start_i - end_prev)
+    if i <= 0 or i >= len(words): 
+        return 0.0
+    return max(0.0, _w_start(words[i]) - _w_end(words[i-1]))
 
 def _nearest_boundary_backward(words, t, max_seek=1.5, min_gap=0.35):
     """walk left to an EOS char or a long enough gap"""
@@ -672,51 +681,58 @@ def _normalize_display_by_band(cands: list[dict]) -> list[dict]:
             c["rank_score"] = float(c.get("display_score", c.get("final_score", 0.0)))
     return cands
 
-def _mmr_select_jaccard(items, top_k, text_key="text", lam=0.7):
-    """
-    Null-safe MMR with Jaccard diversity over token sets.
-    items: list of dicts with 'text' (or text_key) and 'rank_score'/'raw_score'
-    Returns: list[dict] of chosen items
-    """
-    if not items:
+def _tokens(s: str) -> set:
+    if not s:
+        return set()
+    return set(str(s).lower().split())
+
+def _jaccard(a: set, b: set) -> float:
+    if not a and not b:
+        return 0.0
+    inter = len(a & b)
+    union = len(a | b) or 1
+    return inter / union
+
+def _mmr_select_jaccard(items: List[Dict], top_k: int, lam: float = 0.7) -> List[Dict]:
+    """Order-stable, null-safe MMR over text with jaccard diversity."""
+    if not items or top_k <= 0:
         return []
+    # Precompute tokens & base score; never mutate source list
+    features: List[Tuple[float, set, Dict]] = []
+    for it in items:
+        tok = _tokens(it.get("text", ""))
+        features.append((_score_of(it), tok, it))
+    # Sort by base score desc but keep relative order for ties
+    ranked = sorted(range(len(features)), key=lambda i: (features[i][0], i), reverse=True)
 
-    # Work on copies to avoid mutating source
-    pool = [dict(x) for x in items]
-
-    def tokset(s):
-        s = (s or "").lower()
-        # simple whitespace tokenization is fine for our use
-        return set(s.split())
-
-    def score_of(it):
-        # prefer rank_score; fall back to raw_score; else 0.0
-        return float(it.get("rank_score", it.get("raw_score", 0.0)) or 0.0)
-
-    tokens = [tokset(it.get(text_key, it.get("text", ""))) for it in pool]
-    chosen, chosen_tokens = [], []
-
-    while pool and len(chosen) < top_k:
-        best_i, best_val = 0, -1e9
-        for i, it in enumerate(pool):
-            rel = score_of(it)
-            if chosen_tokens:
-                # diversity = max Jaccard similarity to anything we've picked
-                t = tokens[i]
-                div = max(
-                    (len(t & ct) / max(1, len(t | ct)) for ct in chosen_tokens),
-                    default=0.0
-                )
-            else:
-                div = 0.0
-            # standard MMR: maximize lambda*relevance - (1-lambda)*diversity
-            val = lam * rel - (1.0 - lam) * div
-            if val > best_val:
-                best_val, best_i = val, i
-
-        chosen.append(pool.pop(best_i))
-        chosen_tokens.append(tokens.pop(best_i))
-
+    chosen_idx: List[int] = []
+    chosen: List[Dict] = []
+    while ranked and len(chosen) < min(top_k, len(ranked)):
+        if not chosen_idx:
+            i = ranked.pop(0)
+            chosen_idx.append(i)
+            chosen.append(features[i][2])
+            continue
+        # compute marginal gain for each remaining
+        best_j = None
+        best_val = float("-inf")
+        for pos, j in enumerate(ranked):
+            s, tok_j, _ = features[j]
+            max_sim = 0.0
+            for i in chosen_idx:
+                _, tok_i, _ = features[i]
+                sim = _jaccard(tok_j, tok_i)
+                if sim > max_sim:
+                    max_sim = sim
+                    if max_sim >= 1.0:
+                        break
+            mmr_val = lam * s - (1.0 - lam) * max_sim
+            if mmr_val > best_val:
+                best_val = mmr_val
+                best_j = pos
+        i = ranked.pop(best_j)
+        chosen_idx.append(i)
+        chosen.append(features[i][2])
     return chosen
 
 # Import gate calibration constants
@@ -2054,28 +2070,59 @@ def _enhanced_select_and_rank(candidates: List[Dict], words: List[Dict], platfor
     """Enhanced selection with null-safe processing and adaptive gating"""
     from services.quality_filters import filter_low_quality
     
-    # Sanitize first
-    candidates = [_ensure_clip_fields(c) for c in candidates]
-    for c in candidates:
-        _blend_final_score(c)
+    # Text guard: drop blanks/whitespace-only candidates early
+    candidates = [c for c in candidates if (c.get("text") or "").strip()]
     
+    # Sanitize first with per-candidate error handling
+    ok_cands = []
+    for c in candidates:
+        try:
+            c = _ensure_clip_fields(c)
+            _blend_final_score(c)
+            ok_cands.append(c)
+        except Exception as e:
+            logger.exception("ENHANCED_PER_CAND_ERROR: id=%s msg=%s", c.get("id"), str(e))
+    
+    candidates = ok_cands
     logger.info("ENHANCED: candidates=%d", len(candidates))
     
-    # Apply quality filtering (strict mode first)
-    filtered = filter_low_quality(candidates, mode="strict")
+    if not candidates:
+        logger.warning("ENHANCED: no valid candidates after sanitization")
+        return []
+    
+    # Apply quality filtering with error handling
+    try:
+        filtered = filter_low_quality(candidates, mode="strict")
+    except Exception:
+        logger.exception("ENHANCED_GATES_STRICT_ERROR")
+        filtered = []
+    
     if not filtered:
         logger.info("ENHANCED: strict gates empty → soft gates")
-        filtered = filter_low_quality(candidates, mode="soft")
+        try:
+            filtered = filter_low_quality(candidates, mode="soft")
+        except Exception:
+            logger.exception("ENHANCED_GATES_SOFT_ERROR")
+            filtered = []
+    
     if not filtered:
         logger.warning("ENHANCED: soft gates empty → top-K by score")
-        # Be more lenient - take more candidates
-        filtered = sorted(candidates, key=lambda x: x.get("final_score", 0.0), reverse=True)[:max(6, min(15, len(candidates)))]
+        filtered = sorted(candidates, key=_score_of, reverse=True)[:max(6, min(15, len(candidates)))]
     
     logger.info(f"ENHANCED: after filtering: {len(filtered)} candidates")
     
-    # Choose finals safely
+    # MMR selection with error handling
     desired_k = max(6, min(12, len(filtered)))
-    finals = sorted(filtered, key=lambda x: x.get("final_score", 0.0), reverse=True)[:desired_k]
+    try:
+        finals = _mmr_select_jaccard(filtered, top_k=desired_k)
+    except Exception:
+        logger.exception("ENHANCED_MMR_ERROR")
+        finals = sorted(filtered, key=_score_of, reverse=True)[:desired_k]
+    
+    # Never empty clause
+    if not finals:
+        logger.warning("ENHANCED_EMPTY_AFTER_ALL_GATES: using topK")
+        finals = sorted(candidates, key=_score_of, reverse=True)[:max(1, 6)]
     
     logger.info("ENHANCED: finals=%d (after gates/MMR)", len(finals))
     return finals
