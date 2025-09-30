@@ -19,8 +19,123 @@ from config.settings import (
     UPLOAD_DIR, OUTPUT_DIR, MAX_FILE_SIZE, ALLOWED_EXTENSIONS,
     PRERANK_ENABLED, TOP_K_RATIO, TOP_K_MIN, TOP_K_MAX, STRATIFY_ENABLED, 
     SAFETY_KEEP_ENABLED, COMPARE_SCORING_MODES, PRERANK_WEIGHTS,
-    DURATION_TARGET_MIN, DURATION_TARGET_MAX, CLIP_LEN_MIN, CLIP_LEN_MAX
+    DURATION_TARGET_MIN, DURATION_TARGET_MAX, CLIP_LEN_MIN, CLIP_LEN_MAX,
+    FEATURE_SEMANTIC_END_BONUS, SEED_START_PAD_SEC
 )
+from config import settings
+
+# Payoff cues for semantic end bonus
+_PAYOFF_CUES = (
+    "that's why", "that's why", "so that's", "so that's", "and that's", "and that's",
+    "which means", "this shows", "proves that", "the point is", "bottom line",
+    "in the end", "finally", "as a result", "so in short", "long story short"
+)
+
+# Defensive null-safety helpers for enhanced selector
+def _nz(x, default=0.0) -> float:
+    try:
+        if x is None: return float(default)
+        return float(x)
+    except Exception:
+        return float(default)
+
+def _ensure_clip_fields(c: dict) -> dict:
+    c.setdefault("features", {})
+    c["start"]    = _nz(c.get("start", c.get("start_time", 0.0)))
+    c["end"]      = _nz(c.get("end",   c.get("end_time",   c["start"])))
+    c["duration"] = max(0.0, c["end"] - c["start"])
+    c["text"]     = (c.get("text") or "").strip()
+    c["hook_score"]  = _nz(c.get("hook_score", 0.0))
+    c["info_score"]  = _nz(c.get("info_score", 0.0))
+    pf = c.get("features", {}).get("payoff_score")
+    c["features"]["payoff_score"] = _nz(pf, 0.0)
+    c["pl_v2"] = _nz(c.get("pl_v2", 0.0))
+    return c
+
+def _blend_final_score(c: dict) -> float:
+    s  = _nz(c.get("final_score", 0.0))
+    h  = _nz(c.get("hook_score",  0.0))
+    pf = _nz(c.get("features", {}).get("payoff_score", 0.0))
+    if s == 0.0:
+        s = 0.5*h + 0.5*pf
+    c["final_score"] = float(s)
+    return c["final_score"]
+
+# Word schema adapters (normalize different transcript word formats)
+def _w_start(w) -> float:
+    if "start" in w: return float(w["start"])
+    if "ts"    in w: return float(w["ts"])
+    if "t0"    in w: return float(w["t0"]) / 1000.0
+    if "s"     in w: return float(w["s"])
+    raise KeyError("word start time missing")
+
+def _w_end(w) -> float:
+    if "end" in w: return float(w["end"])
+    if "te"  in w: return float(w["te"])
+    if "t1"  in w: return float(w["t1"]) / 1000.0
+    if "e"   in w: return float(w["e"])
+    if "dur" in w: return _w_start(w) + float(w["dur"])
+    raise KeyError("word end time missing")
+
+def _w_text(w) -> str:
+    return (w.get("w") or w.get("text") or w.get("token") or "").strip()
+
+# Phase 3: Precision patches
+FILLER_RE = re.compile(r"^(uh|um|well|so|you know)[\s,]+", re.I)
+
+def soft_start_pad_and_trim(seg, words, pad=0.45, max_trim=0.6):
+    """Apply gentle filler trim + warm-in padding after boundary refinement"""
+    start = max(seg['start'] - pad, 0.0)
+    lead_text = _slice_words_text(words, start, start + 1.2)
+    if FILLER_RE.match(lead_text.lower()):
+        start = min(start + max_trim, seg['end'] - 0.5)
+    seg['start'] = start
+    return seg
+
+def jaccard(a, b):
+    """Calculate Jaccard similarity between two texts"""
+    A, B = set(a.lower().split()), set(b.lower().split())
+    return len(A & B) / max(1, len(A | B))
+
+def dedupe_keep_best(ranked):
+    """Keep best scoring clip among near-duplicate texts"""
+    kept, out = [], []
+    for c in ranked:
+        if all(jaccard(c['text'], k['text']) < 0.6 for k in kept):
+            kept.append(c)
+            out.append(c)
+    return out
+
+def last_sentence_of(text: str) -> str:
+    """Extract the last sentence from text for payoff sentence"""
+    import re
+    SENT_SPLIT = re.compile(r'(?<=[.!?])\s+')
+    parts = [p.strip() for p in SENT_SPLIT.split(text.strip()) if p.strip()]
+    return parts[-1] if parts else text.strip()
+
+def payoff_q_a_bump(text):
+    """Small payoff bump for Q→A pairs (question followed by declarative answer)"""
+    sents = re.split(r'(?<=[.!?])\s+', text.strip())
+    return 0.1 if any(s.endswith('?') for s in sents[:-1]) and sents[-1].endswith(('.', '!', '?')) else 0.0
+
+def _semantic_end_bonus(text_tail: str) -> float:
+    """Calculate semantic end bonus based on payoff cues and punctuation"""
+    tl = text_tail.lower().strip()
+    bonus = 0.0
+    
+    # Payoff cue bonus
+    if any(cue in tl for cue in _PAYOFF_CUES):
+        bonus += 0.25
+    
+    # Terminal punctuation bonus
+    if tl.endswith(('.', '!', '?')):
+        bonus += 0.12
+    
+    # Mild penalty if clearly mid-entity (proper noun/number at end)
+    if re.search(r'\b([A-Z][a-z]+|[0-9]+)$', text_tail):
+        bonus -= 0.15
+    
+    return bonus
 
 # --- Feature toggles (safe defaults) ---
 FEATURES = {
@@ -100,6 +215,12 @@ def _episode_words(episode):
             t0 = float(w["t0"]); t1 = float(w["t1"])
             text = w.get("w") or w.get("text", "")
             out.append({"t": t0, "d": max(0.0, t1 - t0), "w": text})
+        # Format C: {start, end, text} (ASR format)
+        elif "start" in w and "end" in w:
+            start = float(w["start"])
+            end = float(w["end"])
+            text = w.get("text") or w.get("w", "")
+            out.append({"t": start, "d": max(0.0, end - start), "w": text})
         # Unknown shape → skip
     return out
 
@@ -114,7 +235,13 @@ def _episode_words_or_empty(ep):
     )
 
 def _word_starts(words):
-    return [w["t"] for w in words]
+    starts = []
+    for w in words:
+        try:
+            starts.append(_w_start(w))
+        except KeyError:
+            continue
+    return starts
 
 def _idx_at_or_before(words, t):
     starts = _word_starts(words)
@@ -127,10 +254,13 @@ def _slice_words_text(words, t0, t1):
     i = max(0, _idx_at_or_before(words, t0))
     acc = []
     for j in range(i, len(words)):
-        wt = words[j]["t"]
-        if wt > t1:
-            break
-        acc.append(words[j].get("w", ""))
+        try:
+            wt = _w_start(words[j])
+            if wt > t1:
+                break
+            acc.append(_w_text(words[j]))
+        except KeyError:
+            continue
     return " ".join(acc).strip()
 
 # Back-compat shims (only if other modules still import these)
@@ -241,9 +371,16 @@ def _boundary_score_end(t, t1_orig, words, window, start_t):
     tail_text = _slice_words_text(words, max(start_t, t - 4.0), t)[-120:]
     curiosity_bonus = 0.25 if _ends_on_curiosity_text(tail_text) else 0.0
 
+    # Semantic end bonus (Phase 2)
+    semantic_bonus = 0.0
+    if FEATURE_SEMANTIC_END_BONUS:
+        # Look at the last ~1.4 seconds for semantic cues
+        semantic_text = _slice_words_text(words, max(start_t, t - 1.4), t)
+        semantic_bonus = _semantic_end_bonus(semantic_text)
+
     dist_pen = min(0.35, 0.35 * abs(t - t1_orig) / max(0.001, window))
 
-    return 0.55 * gap_bonus + 0.35 * punct + 0.25 * curiosity_bonus - dist_pen
+    return 0.55 * gap_bonus + 0.35 * punct + 0.25 * curiosity_bonus + semantic_bonus - dist_pen
 
 def refine_bounds_with_hill_climb(clip, episode, max_nudge=1.0, step=0.05):
     """
@@ -534,7 +671,18 @@ def _normalize_display_by_band(cands: list[dict]) -> list[dict]:
     return cands
 
 def _mmr_select_jaccard(items: list[dict], *, top_k: int, text_key: str = "text", lam: float = 0.7) -> list[dict]:
-    """MMR using simple Jaccard over token sets; no extra deps."""
+    """MMR using simple Jaccard over token sets; no extra deps. Null-safe version."""
+    if not items or top_k <= 0:
+        return []
+    
+    # Ensure fields exist
+    for it in items:
+        it.setdefault("text", "")
+        it.setdefault("rank_score", 0.0)
+        it.setdefault("raw_score", 0.0)
+    
+    top_k = min(top_k, len(items))
+    
     def tokset(s: str): 
         return set(w for w in (s or "").lower().split())
     
@@ -1830,8 +1978,14 @@ def choose_default_clip(clips: List[Dict[str, Any]]) -> Optional[str]:
     return None
 
 def rank_clips(clips: List[Dict[str, Any]], platform_neutral: bool = True) -> List[Dict[str, Any]]:
-    """Rank clips using platform-neutral V_core scoring or traditional scoring"""
+    """Rank clips using platform-neutral V_core scoring or traditional scoring with seed-first ranking"""
     from services.secret_sauce_pkg.features import compute_v_core
+    
+    # Separate seed clips from brute-force clips
+    seed_clips = [c for c in clips if c.get('seed_idx') is not None]
+    brute_clips = [c for c in clips if c.get('seed_idx') is None]
+    
+    logger.info("RANKING: %d seed clips, %d brute clips", len(seed_clips), len(brute_clips))
     
     if platform_neutral:
         # Platform-neutral ranking using V_core
@@ -1841,21 +1995,71 @@ def rank_clips(clips: List[Dict[str, Any]], platform_neutral: bool = True) -> Li
             v_core = compute_v_core(clip, start_s, end_s)
             clip["v_core_score"] = v_core
         
-        # Sort by V_core score (highest first)
-        sorted_clips = sorted(clips, key=lambda c: -c.get("v_core_score", 0.0))
+        # Sort seed clips by V_core score (highest first)
+        ranked_seed = sorted(seed_clips, key=lambda c: -c.get("v_core_score", 0.0))
+        
+        # Sort brute clips by V_core score (highest first)
+        ranked_brute = sorted(brute_clips, key=lambda c: -c.get("v_core_score", 0.0))
+        
+        # Combine: seed clips first, then brute clips
+        sorted_clips = ranked_seed + ranked_brute
     else:
         # Traditional ranking with platform bias
-        longs = sorted([c for c in clips if c.get("protected_long")],
-                       key=lambda c: (-c.get("pl_v2", 0), -c.get("duration", 0), -c.get("final_score", 0)))
-        rest = sorted([c for c in clips if not c.get("protected_long")],
-                      key=lambda c: (-c.get("final_score", 0), -c.get("finished_thought", 0), -c.get("pl_v2", 0)))
-        sorted_clips = longs + rest
+        # Seed clips get priority
+        seed_longs = sorted([c for c in seed_clips if c.get("protected_long")],
+                           key=lambda c: (-c.get("pl_v2", 0), -c.get("duration", 0), -c.get("final_score", 0)))
+        seed_rest = sorted([c for c in seed_clips if not c.get("protected_long")],
+                          key=lambda c: (-c.get("final_score", 0), -c.get("finished_thought", 0), -c.get("pl_v2", 0)))
+        
+        # Brute clips with stricter quality requirements
+        brute_longs = sorted([c for c in brute_clips if c.get("protected_long")],
+                            key=lambda c: (-c.get("pl_v2", 0), -c.get("duration", 0), -c.get("final_score", 0)))
+        brute_rest = sorted([c for c in brute_clips if not c.get("protected_long")],
+                           key=lambda c: (-c.get("final_score", 0), -c.get("finished_thought", 0), -c.get("pl_v2", 0)))
+        
+        # Apply stricter quality filter to brute clips
+        brute_rest = [c for c in brute_rest if c.get("final_score", 0) > 0.3]  # Higher threshold for brute clips
+        
+        sorted_clips = seed_longs + seed_rest + brute_longs + brute_rest
+    
+    # Apply dedupe to remove near-duplicates (Phase 3)
+    deduped_clips = dedupe_keep_best(sorted_clips)
     
     # Add rank to each clip
-    for i, c in enumerate(sorted_clips): 
+    for i, c in enumerate(deduped_clips): 
         c["rank_primary"] = i
     
-    return sorted_clips
+    logger.info("RANKING: final order has %d clips (%d seed + %d brute) after dedupe", 
+                len(deduped_clips), len(seed_clips), len(brute_clips))
+    
+    return deduped_clips
+
+def _enhanced_select_and_rank(candidates: List[Dict], words: List[Dict], platform_cfg: Dict) -> List[Dict]:
+    """Enhanced selection with null-safe processing and adaptive gating"""
+    from services.quality_filters import filter_low_quality
+    
+    # Sanitize first
+    candidates = [_ensure_clip_fields(c) for c in candidates]
+    for c in candidates:
+        _blend_final_score(c)
+    
+    logger.info("ENHANCED: candidates=%d", len(candidates))
+    
+    # Apply quality filtering (strict mode first)
+    filtered = filter_low_quality(candidates, mode="strict")
+    if not filtered:
+        logger.info("ENHANCED: strict gates empty → soft gates")
+        filtered = filter_low_quality(candidates, mode="soft")
+    if not filtered:
+        logger.warning("ENHANCED: soft gates empty → top-K by score")
+        filtered = sorted(candidates, key=lambda x: x.get("final_score", 0.0), reverse=True)[:max(5, min(12, len(candidates)))]
+    
+    # Choose finals safely
+    desired_k = max(6, min(12, len(filtered)))
+    finals = sorted(filtered, key=lambda x: x.get("final_score", 0.0), reverse=True)[:desired_k]
+    
+    logger.info("ENHANCED: finals=%d (after gates/MMR)", len(finals))
+    return finals
 
 def final_safety_pass(clips: List[Dict[str, Any]], eos_times: List[float], word_end_times: List[float], platform: str) -> List[Dict[str, Any]]:
     """
@@ -1940,7 +2144,6 @@ def final_safety_pass(clips: List[Dict[str, Any]], eos_times: List[float], word_
     # Count finish thought results
     finished_count = sum(1 for c in clips if c.get("finished_thought", 0) == 1)
     finished_ratio = finished_count / max(len(clips), 1)
-    
     
     # Log episode-level telemetry
     logger.info(f"TELEMETRY: word_count={wc}, eos_count={ec}, eos_density={eos_density:.3f}")
@@ -2841,7 +3044,7 @@ class ClipScoreService:
                 return True
         return False
 
-    def _transcript_to_segments(self, transcript: List[TranscriptSegment], genre: str = 'general', platform: str = 'tiktok') -> List[Dict]:
+    def _transcript_to_segments(self, transcript: List[TranscriptSegment], genre: str = 'general', platform: str = 'tiktok', words: List[Dict] = None) -> List[Dict]:
         """Create dynamic segments based on natural content boundaries and platform optimization"""
         try:
             # Convert TranscriptSegment objects to dicts
@@ -2886,7 +3089,7 @@ class ClipScoreService:
             
             # Note: EOS times will be provided later in the pipeline
             try:
-                dynamic_segments = create_dynamic_segments(filtered_segments, platform, eos_times=None)
+                dynamic_segments = create_dynamic_segments(filtered_segments, platform, eos_times=None, words=words)
             except Exception as e:
                 logger.exception("Dynamic segmentation failed despite preflight: %s; falling back", e)
                 dynamic_segments = None
@@ -3300,6 +3503,20 @@ class ClipScoreService:
             "platform_len_match": float(self._safe_get(c, "platform_len_match", 0.0)),
         }
         
+        # Extract seed and payoff sentences for enhanced title generation (Phase 3)
+        seed_sentence = None
+        payoff_sentence = None
+        if c.get('seed_idx') is not None:
+            # Try to get sentence_spans from the clip or episode context
+            sentence_spans = c.get('sentence_spans') or getattr(self, 'sentence_spans', None)
+            if sentence_spans and c['seed_idx'] < len(sentence_spans):
+                seed_sentence = sentence_spans[c['seed_idx']].text
+        payoff_sentence = last_sentence_of(c.get('text', ''))
+        
+        # Add to clip for title service
+        c['seed_sentence'] = seed_sentence
+        c['payoff_sentence'] = payoff_sentence
+        
         # Generate eager title
         title = None
         title_suggestions = []
@@ -3428,7 +3645,7 @@ class ClipScoreService:
             logger.info(f"QUALITY_GATE: finished_required={FINISHED_THOUGHT_REQUIRED}")
 
             # Convert transcript to segments using intelligent moment detection
-            segments = self._transcript_to_segments(episode.transcript, genre=final_genre, platform=platform)
+            segments = self._transcript_to_segments(episode.transcript, genre=final_genre, platform=platform, words=getattr(episode, 'words', None))
             
             # Store base segments for boundary refinement
             self._base_segments = segments.copy() if segments else []
@@ -3459,7 +3676,39 @@ class ClipScoreService:
 
             # Use the enhanced viral clips pipeline with all Phase 1-3 improvements
             logger.info(f"Using enhanced viral clips pipeline with {len(segments)} segments")
-            viral_result = find_viral_clips_enhanced(segments, episode.audio_path, genre=final_genre, platform=backend_platform, fallback_mode=episode_fallback_mode, effective_eos_times=eos_times, effective_word_end_times=word_end_times, eos_source=eos_source)
+            try:
+                viral_result = find_viral_clips_enhanced(
+                    segments,
+                    episode.audio_path,
+                    genre=final_genre,
+                    platform=backend_platform,
+                    fallback_mode=episode_fallback_mode,
+                    effective_eos_times=eos_times,
+                    effective_word_end_times=word_end_times,
+                    eos_source=eos_source,
+                )
+                if not viral_result or not viral_result.get("clips"):
+                    raise RuntimeError("ENHANCED_EMPTY")
+            except Exception:
+                logger.error("CANDIDATE_PIPELINE_FAIL: enhanced pipeline threw; invoking legacy fallback")
+                logger.exception("CANDIDATE_PIPELINE_FAIL_STACK")
+                # Legacy fallback on segments → simple pass-through as minimal candidates
+                legacy_candidates = []
+                for seg in segments or []:
+                    try:
+                        s = float(seg.get("start", 0.0))
+                        e = float(seg.get("end", s))
+                        legacy_candidates.append({
+                            "start": s,
+                            "end": e,
+                            "text": seg.get("text", ""),
+                            "duration": max(0.0, e - s),
+                            "features": {},
+                            "meta": {"legacy_fallback": True},
+                        })
+                    except Exception:
+                        continue
+                viral_result = {"clips": legacy_candidates, "meta": {"fallback": True}}
             
             # Debug: log ft_status from enhanced pipeline
             if viral_result and "clips" in viral_result:
@@ -4013,8 +4262,27 @@ class ClipScoreService:
             
             for clip in ranked_clips:
                 try:
+                    # Store original end time for A/B metrics
+                    old_end = clip.get("end", 0.0)
+                    
                     # Step 1: Hill-climb refinement (increased max_nudge for better context)
                     s1, e1 = refine_bounds_with_hill_climb(clip, episode, max_nudge=8.0, step=0.05)
+                    
+                    # Step 1.5: Apply soft start pad and gentle filler trim (Phase 3)
+                    if episode_words:
+                        # Preserve all metadata from original clip
+                        temp_clip = dict(clip)  # Copy all fields including seed_idx, seed_sentence, etc.
+                        temp_clip['start'] = s1
+                        temp_clip['end'] = e1
+                        temp_clip = soft_start_pad_and_trim(temp_clip, episode_words, pad=settings.SEED_START_PAD_SEC, max_trim=0.6)
+                        s1, e1 = temp_clip['start'], temp_clip['end']
+                        
+                        # Preserve the refined metadata back to the original clip
+                        clip.update(temp_clip)
+                    
+                    # Track end delta for A/B metrics
+                    clip["end_delta_ms"] = int(1000 * (e1 - old_end))
+                    
                     # Step 2: Clean start/end guards
                     if not episode_words:
                         logger.warning("BOUNDARY_REFINEMENT: no episode words; skipping clean for this clip")

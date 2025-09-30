@@ -9,6 +9,18 @@ import logging
 from bisect import bisect_left
 import re
 
+# Import settings for feature flags
+try:
+    from backend.config import settings
+except ImportError:
+    # Fallback for when settings module isn't available
+    class MockSettings:
+        FEATURE_CONTEXT_SEEDS = True
+        FEATURE_SEMANTIC_END_BONUS = True
+        SEED_START_PAD_SEC = 0.45
+        SENT_PAUSE_FALLBACK_MS = 400
+    settings = MockSettings()
+
 # --- precision helpers ---
 _UNCERTAINTY = ["maybe","might","could","kinda","sort of","somewhat","probably","possibly","perhaps","i think","i guess","i feel like"]
 _CAUSAL = ["because","therefore","thus","which means","that means","as a result","here's why","the reason"]
@@ -44,6 +56,108 @@ def _ends_on_curiosity(text: str) -> bool:
     t = text.strip().lower()
     return any(kw in t[-80:] for kw in ["but", "however", "what you don't", "here's why", "the catch"]) \
         or t.endswith("?") or t.endswith("...")
+
+# -----------------------------------------
+# Context-Aware Clip Generation
+# -----------------------------------------
+
+@dataclass
+class SentenceSpan:
+    start: float
+    end: float
+    text: str
+    idx: int
+
+# Sentence boundary detection
+_SENT_END = re.compile(r'[.!?]["\']?$')
+
+# Payoff cues for complete thought detection
+_PAYOFF_CUES = (
+    "that's why", "that's why", "so that's", "so that's", "and that's", "and that's",
+    "which means", "this shows", "proves that", "the point is", "bottom line",
+    "in the end", "finally", "as a result", "so in short", "long story short"
+)
+
+def _has_terminal_punct(s: str) -> bool:
+    """Check if text ends with terminal punctuation"""
+    return bool(_SENT_END.search(s.strip()))
+
+def build_sentence_spans(words: List[Dict[str, Any]]) -> List[SentenceSpan]:
+    """
+    Build sentence spans from word-level timestamps.
+    Uses punctuation in 'after' or 'text'; falls back to long pauses if needed.
+    
+    Args:
+        words: [{'start': float, 'end': float, 'text': str, 'after': str?}, ...]
+    
+    Returns:
+        List of SentenceSpan objects
+    """
+    spans: List[SentenceSpan] = []
+    buf: List[str] = []
+    start_t = None
+    last_end = None
+    idx = 0
+    
+    for w in words:
+        if start_t is None:
+            start_t = w['start']
+        buf.append(w.get('text', ''))
+        after = (w.get('after') or '')
+        flush = False
+
+        # 1) Prefer punctuation
+        if _SENT_END.search(after or w.get('text', '')):
+            flush = True
+
+        # 2) Fallback: long pause
+        if not flush and last_end is not None:
+            gap_ms = int((w['start'] - last_end) * 1000)
+            if gap_ms >= settings.SENT_PAUSE_FALLBACK_MS:
+                flush = True
+
+        if flush:
+            # Join words and add punctuation from the last word
+            text = " ".join(buf).strip()
+            if after:
+                text += after
+            spans.append(SentenceSpan(start_t, w['end'], text, idx))
+            idx += 1
+            buf, start_t = [], None
+
+        last_end = w['end']
+
+    # Handle remaining buffer
+    if buf:
+        text = " ".join(buf).strip()
+        # Add punctuation from the last word if available
+        if words and words[-1].get('after'):
+            text += words[-1]['after']
+        spans.append(SentenceSpan(start_t or words[0]['start'], words[-1]['end'], text, idx))
+    
+    return spans
+
+def _is_strong_opening(text: str) -> bool:
+    """Check if text is a strong opening that could serve as a seed"""
+    t = text.lower().strip()
+    return (
+        t.endswith('?')
+        or any(t.startswith(p) for p in (
+            "look","listen","here's","here is","let me","the thing is",
+            "real talk","so here's","okay so","so today","what we're","we're gonna",
+            "and i'll","and i will","here's why","here's how"
+        ))
+        or any(t.startswith(p) for p in ("the 3","the three","top ","why ","how "))
+    )
+
+def _has_complete_payoff(text: str) -> bool:
+    """Check if text has a complete payoff with conclusion markers"""
+    tl = text.lower()
+    has_cue = any(cue in tl for cue in _PAYOFF_CUES)
+    ends_ok = _has_terminal_punct(tl)
+    sent_like = len(re.split(r'[.!?]+', tl)) >= 2
+    return has_cue and ends_ok and sent_like
+
 # -----------------------------------------
 
 FTStatus = Literal["finished", "sparse_finished", "unresolved"]
@@ -584,7 +698,7 @@ def _variantize_segment(seg, *, pl_v2: float, cap_s: float, eos_times: list[floa
             continue  # Skip impossible ends
             
         # Extend to coherent end
-        e = extend_to_coherent_end(best_end, eos_times or [], words, max_extend=3.5)
+        e = extend_to_coherent_end(best_end, eos_times or [], words)
         
         # Apply micro-jitter to break identical lengths
         e = _apply_micro_jitter(e, words, start)
@@ -2814,12 +2928,16 @@ def find_viral_clips_enhanced(segments: List[Dict], audio_file: str, genre: str 
         if optimal_segments:
             segments = optimal_segments
     
+    # Create dynamic segments with Phase 2 & 3 improvements (seed candidates)
+    dynamic_segments = create_dynamic_segments(segments, platform, eos_times, word_end_times)
+    logger.info(f"Created {len(dynamic_segments)} dynamic segments (including seed candidates)")
+    
     # Process each segment with enhanced features
     enhanced_segments = []
     skip_reasons = {}
-    logger.info(f"Processing {len(segments)} segments with enhanced pipeline")
+    logger.info(f"Processing {len(dynamic_segments)} segments with enhanced pipeline")
     
-    for i, segment in enumerate(segments):
+    for i, segment in enumerate(dynamic_segments):
         skip_reason = None
         
         # Check for skip reasons before processing
@@ -3646,13 +3764,86 @@ def find_natural_boundaries(text: str) -> List[Dict]:
     
     return unique_boundaries
 
-def create_dynamic_segments(segments: List[Dict], platform: str = 'tiktok', eos_times: list[float] | None = None) -> List[Dict]:
+def create_dynamic_segments(segments: List[Dict], platform: str = 'tiktok', eos_times: list[float] | None = None, words: List[Dict] = None) -> List[Dict]:
     """
     Create dynamic segments based on natural content boundaries and platform optimization.
+    Now includes context-first seed generation for better clip completeness.
+    
+    Args:
+        segments: List of transcript segments
+        platform: Target platform for length requirements
+        eos_times: End-of-sentence timestamps
+        words: Optional word-level data with timestamps and punctuation
     """
     # Local helper for null-safe length
     def _safe_len(x):
         return len(x) if isinstance(x, (list, tuple, str)) else 0
+    
+    # Context-first seed generation (Phase 2 - Real ASR Integration)
+    seed_candidates = []
+    if settings.FEATURE_CONTEXT_SEEDS and words:
+        # Use real word-level data for sentence span building
+        from services.transcript_builder import _distribute_punct_to_words
+        
+        # Distribute punctuation from segments to words
+        words_with_punct = _distribute_punct_to_words(segments)
+        log.info("CONTEXT_SEEDS: distributed punctuation to %d words", len(words_with_punct))
+        
+        if words_with_punct:
+            sentence_spans = build_sentence_spans(words_with_punct)
+            log.info("CONTEXT_SEEDS: built %d sentence spans from %d words", len(sentence_spans), len(words_with_punct))
+            
+            # Platform length requirements
+            platform_lengths = {
+                'tiktok': {'min': 8.0, 'max': 60.0},
+                'instagram': {'min': 8.0, 'max': 60.0},
+                'instagram_reels': {'min': 8.0, 'max': 60.0},
+                'youtube': {'min': 8.0, 'max': 60.0},
+                'youtube_shorts': {'min': 8.0, 'max': 60.0},
+                'twitter': {'min': 8.0, 'max': 60.0},
+                'linkedin': {'min': 8.0, 'max': 60.0}
+            }
+            target_length = platform_lengths.get(platform, platform_lengths['tiktok'])
+            
+            # Generate seed candidates
+            for i, s in enumerate(sentence_spans):
+                if not _is_strong_opening(s.text):
+                    continue
+
+                # Expand by whole sentences until platform min, then aim for payoff
+                start_i, end_i = i, i
+                # Pull light setup if tiny
+                while (sentence_spans[end_i].end - sentence_spans[start_i].start) < target_length["min"] and start_i > 0:
+                    start_i -= 1
+                while (sentence_spans[end_i].end - sentence_spans[start_i].start) < target_length["min"] and end_i < len(sentence_spans)-1:
+                    end_i += 1
+
+                # A few outward attempts to catch payoff
+                for _ in range(3):
+                    seg_text = " ".join(ss.text for ss in sentence_spans[start_i:end_i+1]).strip()
+                    dur = sentence_spans[end_i].end - sentence_spans[start_i].start
+                    if target_length["min"] <= dur <= target_length["max"] and (
+                        _has_complete_payoff(seg_text) or seg_text.strip().endswith(('.', '!', '?'))
+                    ):
+                        # Extract seed and payoff sentences for title generation
+                        seed_sentence = sentence_spans[i].text
+                        payoff_sentence = sentence_spans[end_i].text
+                        
+                        seed_candidates.append({
+                            "start": max(sentence_spans[start_i].start - settings.SEED_START_PAD_SEC, 0.0),
+                            "end": sentence_spans[end_i].end,
+                            "text": seg_text,
+                            "seed_idx": i,
+                            "seed_sentence": seed_sentence,
+                            "payoff_sentence": payoff_sentence,
+                            "boundary_type": "seed",
+                            "confidence": 0.9  # High confidence for seed-based clips
+                        })
+                        break
+                    if end_i < len(sentence_spans)-1:
+                        end_i += 1
+            
+            log.info("CONTEXT_SEEDS: generated %d seed candidates", len(seed_candidates))
     
     dynamic_segments = []
     
@@ -3855,7 +4046,18 @@ def create_dynamic_segments(segments: List[Dict], platform: str = 'tiktok', eos_
     # Apply final caps filtering to ensure all segments meet requirements
     final_segments = [seg for seg in final_segments if _keep(seg)]
     
-    return final_segments
+    # Combine seed candidates with original segments (seed-first ranking)
+    all_segments = seed_candidates + final_segments
+    
+    # Mark original segments as non-seed for ranking purposes
+    for seg in final_segments:
+        if 'seed_idx' not in seg:
+            seg['seed_idx'] = None
+    
+    log.info("CONTEXT_SEEDS: returning %d total segments (%d seed + %d original)", 
+             len(all_segments), len(seed_candidates), len(final_segments))
+    
+    return all_segments
 
 def _explain_viral_potential_v4(features: Dict, scoring: Dict, genre: str = 'general') -> str:
     """Generate human-readable explanation of viral potential with genre context"""

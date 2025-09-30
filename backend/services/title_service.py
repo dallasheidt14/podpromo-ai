@@ -202,7 +202,7 @@ def _hashtags_from_keywords(keywords: list[str], limit_total_chars: int = 45, ma
                 total = new_total
     return tags
 
-def _title_engine_v2(text: str, want: int = 6) -> list[str]:
+def _title_engine_v2(text: str, want: int = 6, seed_sentence: str | None = None, payoff_sentence: str | None = None) -> list[str]:
     """Title engine v2 facade with heuristic fallback"""
     try:
         # Try to use existing v2 engine
@@ -250,7 +250,7 @@ def _heuristic_title_generator(text: str, want: int = 6) -> list[str]:
     
     return titles[:want]
 
-def _generate_title_pack_uncached(clip_id: str, platform: str, text: str, episode_text: str | None = None, keywords: list[str] = None) -> dict:
+def _generate_title_pack_uncached(clip_id: str, platform: str, text: str, episode_text: str | None = None, keywords: list[str] = None, seed_sentence: str | None = None, payoff_sentence: str | None = None) -> dict:
     """
     Generate a complete title pack with labeled variants, overlay, and metadata.
     Returns dict with variants, overlay, engine, generated_at, meta fields.
@@ -264,7 +264,7 @@ def _generate_title_pack_uncached(clip_id: str, platform: str, text: str, episod
     budgets = PLAT_BUDGETS.get(platform, PLAT_BUDGETS["default"])
     
     # Generate raw titles using v2 engine
-    raw_titles = _title_engine_v2(text, want=6)
+    raw_titles = _title_engine_v2(text, want=6, seed_sentence=seed_sentence, payoff_sentence=payoff_sentence)
     
     # Post-process: filter filler, normalize, inject keywords, classify style, polish, enforce budgets
     def norm_one(s: str, limit: int) -> str:
@@ -342,7 +342,7 @@ def _generate_title_pack_uncached(clip_id: str, platform: str, text: str, episod
         "meta": meta
     }
 
-def generate_title_pack_v2(clip_id: str, platform: str, text: str, episode_text: str | None = None) -> dict:
+def generate_title_pack_v2(clip_id: str, platform: str, text: str, episode_text: str | None = None, seed_sentence: str | None = None, payoff_sentence: str | None = None) -> dict:
     """
     Generate a complete title pack with LRU caching for performance (v2 API).
     Returns dict with variants, overlay, engine, generated_at, meta fields.
@@ -357,19 +357,19 @@ def generate_title_pack_v2(clip_id: str, platform: str, text: str, episode_text:
     
     # Define the generation function with consistent keywords
     def _gen():
-        return _generate_title_pack_uncached(clip_id, platform, text, episode_text, keywords)
+        return _generate_title_pack_uncached(clip_id, platform, text, episode_text, keywords, seed_sentence, payoff_sentence)
     
     # Return cached result
     return _cached_title_pack(key, _gen_fn=_gen)
 
-def generate_title_pack(text: str, platform: str, episode_text: str | None = None) -> dict:
+def generate_title_pack(text: str, platform: str, episode_text: str | None = None, seed_sentence: str | None = None, payoff_sentence: str | None = None) -> dict:
     """
     Backward-compatible wrapper for existing callers (v1 API).
     Old callers use (text, platform). We map to v2 with an empty clip_id.
     Callers that have a real clip_id should prefer generate_title_pack_v2 for better caching/analytics.
     """
     clip_id = ""  # unknown here; callers like TitlesService don't pass it
-    return generate_title_pack_v2(clip_id=clip_id, platform=platform, text=text, episode_text=episode_text)
+    return generate_title_pack_v2(clip_id=clip_id, platform=platform, text=text, episode_text=episode_text, seed_sentence=seed_sentence, payoff_sentence=payoff_sentence)
 
 # Generic scaffold patterns to penalize
 GENERIC_SCAFFOLD_RE = re.compile(
@@ -1443,6 +1443,8 @@ def generate_titles(
     clip_id: Optional[str] = None,
     start: Optional[float] = None,
     end: Optional[float] = None,
+    seed_sentence: Optional[str] = None,
+    payoff_sentence: Optional[str] = None,
     episode_vocab: Optional[dict] = None,
 ) -> List[Dict[str, object]]:
     """
@@ -1501,6 +1503,10 @@ def generate_titles(
     platform = normalize_platform(platform)
     avoid_set = set(avoid_titles or [])
     
+    # Use seed/payoff sentences if provided (Phase 3 integration)
+    hook_text = seed_sentence or clean_text.split('.')[0][:120] if clean_text else ""
+    payoff_text = payoff_sentence or clean_text[-200:] if clean_text else ""
+    
     # Reset cache on new episode
     if episode_id:
         maybe_reset_cache(episode_id)
@@ -1516,7 +1522,26 @@ def generate_titles(
                 return filtered_titles[:n]
     
     # Use dynamic title generation as the PRIMARY method
-    dynamic_titles = _generate_dynamic_titles(clean_text, platform)
+    dynamic_titles = _generate_dynamic_titles(clean_text, platform) or []
+    
+    # NEW: Integrate seed/payoff sentences for enhanced title generation (Phase 2 & 3)
+    hook = (seed_sentence or "").strip()
+    payoff = (payoff_sentence or "").strip()
+    
+    if hook and payoff:
+        # Create hook→payoff pattern titles
+        dynamic_titles.insert(0, f"{hook} → {payoff}")
+        dynamic_titles.insert(1, f"Why {hook.rstrip('?')}? {payoff}")
+        dynamic_titles.insert(2, f"{hook} (and {payoff})")
+    elif hook:
+        # Use seed sentence as primary hook
+        dynamic_titles.insert(0, hook[:80])
+        dynamic_titles.insert(1, f"Why {hook.rstrip('?')}?")
+    elif payoff:
+        # Use payoff sentence for conclusion-focused titles
+        dynamic_titles.insert(0, f"The Key Insight: {payoff[:60]}")
+        dynamic_titles.insert(1, f"Here's What Matters: {payoff[:60]}")
+    
     if dynamic_titles:
         variants = dynamic_titles
         # Extract keywords for logging

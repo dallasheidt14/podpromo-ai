@@ -234,6 +234,24 @@ def format_candidate(seg_features: dict, *, platform: str, genre: str, full_epis
         "platform": platform,
         "genre": genre,
     }
+    
+    # Add seed/payoff fields for Phase 2 & 3 context signals
+    cand.update({
+        "seed_idx": seg_features.get("seed_idx"),
+        "seed_sentence": seg_features.get("seed_sentence"),
+        "payoff_sentence": seg_features.get("payoff_sentence"),
+    })
+    
+    # Ensure start/end/duration are properly formatted for UI
+    try:
+        start_time = float(seg_features.get("start") or 0.0)
+        end_time = float(seg_features.get("end") or 0.0)
+    except (ValueError, TypeError):
+        start_time, end_time = 0.0, 0.0
+    
+    cand["start"] = start_time
+    cand["end"] = end_time
+    cand["duration"] = round(max(0.0, end_time - start_time), 2)
 
     # always present scoring components (or 0.0 defaults)
     cand["hook_score"]      = _num(seg_features, "hook_score", 0.0)
@@ -309,7 +327,12 @@ def format_candidates(
             n=6, 
             avoid_titles={t for t in used_title_keys},
             episode_id=episode_id,
-            clip_id=clip_id
+            clip_id=clip_id,
+            start=start_float,
+            end=end_float,
+            # NEW: Pass seed/payoff sentences for enhanced title generation
+            seed_sentence=seg.get("seed_sentence") or features.get("seed_sentence"),
+            payoff_sentence=seg.get("payoff_sentence") or features.get("payoff_sentence"),
         )
         # Normalize variants to handle both List[str] and List[dict] returns
         variants = _normalize_title_variants(variants)

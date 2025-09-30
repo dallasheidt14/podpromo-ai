@@ -6,6 +6,33 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+def _distribute_punct_to_words(segments):
+    """
+    Distribute punctuation from segment text to the final word of each sentence.
+    This enables sentence span detection in context-aware clip generation.
+    """
+    words = []
+    for seg in segments:
+        seg_words = seg.get('words', [])
+        if not seg_words:
+            continue
+            
+        # Extract punctuation from segment text
+        seg_text = seg.get('text', '').strip()
+        tail_punct = ''
+        if seg_text.endswith(('.', '!', '?')):
+            tail_punct = seg_text.rstrip()[-1]
+        
+        # Distribute punctuation to the last word of each segment
+        for j, w in enumerate(seg_words):
+            w = dict(w)  # Make a copy
+            w['after'] = ''
+            if j == len(seg_words) - 1 and tail_punct:
+                w['after'] = tail_punct
+            words.append(w)
+    
+    return words
+
 def _concat_segment_text(source, start_s: float, end_s: float) -> str:
     """
     Build transcript by concatenating segment texts that overlap [start, end].

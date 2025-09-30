@@ -230,3 +230,15 @@ ASR_PROGRESS_LABEL_HQ = os.getenv("ASR_PROGRESS_LABEL_HQ", "transcribing_hq")
 
 # Feature weight adjustments for low ASR quality
 ENABLE_ASR_QUALITY_WEIGHTING = _bool("ENABLE_ASR_QUALITY_WEIGHTING", True)
+
+# -------- Context-Aware Clip Generation --------
+# Feature flags for context-first clip generation
+FEATURE_CONTEXT_SEEDS = _bool("FEATURE_CONTEXT_SEEDS", True)  # enable sentence-seed candidates
+FEATURE_SEMANTIC_END_BONUS = _bool("FEATURE_SEMANTIC_END_BONUS", True)  # nudge hill-climb to semantic endings
+
+# Context generation settings
+SEED_START_PAD_SEC = _float("SEED_START_PAD_SEC", 0.45)  # warm-in pad for seed clips
+SENT_PAUSE_FALLBACK_MS = _int("SENT_PAUSE_FALLBACK_MS", 400)  # if punctuation missing, use pause
+
+# Fallback selector settings
+FALLBACK_TOPK = _int("FALLBACK_TOPK", 5)

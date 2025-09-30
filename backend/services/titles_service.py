@@ -665,9 +665,13 @@ class TitlesService:
             # Get language hint if available
             language = features.get("language", "en")
             
+            # Extract seed and payoff sentences for enhanced title generation (Phase 3)
+            seed_sentence = clip.get('seed_sentence')
+            payoff_sentence = clip.get('payoff_sentence')
+            
             # Generate title pack using v1 API
             from .title_service import generate_title_pack
-            pack = generate_title_pack(text=snippet, platform=platform)
+            pack = generate_title_pack(text=snippet, platform=platform, seed_sentence=seed_sentence, payoff_sentence=payoff_sentence)
             
             # Extract variants from the pack with fallback
             variants = [v["title"] for v in pack.get("variants", [])] if pack.get("variants") else []
