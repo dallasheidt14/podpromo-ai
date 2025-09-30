@@ -670,37 +670,51 @@ def _normalize_display_by_band(cands: list[dict]) -> list[dict]:
             c["rank_score"] = float(c.get("display_score", c.get("final_score", 0.0)))
     return cands
 
-def _mmr_select_jaccard(items: list[dict], *, top_k: int, text_key: str = "text", lam: float = 0.7) -> list[dict]:
-    """MMR using simple Jaccard over token sets; no extra deps. Null-safe version."""
-    if not items or top_k <= 0:
+def _mmr_select_jaccard(items, top_k, text_key="text", lam=0.7):
+    """
+    Null-safe MMR with Jaccard diversity over token sets.
+    items: list of dicts with 'text' (or text_key) and 'rank_score'/'raw_score'
+    Returns: list[dict] of chosen items
+    """
+    if not items:
         return []
-    
-    # Ensure fields exist
-    for it in items:
-        it.setdefault("text", "")
-        it.setdefault("rank_score", 0.0)
-        it.setdefault("raw_score", 0.0)
-    
-    top_k = min(top_k, len(items))
-    
-    def tokset(s: str): 
-        return set(w for w in (s or "").lower().split())
-    
-    T = [tokset(it.get(text_key,"")) for it in items]
-    S, chosen = set(), []
-    
-    while items and len(chosen) < top_k:
-        best_i, best = None, -1e9
-        for i, it in enumerate(items):
-            rel = float(it.get("rank_score", it.get("raw_score",0.0)))
-            div = 0.0
-            if chosen:
-                div = max(len(T[i]&T[j]) / max(1,len(T[i]|T[j])) for j in S)
-            sc = lam*rel - (1-lam)*div
-            if sc > best:
-                best, best_i = sc, i
-        S.add(len(chosen))  # index in chosen space doesn't matter for div since we recompute each round
-        chosen.append(items.pop(best_i))
+
+    # Work on copies to avoid mutating source
+    pool = [dict(x) for x in items]
+
+    def tokset(s):
+        s = (s or "").lower()
+        # simple whitespace tokenization is fine for our use
+        return set(s.split())
+
+    def score_of(it):
+        # prefer rank_score; fall back to raw_score; else 0.0
+        return float(it.get("rank_score", it.get("raw_score", 0.0)) or 0.0)
+
+    tokens = [tokset(it.get(text_key, it.get("text", ""))) for it in pool]
+    chosen, chosen_tokens = [], []
+
+    while pool and len(chosen) < top_k:
+        best_i, best_val = 0, -1e9
+        for i, it in enumerate(pool):
+            rel = score_of(it)
+            if chosen_tokens:
+                # diversity = max Jaccard similarity to anything we've picked
+                t = tokens[i]
+                div = max(
+                    (len(t & ct) / max(1, len(t | ct)) for ct in chosen_tokens),
+                    default=0.0
+                )
+            else:
+                div = 0.0
+            # standard MMR: maximize lambda*relevance - (1-lambda)*diversity
+            val = lam * rel - (1.0 - lam) * div
+            if val > best_val:
+                best_val, best_i = val, i
+
+        chosen.append(pool.pop(best_i))
+        chosen_tokens.append(tokens.pop(best_i))
+
     return chosen
 
 # Import gate calibration constants
