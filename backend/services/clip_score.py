@@ -440,37 +440,39 @@ def _is_terminal_char(ch: str) -> bool:
 def _gap_after(words, i) -> float:
     """gap from end of words[i] to start of words[i+1]"""
     if i < 0 or i+1 >= len(words): return 9999.0
-    end_i = words[i]['t'] + words[i].get('d', 0.0)
-    return max(0.0, words[i+1]['t'] - end_i)
+    end_i = _w_end(words[i])
+    start_next = _w_start(words[i+1])
+    return max(0.0, start_next - end_i)
 
 def _gap_before(words, i) -> float:
     """gap from end of words[i-1] to start of words[i]"""
     if i <= 0 or i >= len(words): return 9999.0
-    end_prev = words[i-1]['t'] + words[i-1].get('d', 0.0)
-    return max(0.0, words[i]['t'] - end_prev)
+    end_prev = _w_end(words[i-1])
+    start_i = _w_start(words[i])
+    return max(0.0, start_i - end_prev)
 
 def _nearest_boundary_backward(words, t, max_seek=1.5, min_gap=0.35):
     """walk left to an EOS char or a long enough gap"""
-    i = max(0, max(range(len(words)), key=lambda k: words[k]['t'] <= t and words[k]['t'] or -1))
+    i = max(0, max(range(len(words)), key=lambda k: _w_start(words[k]) <= t and _w_start(words[k]) or -1))
     best = t
     anchor = t
-    while i > 0 and (anchor - words[i]['t']) <= max_seek:
-        token = words[i].get('w','')
+    while i > 0 and (anchor - _w_start(words[i])) <= max_seek:
+        token = _w_text(words[i])
         if _is_terminal_char(token.strip()[-1:]) or _gap_before(words, i) >= min_gap:
-            best = words[i]['t']
+            best = _w_start(words[i])
             break
         i -= 1
     return best
 
 def _nearest_boundary_forward(words, t, max_seek=2.0, min_gap=0.40):
     """walk right to an EOS char or a long enough gap"""
-    i = min(len(words)-1, min(range(len(words)), key=lambda k: words[k]['t'] >= t and words[k]['t'] or 10**9))
+    i = min(len(words)-1, min(range(len(words)), key=lambda k: _w_start(words[k]) >= t and _w_start(words[k]) or 10**9))
     best = t
     anchor = t
-    while i < len(words)-1 and (words[i]['t'] - anchor) <= max_seek:
-        token = words[i].get('w','')
+    while i < len(words)-1 and (_w_start(words[i]) - anchor) <= max_seek:
+        token = _w_text(words[i])
         if _is_terminal_char(token.strip()[-1:]) or _gap_after(words, i) >= min_gap:
-            end_i = words[i]['t'] + words[i].get('d', 0.0)
+            end_i = _w_end(words[i])
             best = end_i
             break
         i += 1
