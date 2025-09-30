@@ -2878,7 +2878,7 @@ def compute_features_v4_enhanced(segment: Dict, audio_file: str, y_sr=None, genr
     
     return result
 
-def find_viral_clips_enhanced(segments: List[Dict], audio_file: str, genre: str = 'general', platform: str = 'tiktok', fallback_mode: bool = None, effective_eos_times: List[float] = None, effective_word_end_times: List[float] = None, eos_source: str = None) -> Dict:
+def find_viral_clips_enhanced(segments: List[Dict], audio_file: str, genre: str = 'general', platform: str = 'tiktok', fallback_mode: bool = None, effective_eos_times: List[float] = None, effective_word_end_times: List[float] = None, eos_source: str = None, episode_words: List[Dict] = None) -> Dict:
     """
     Enhanced viral clip finding with Phase 1, 2 & 3 improvements:
     - Path whitening
@@ -3017,14 +3017,27 @@ def find_viral_clips_enhanced(segments: List[Dict], audio_file: str, genre: str 
             
             enhanced_segments[i] = grow_to_bins(segment, audio_file, genre, platform, eos_times, word_end_times, fallback_mode, ft)
     
-    # Sort by final score, then platform fit, then duration (prefer longer)
-    def sort_key(seg):
-        return (
-            round(seg.get('final_score', 0), 3),
-            round(seg.get('platform_length_score_v2', 0.0), 3),
-            round((seg.get('end', 0) - seg.get('start', 0)), 2)
-        )
-    enhanced_segments.sort(key=sort_key, reverse=True)
+    # Use enhanced selection with null-safe processing and adaptive gating
+    from services.clip_score import _enhanced_select_and_rank
+    
+    # Use episode words if available, otherwise create from segments
+    words = episode_words or []
+    if not words:
+        # Fallback: create word data from segments
+        for seg in enhanced_segments:
+            if 'words' in seg:
+                words.extend(seg['words'])
+            else:
+                # Create mock word data from segment timing
+                words.append({
+                    'start': seg.get('start', 0),
+                    'end': seg.get('end', seg.get('start', 0) + 1),
+                    'text': seg.get('text', ''),
+                    'w': seg.get('text', '')
+                })
+    
+    # Apply enhanced selection
+    top_clips = _enhanced_select_and_rank(enhanced_segments, words, {'platform': platform})
     
     # Log score distribution
     if enhanced_segments:
@@ -3037,9 +3050,6 @@ def find_viral_clips_enhanced(segments: List[Dict], audio_file: str, genre: str 
             display_score = seg.get('display_score', 0)
             text_length = len(seg.get('text', '').split())
             logger.info(f"Top segment {i+1}: score={score:.3f}, display={display_score}, words={text_length}")
-    
-    # Take top clips
-    top_clips = enhanced_segments[:10]  # Top 10 clips
     
     # Diversity guard: ensure at least one long platform-fit clip
     if len(top_clips) >= 4 and max(c.get('end', 0) - c.get('start', 0) for c in top_clips) < 16.0:

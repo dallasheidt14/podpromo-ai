@@ -2052,7 +2052,10 @@ def _enhanced_select_and_rank(candidates: List[Dict], words: List[Dict], platfor
         filtered = filter_low_quality(candidates, mode="soft")
     if not filtered:
         logger.warning("ENHANCED: soft gates empty → top-K by score")
-        filtered = sorted(candidates, key=lambda x: x.get("final_score", 0.0), reverse=True)[:max(5, min(12, len(candidates)))]
+        # Be more lenient - take more candidates
+        filtered = sorted(candidates, key=lambda x: x.get("final_score", 0.0), reverse=True)[:max(6, min(15, len(candidates)))]
+    
+    logger.info(f"ENHANCED: after filtering: {len(filtered)} candidates")
     
     # Choose finals safely
     desired_k = max(6, min(12, len(filtered)))
@@ -3686,6 +3689,7 @@ class ClipScoreService:
                     effective_eos_times=eos_times,
                     effective_word_end_times=word_end_times,
                     eos_source=eos_source,
+                    episode_words=episode_words,
                 )
                 if not viral_result or not viral_result.get("clips"):
                     raise RuntimeError("ENHANCED_EMPTY")
