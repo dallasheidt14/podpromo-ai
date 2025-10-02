@@ -54,6 +54,30 @@ export const ClipCard: React.FC<{ clip: Clip; onClick?: () => void }> = ({ clip,
         <MiniBar label="Platform fit" pct={platform} title="Length-fit for Shorts/TikTok/Reels" />
       </div>
 
+      {/* Platform Recommendations */}
+      {clip.platform_recommendations && clip.platform_recommendations.length > 0 && (
+        <div className="mt-3">
+          <div className="text-xs text-gray-500 mb-1">Will Perform Best On:</div>
+          <div className="flex flex-wrap gap-1">
+            {clip.platform_recommendations
+              .filter(rec => rec.fit_score >= 0.7) // Only show high-fit platforms
+              .slice(0, 3) // Limit to top 3
+              .map((rec, index) => (
+                <span
+                  key={index}
+                  className="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-blue-100 text-blue-800"
+                  title={rec.reason}
+                >
+                  {rec.platform === 'shorts' ? 'YouTube Shorts' : 
+                   rec.platform === 'tiktok' ? 'TikTok' :
+                   rec.platform === 'reels' ? 'Instagram Reels' :
+                   rec.platform.charAt(0).toUpperCase() + rec.platform.slice(1)}
+                </span>
+              ))}
+          </div>
+        </div>
+      )}
+
       {/* Additional score breakdown */}
       <div className="grid grid-cols-3 gap-2 mt-2 text-xs">
         <div className="text-center">

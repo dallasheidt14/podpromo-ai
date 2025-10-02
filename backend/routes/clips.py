@@ -299,6 +299,7 @@ def _load_clips(ep_id: str) -> List[Dict[str, Any]]:
                     "emotion_score": clip.get('features', {}).get('emotion_score', 0),
                     "payoff_score": clip.get('features', {}).get('payoff_score', 0),
                 } if clip.get('features') else None,
+                "platform_recommendations": clip.get('platform_recommendations', []),
                 "previewUrl": f"/api/preview/{ep_id}/{clip_id}.mp3",
                 "vttUrl": f"/api/captions/{ep_id}/{clip_id}.vtt",
             }

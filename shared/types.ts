@@ -8,6 +8,12 @@ export interface Episode {
   uploadedAt?: string;
 }
 
+export interface PlatformRecommendation {
+  platform: string;
+  fit_score: number;
+  reason: string;
+}
+
 export interface Clip {
   id: string;
   start: number;
@@ -21,6 +27,7 @@ export interface Clip {
   full_transcript?: string;
   is_advertisement?: boolean;
   features?: Record<string, any>;
+  platform_recommendations?: PlatformRecommendation[];
   [key: string]: any;
 }
 

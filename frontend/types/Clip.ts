@@ -1,4 +1,10 @@
 // types/Clip.ts
+export interface PlatformRecommendation {
+  platform: string;
+  fit_score: number;
+  reason: string;
+}
+
 export interface Clip {
   id: string;
   title?: string;
@@ -12,6 +18,7 @@ export interface Clip {
   virality_pct?: number;        // 0–100
   platform_fit?: number;        // 0–1
   platform_fit_pct?: number;    // 0–100
+  platform_recommendations?: PlatformRecommendation[];
 
   // nice-to-have if you return them:
   confidence?: string;       // "Low" | "Med" | "High"
