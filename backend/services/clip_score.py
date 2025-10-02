@@ -1422,46 +1422,123 @@ def tighten_selection(clips, finished_required=True):
     
     return tightened
 
+def calculate_safety_penalty(clip: dict, platform: str) -> float:
+    """
+    Calculate safety penalty for violent profanity.
+    Returns penalty coefficient (0.0 to 1.0) to subtract from final_score.
+    """
+    text = (clip.get("text") or "").lower()
+    if not text:
+        return 0.0
+    
+    # Platform-specific penalty coefficients
+    platform_coeffs = {
+        "tiktok": 0.25,
+        "x": 0.25,  # Twitter/X
+        "youtube": 1.0,
+        "facebook": 1.0,
+        "instagram": 1.0,
+        "reels": 1.0,
+        "default": 1.0
+    }
+    
+    # Get platform coefficient
+    platform_key = platform.lower() if platform else "default"
+    coeff = platform_coeffs.get(platform_key, platform_coeffs["default"])
+    
+    # Simple profanity detection (expand as needed)
+    violent_profanity = [
+        "kill", "murder", "death", "die", "dead", "blood", "violence", "fight", "attack",
+        "hate", "destroy", "damn", "hell", "shit", "fuck", "bitch", "asshole"
+    ]
+    
+    # Count violent profanity instances
+    penalty_count = 0
+    for word in violent_profanity:
+        penalty_count += text.count(word)
+    
+    # Calculate penalty (soft, not hard drop)
+    if penalty_count == 0:
+        return 0.0
+    
+    # Base penalty scaled by platform tolerance
+    base_penalty = min(0.3, penalty_count * 0.1)  # Max 30% penalty
+    final_penalty = base_penalty * coeff
+    
+    # Log penalty application
+    if final_penalty > 0:
+        logger.info(f"SAFETY_PENALTY: clip={clip.get('id', 'unknown')}, platform={platform}, penalty={final_penalty:.3f}, coeff={coeff}")
+    
+    return final_penalty
+
 def apply_duration_diversity(clips):
-    """Apply soft duration diversity - prefer mix of short/mid/long clips"""
+    """Apply platform-aware duration diversity with configurable buckets"""
     if len(clips) <= 3:
         return clips  # Not enough clips to diversify
     
+    # Configurable buckets via environment
+    bucket_config = os.getenv("BUCKETS", "sub20,20to45,45to120,120plus")
+    buckets = bucket_config.split(",")
+    
+    # Default bucket definitions
+    bucket_definitions = {
+        "sub20": (0, 20),
+        "20to45": (20, 45), 
+        "45to120": (45, 120),
+        "120plus": (120, float('inf'))
+    }
+    
     # Categorize clips by duration
-    short_clips = []  # 6-12s
-    mid_clips = []    # 13-22s  
-    long_clips = []   # 23-30s
+    bucket_clips = {bucket: [] for bucket in buckets}
     
     for clip in clips:
-        dur = float(clip.get("dur", 0.0))
-        if 6 <= dur <= 12:
-            short_clips.append(clip)
-        elif 13 <= dur <= 22:
-            mid_clips.append(clip)
-        elif 23 <= dur <= 30:
-            long_clips.append(clip)
+        dur = float(clip.get("dur", clip.get("duration", 0.0)))
+        if dur <= 0:
+            continue
+            
+        # Find appropriate bucket
+        for bucket in buckets:
+            min_dur, max_dur = bucket_definitions.get(bucket, (0, float('inf')))
+            if min_dur <= dur < max_dur:
+                bucket_clips[bucket].append(clip)
+                break
         else:
-            # Other durations - add to mid by default
-            mid_clips.append(clip)
+            # Fallback to first bucket if no match
+            bucket_clips[buckets[0]].append(clip)
     
-    # Soft target mix: Short: 1-2, Mid: 2-3, Long: 0-1
-    # Sort each category by virality score
-    short_clips.sort(key=lambda c: c.get("display_score", c.get("score", 0.0)), reverse=True)
-    mid_clips.sort(key=lambda c: c.get("display_score", c.get("score", 0.0)), reverse=True)
-    long_clips.sort(key=lambda c: c.get("display_score", c.get("score", 0.0)), reverse=True)
+    # Sort each bucket by final score
+    for bucket in buckets:
+        bucket_clips[bucket].sort(key=lambda c: c.get("final_score", c.get("display_score", c.get("score", 0.0))), reverse=True)
     
-    # Select diverse mix
+    # Score-first with targeted injection
     diverse = []
-    diverse.extend(short_clips[:2])  # Up to 2 short clips
-    diverse.extend(mid_clips[:3])    # Up to 3 mid clips
-    diverse.extend(long_clips[:1])   # Up to 1 long clip
+    used_clip_ids = set()
     
-    # If we have fewer than original, add remaining high-scoring clips
+    # Take top clips from each bucket (score-first approach)
+    for bucket in buckets:
+        clips_in_bucket = bucket_clips[bucket]
+        if clips_in_bucket:
+            # Take the highest-scored clip from this bucket
+            top_clip = clips_in_bucket[0]
+            if top_clip['id'] not in used_clip_ids:
+                diverse.append(top_clip)
+                used_clip_ids.add(top_clip['id'])
+    
+    # If we need more clips, fill from highest-scored remaining clips
     if len(diverse) < len(clips):
-        all_clips = short_clips + mid_clips + long_clips
-        remaining = [c for c in all_clips if c not in diverse]
-        remaining.sort(key=lambda c: c.get("display_score", c.get("score", 0.0)), reverse=True)
-        diverse.extend(remaining[:len(clips) - len(diverse)])
+        all_remaining = []
+        for bucket in buckets:
+            for clip in bucket_clips[bucket]:
+                if clip['id'] not in used_clip_ids:
+                    all_remaining.append(clip)
+        
+        all_remaining.sort(key=lambda c: c.get("final_score", c.get("display_score", c.get("score", 0.0))), reverse=True)
+        needed = len(clips) - len(diverse)
+        diverse.extend(all_remaining[:needed])
+    
+    # Log diversification results
+    bucket_counts = {bucket: len([c for c in diverse if c['id'] in [bc['id'] for bc in bucket_clips[bucket]]]) for bucket in buckets}
+    logger.info(f"DURATION_DIVERSITY: buckets={bucket_counts}, total={len(diverse)}")
     
     return diverse
 
@@ -1812,7 +1889,7 @@ from services.secret_sauce_pkg import compute_features_v4, score_segment_v4, exp
 from services.viral_moment_detector import ViralMomentDetector
 from services.progress_writer import write_progress
 from services.prerank import pre_rank_candidates, get_safety_candidates, pick_stratified
-from services.quality_filters import fails_quality, filter_overlapping_candidates, filter_low_quality
+from services.utils.logging_ext import log_json
 from services.candidate_formatter import format_candidates
 
 # Enhanced compute function with all Phase 1-3 features
@@ -1980,10 +2057,10 @@ def _get_platform_mode():
     # keep at least one long clip in traditional/platform-biased modes
     platform_protect = os.getenv("PLATFORM_PROTECT", "1") in ("1", "true", "True")
     # when TRUE we treat all lengths neutrally and cap long-count
-    # Enable length-agnostic mode when enhanced pipeline is active
+    # Default to OFF (0) - still overrideable by env
     try:
         from config import settings
-        length_agnostic = os.getenv("LENGTH_AGNOSTIC", "1" if settings.PP_ENHANCED else "0") in ("1", "true", "True")
+        length_agnostic = os.getenv("LENGTH_AGNOSTIC", "0") in ("1", "true", "True")
     except ImportError:
         # Fallback if config not available
         length_agnostic = os.getenv("LENGTH_AGNOSTIC", "0") in ("1", "true", "True")
@@ -4373,8 +4450,22 @@ class ClipScoreService:
             for c in finals:
                 c["protected"] = c.get("protected", False)
             
-            # Stable final ordering: protected clips first, then by score
-            finals.sort(key=lambda c: (c.get("protected", False), c.get("final_score", 0)), reverse=True)
+            # Deterministic ordering with stable sort key
+            import hashlib, random
+            seed = int(hashlib.md5(episode_id.encode()).hexdigest()[:8], 16)
+            random.seed(seed)
+            
+            def _stable_key(c):
+                finished_like = 1 if (c.get("finished_thought") or c.get("ft_status") in ("finished","sparse_finished")) else 0
+                coverage = float(c.get("ft_coverage_ratio") or 0.0)
+                novelty  = float(c.get("novelty_score") or 0.0)
+                length_s = float(c.get("duration") or 0.0)
+                start    = float(c.get("start") or 0.0)
+                vir      = float(c.get("final_score") or 0.0)
+                # Higher first → negative sort key
+                return (-finished_like, -coverage, -novelty, -length_s, -vir, start)
+            
+            finals.sort(key=_stable_key)
             
             # Apply temporal deduplication to remove near-duplicate clips
             if finals:
@@ -4385,6 +4476,15 @@ class ClipScoreService:
                 after_count = len(finals)
                 if before_count != after_count:
                     logger.info(f"DEDUP_BY_TIME: {before_count} → {after_count} kept ({before_count - after_count} removed), thresh={iou_thresh}")
+            
+            # Apply semantic deduplication after timing dedupe
+            if finals and os.getenv("SEMANTIC_DEDUPE", "1") in ("1","true","True"):
+                before_semantic = len(finals)
+                sim_thresh = float(os.getenv("SEMANTIC_SIM", "0.92"))
+                finals = semantic_dedupe(finals, sim_thresh=sim_thresh)
+                after_semantic = len(finals)
+                if before_semantic != after_semantic:
+                    logger.info(f"SEMANTIC_DEDUPE: {before_semantic} → {after_semantic} kept ({before_semantic - after_semantic} removed), thresh={sim_thresh}")
             
             # Debug: Log final saved set with durations and protected flags
             final_info = []
@@ -4397,7 +4497,13 @@ class ClipScoreService:
             logger.info(f"FINAL_PICK_BEFORE_LIMITS: n={len(finals)} :: [{', '.join(final_info)}]")
             
             # Determine finished requirement based on authoritative enhanced status
-            finished_required = FINISHED_THOUGHT_REQUIRED and not authoritative_enhanced
+            # Fix: Prevent unfinished clips from sneaking through when "authoritative" is set
+            is_finished_like = any(_is_finished_like(c) for c in finals)
+            coverage = len([c for c in finals if _is_finished_like(c)]) / max(len(finals), 1)
+            finished_required = FINISHED_THOUGHT_REQUIRED and not (authoritative_enhanced and is_finished_like and coverage >= 0.66)
+            
+            # Structured logging for gates
+            log_json(logger, "GATES", finished_required=finished_required, authoritative=authoritative_enhanced, coverage=coverage)
             
             # Apply min-max normalization over finals for proper score spread
             if len(finals) > 1:
@@ -4405,11 +4511,50 @@ class ClipScoreService:
                 vmin, vmax = min(scores), max(scores)
                 
                 if vmax - vmin < 1e-6:
-                    # Guard against score collapse - set neutral scores
+                    # Virality collapse fallback: use z-score on composite + tie-breaking
+                    logger.info("VIRALITY_COLLAPSE: min≈max detected, switching to z-score fallback")
+                    
+                    # Structured logging for virality collapse
+                    log_json(logger, "VIRALITY", scaler="zscore", range=vmax-vmin, collapse=True)
+                    
+                    # Create composite scores (virality + hook + insight + novelty)
+                    composite_scores = []
                     for c in finals:
-                        c['virality_pct'] = 50.0
-                        c['display_score'] = 50.0
-                    logger.info("VIRALITY_MINMAX: score collapse detected, set neutral virality_pct=50.0")
+                        virality = c.get('virality_score', c.get('composite_score', c.get('final_score', 0)))
+                        hook = c.get('hook', 0.0)
+                        insight = c.get('info', 0.0)  # info score as insight proxy
+                        novelty = c.get('payoff', 0.0)  # payoff as novelty proxy
+                        composite = virality + hook + insight + novelty
+                        composite_scores.append(composite)
+                    
+                    # Calculate z-scores
+                    import statistics
+                    if len(composite_scores) > 1:
+                        mean_comp = statistics.mean(composite_scores)
+                        stdev_comp = statistics.stdev(composite_scores) if len(composite_scores) > 1 else 1.0
+                        
+                        for i, c in enumerate(finals):
+                            z_score = (composite_scores[i] - mean_comp) / stdev_comp if stdev_comp > 0 else 0.0
+                            # Convert z-score to percentage (0-100 range)
+                            virality_pct = max(0, min(100, 50 + z_score * 15))  # Scale z-score to reasonable range
+                            c['virality_pct'] = round(virality_pct, 1)
+                            c['display_score'] = round(virality_pct, 1)
+                            c['z_score'] = z_score  # Store for debugging
+                    else:
+                        # Single clip case
+                        for c in finals:
+                            c['virality_pct'] = 50.0
+                            c['display_score'] = 50.0
+                    
+                    # Apply tie-breaking: finished > longer > novelty
+                    finals.sort(key=lambda c: (
+                        c.get('finished_thought', False),  # finished first
+                        c.get('end', 0) - c.get('start', 0),  # longer first
+                        c.get('payoff', 0.0),  # novelty (payoff) first
+                        c.get('virality_pct', 0.0)  # z-score last
+                    ), reverse=True)
+                    
+                    logger.info(f"VIRALITY_COLLAPSE: applied z-score fallback with tie-breaking, virality_pct={[c.get('virality_pct', 0) for c in finals[:3]]}")
                 else:
                     # Apply min-max normalization
                     for c in finals:
@@ -4418,6 +4563,9 @@ class ClipScoreService:
                         c['virality_pct'] = round(virality_pct, 1)
                         c['display_score'] = round(virality_pct, 1)
                     logger.info(f"VIRALITY_MINMAX: vmin={vmin:.3f} vmax={vmax:.3f} → virality_pct={[c.get('virality_pct', 0) for c in finals[:3]]}")
+                    
+                    # Structured logging for normal virality
+                    log_json(logger, "VIRALITY", scaler="minmax", range=vmax-vmin, collapse=False)
             
             # Tighten selection after gating
             finals = tighten_selection(finals, finished_required=finished_required)
@@ -4607,6 +4755,13 @@ class ClipScoreService:
                     # Blend platform score with final score
                     clip["final_score"] = clip.get("final_score", 0) * (1 - pl_v2_weight) + pl_v2 * pl_v2_weight
                     clip["display_score"] = clip["final_score"]
+                    
+                    # Apply safety penalty (soft penalty, not hard drop)
+                    safety_penalty = calculate_safety_penalty(clip, platform)
+                    if safety_penalty > 0:
+                        clip["final_score"] = max(0.0, clip["final_score"] - safety_penalty)
+                        clip["display_score"] = clip["final_score"]
+                        clip["safety_penalty"] = safety_penalty
             
             # Log platform-aware selection info
             logger.info(f"SELECTION: platform_neutral={PLATFORM_NEUTRAL_SELECTION}")
@@ -4887,6 +5042,18 @@ class ClipScoreService:
                 logger.warning("LIMITS_PIPE_EMPTY: restoring %d finals", len(finals_before_limits))
                 final_clips = finals_before_limits
             
+            # Final "No-Ad" Hard Gate (belt-and-suspenders)
+            # Stops any ad that slips past earlier stages
+            from services.ads import looks_like_ad
+            pre_ad_gate_count = len(final_clips)
+            final_clips = [c for c in final_clips if not (
+                c.get("is_advertisement", False) or 
+                looks_like_ad(c.get("text", ""))
+            )]
+            ad_gate_filtered = pre_ad_gate_count - len(final_clips)
+            if ad_gate_filtered > 0:
+                logger.warning(f"FINAL_AD_GATE: filtered {ad_gate_filtered} clips with ad content")
+            
             # Backend compatibility shim: ensure canonical score fields for frontend
             for clip in final_clips:
                 # Canonicalize virality field (0-1 range)
@@ -5001,6 +5168,35 @@ class ClipScoreService:
                 "platform_protect": platform_protect,
                 "length_agnostic": length_agnostic,
             }
+            
+            # Enforce MIN_FINALS at the very end (after all filters)
+            if len(final_clips) < MIN_FINALS:
+                logger.warning(f"MIN_FINALS_ENFORCEMENT: only {len(final_clips)} finals, need {MIN_FINALS}")
+                
+                # Top-up from reserve pool if available
+                if 'reserve_pool' in locals() and reserve_pool:
+                    # Get IDs of current finals to avoid duplicates
+                    final_ids = {c.get('id') for c in final_clips}
+                    
+                    # Find safe non-finals from reserve pool
+                    safe_reserve = [c for c in reserve_pool if c.get('id') not in final_ids]
+                    
+                    if safe_reserve:
+                        # Sort by score and take what we need
+                        needed = MIN_FINALS - len(final_clips)
+                        top_up = sorted(safe_reserve, key=lambda c: c.get("final_score", 0.0), reverse=True)[:needed]
+                        
+                        final_clips.extend(top_up)
+                        logger.info(f"MIN_FINALS_ENFORCEMENT: topped up with {len(top_up)} clips from reserve pool")
+                    else:
+                        logger.warning(f"MIN_FINALS_ENFORCEMENT: no safe reserve clips available for top-up")
+                else:
+                    logger.warning(f"MIN_FINALS_ENFORCEMENT: no reserve pool available for top-up")
+                
+                logger.info(f"MIN_FINALS_ENFORCEMENT: final count={len(final_clips)} (target: {MIN_FINALS})")
+                
+                # Structured logging for finals
+                log_json(logger, "FINALS", n=len(final_clips), min_finals=MIN_FINALS, enforced=True)
             
             # Calculate finals_finished for consistent return type
             finals_finished = [c for c in final_clips if c.get("finished_thought", False)]

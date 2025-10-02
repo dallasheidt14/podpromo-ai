@@ -481,17 +481,9 @@ def _extract_text(obj: Any) -> str:
     return str(obj)
 
 def _looks_like_ad(text) -> bool:
-    """Check if text looks like an advertisement"""
-    t = _extract_text(text).lower()
-    if not t:
-        return False
-    ad_terms = [
-        "only in theaters", "in theaters", "rated r", "from producer",
-        "sponsored by", "use code", "available now", "link in bio",
-        "promo code", "visit", "shop now", "limited time", "free trial",
-        "subscribe", "wayfair", "nordvpn", "squarespace", "raid shadow legends"
-    ]
-    return any(p in t for p in ad_terms)
+    """Check if text looks like an advertisement - delegates to centralized detector"""
+    from services.ads import looks_like_ad
+    return looks_like_ad(text)
 
 # Minimal English stopwords (expand if needed)
 STOP = {

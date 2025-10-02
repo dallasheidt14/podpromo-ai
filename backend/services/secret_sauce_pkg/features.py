@@ -2943,6 +2943,7 @@ def find_viral_clips_enhanced(segments: List[Dict], audio_file: str, genre: str 
             total_duration_minutes = max(1.0, (word_end_times[-1] - word_end_times[0]) / 60.0) if word_end_times and len(word_end_times) > 1 else 1.0
             eos_density = len(eos_times) / total_duration_minutes
             fallback_mode = eos_density < 0.020
+            log.debug(f"EOS_FALLBACK_CHECK: count={len(eos_times)}, density={eos_density:.3f} per_min, fallback_mode={fallback_mode}")
     
     # Create FTTracker for authoritative finish-thought tracking
     ft = FTTracker(fallback_mode=fallback_mode)
@@ -4564,15 +4565,18 @@ def optimize_window(center, words, eos_times, score_fn, min_len=7.0, max_len=120
 
 def discover_dynamic_length(words, eos_times, score_fn, duration_s):
     """
-    Main dynamic length discovery function.
+    Main dynamic length discovery function with improved stability for short/structured tracks.
     Returns list of optimized segments.
     """
     if not words or not eos_times:
         return []
     
-    # Compute hotness curve
+    # Compute hotness curve with adaptive smoothing
     times, hook, arousal, payoff, info, q_or_list, emotion, loop = compute_features_lite(words, hop_s=0.5)
-    hotness = build_hotness_curve(times, hook, arousal, payoff, info, q_or_list, emotion, loop, smooth_window=3.0)
+    
+    # Seatbelts for short/structured audio - exact rule as specified
+    smooth_window = float(os.getenv("DISCOVERY_SMOOTH_SHORT", "4.5")) if duration_s < 600 else 3.0
+    hotness = build_hotness_curve(times, hook, arousal, payoff, info, q_or_list, emotion, loop, smooth_window=smooth_window)
     
     # Adaptive peak detection with improved spacing
     duration_minutes = duration_s / 60.0
@@ -4585,10 +4589,30 @@ def discover_dynamic_length(words, eos_times, score_fn, duration_s):
     eos_density_factor = 1.15 if eos_density > 0.15 else 1.0  # Dense speech → larger spacing
     min_dist = base_min_dist * eos_density_factor
     
+    # Log EOS density for dynamic discovery
+    log.debug(f"DYNAMIC_DISCOVERY: EOS count={len(eos_times)}, density={eos_density:.3f} per_min, min_dist={min_dist:.1f}s")
+    
+    # Peak thresholds with exact values as specified
+    min_peak_prominence = 0.15 if duration_s > 600 else 0.10
+    min_peak_distance_s = 6.0 if duration_s > 600 else 4.0
+    
     k = max(20, min(60, int(duration_minutes * 1.5)))
     
-    # Find peaks
+    # Find peaks with retry logic for stability
     peaks = top_k_local_maxima(hotness, times, k=k, min_dist=min_dist)
+    
+    # One controlled retry with relaxed thresholds before fallback
+    if len(peaks) == 0:
+        if os.getenv("DYNAMIC_RETRY", "1") in ("1", "true", "True"):
+            log.info("DYNAMIC_LENGTH: no peaks; retrying with relaxed thresholds")
+            # Reduce thresholds by ~25% as specified
+            relaxed_prominence = max(0.05, min_peak_prominence * 0.75)
+            relaxed_distance = max(3.0, min_peak_distance_s * 0.75)
+            peaks = top_k_local_maxima(hotness, times, k=k, min_dist=relaxed_distance)
+        
+        if len(peaks) == 0:
+            log.warning("DYNAMIC_LENGTH: discovery failed; falling back")
+            return []
     
     # Optimize each peak
     candidates = []
@@ -4620,7 +4644,11 @@ def discover_dynamic_length(words, eos_times, score_fn, duration_s):
     target_count = max(20, min(40, int(duration_minutes * 1.0)))
     final_candidates = sorted(deduped, key=lambda x: x['score'], reverse=True)[:target_count]
     
-    log.info(f"DYNAMIC_LENGTH: found {len(peaks)} peaks, optimized {len(candidates)} candidates, kept {len(final_candidates)} after dedupe")
+    log.info(f"DYNAMIC_LENGTH: found {len(peaks)} peaks (smooth={smooth_window:.1f}s), optimized {len(candidates)} candidates, kept {len(final_candidates)} after dedupe mode=peaks")
+    
+    # Structured logging for dynamic discovery
+    from services.utils.logging_ext import log_json
+    log_json(log, "DYNAMIC", mode="peaks", peaks=len(peaks), kept=len(final_candidates), smooth_window=smooth_window)
     
     return final_candidates
 
@@ -4901,14 +4929,23 @@ def create_dynamic_segments(segments: List[Dict], platform: str = 'tiktok', eos_
                     continue
                 filtered_segments.append(seg)
             
-            # Take more diverse samples (not just the first few)
-            if len(filtered_segments) >= 10:
-                # Take every 3rd segment to get diversity
-                fallback_segments = filtered_segments[::3][:15]
+            # Improved fallback: keep more segments (15-20) with better diversity
+            if len(filtered_segments) >= 20:
+                # Take every 2nd segment to get better diversity while keeping more content
+                fallback_segments = filtered_segments[::2][:20]
+            elif len(filtered_segments) >= 15:
+                # Take every 2nd segment up to 15
+                fallback_segments = filtered_segments[::2][:15]
             else:
-                fallback_segments = filtered_segments[:10]
+                # Take all available segments if we have fewer than 15
+                fallback_segments = filtered_segments[:15]
             
             log.info(f"DYNAMIC_LENGTH: using {len(fallback_segments)} ad-filtered fallback segments")
+            
+            # Structured logging for fallback mode
+            from services.utils.logging_ext import log_json
+            log_json(log, "DYNAMIC", mode="fallback", peaks=0, kept=len(fallback_segments), fallback_segments=len(filtered_segments))
+            
             return fallback_segments
         else:
             log.error("DYNAMIC_LENGTH: no segments available for fallback")
@@ -4935,7 +4972,7 @@ def create_dynamic_segments(segments: List[Dict], platform: str = 'tiktok', eos_
     if eos_times is not None:
         count = _len_safe(eos_times)
         fallback_flag = (src == "gap_fallback")
-        log.info("EOS: %d markers, density=%.3f, source=%s, fallback=%s",
+        log.info("EOS: count=%d, density=%.3f per_min, source=%s, fallback=%s",
                  count, eos_density, src, fallback_flag)
 
     platform_lengths = {
@@ -5631,14 +5668,10 @@ def find_candidates(segments: List[Dict], audio_file: str, platform: str = 'tikt
 def filter_ads_from_features(all_features: List[Dict]) -> List[Dict]:
     """
     Filter out advertisements completely from the feature list.
-    Returns only non-ad content for scoring.
+    Returns only non-ad content for scoring - delegates to centralized detector.
     """
-    non_ad_features = [f for f in all_features if not f.get("is_advertisement", False)]
-    
-    if len(non_ad_features) < 5:
-        return {"error": "Episode is mostly advertisements, no viable clips found"}
-    
-    return non_ad_features
+    from services.ads import filter_ads_from_features as centralized_filter
+    return centralized_filter(all_features)
 
 def filter_intro_content_from_features(all_features: List[Dict]) -> List[Dict]:
     """
@@ -6059,11 +6092,12 @@ def build_eos_index(segments: List[Dict], episode_words: List[Dict] = None, epis
     for word in all_words:
         word_end_times.append(word.get('end', 0))
     
-    # Log final EOS density
+    # Log final EOS density with explicit unit
     # Standardize EOS density calculation: markers per minute
-    total_duration_minutes = max(1.0, (word_end_times[-1] - word_end_times[0]) / 60.0) if word_end_times and len(word_end_times) > 1 else 1.0
-    eos_density = len(eos_times) / total_duration_minutes
-    logger.info(f"EOS unified: {len(eos_times)} markers, {len(word_end_times)} words, density={eos_density:.3f}, source={eos_source}")
+    from services.utils.units import per_min
+    total_duration_s = (word_end_times[-1] - word_end_times[0]) if word_end_times and len(word_end_times) > 1 else 60.0
+    eos_density = per_min(len(eos_times), total_duration_s)
+    logger.info(f"EOS_UNIFIED: count={len(eos_times)}, density_per_min={eos_density:.3f} unit=per_min, source={eos_source}")
     
     return sorted(list(eos_times)), sorted(word_end_times), eos_source
 

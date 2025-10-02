@@ -36,31 +36,39 @@ _AD_PRODUCT_PHRASES = {
 _AD_RE = re.compile("|".join(_AD_PATTERNS), re.IGNORECASE)
 
 def _ad_like_score(text: str) -> float:
+    """Calculate ad likelihood score - delegates to centralized detector"""
+    from services.ads import ad_like_score
+    return ad_like_score(text)
+
+def is_viable_clip(clip: dict, *, relax: dict | None = None) -> tuple[bool, str]:
+    """
+    Central viability gate to avoid scattered boolean drops.
+    Returns (ok, reason_if_dropped).
+    'relax' can override specific thresholds, e.g. {"finished_thresh": 0.60}
+    """
+    relax = relax or {}
+    text = (clip.get("text") or "").strip()
     if not text:
-        return 0.0
-    
-    text_lower = text.lower()
-    score = 0.0
-    
-    # Check regex patterns
-    m = len(_AD_RE.findall(text))
-    score += m / (m + 3)
-    
-    # Check for brand names
-    brand_matches = sum(1 for brand in _AD_BRANDS if brand.lower() in text_lower)
-    if brand_matches > 0:
-        score += 0.3 * brand_matches
-    
-    # Check for product-y phrases
-    product_matches = sum(1 for phrase in _AD_PRODUCT_PHRASES if phrase.lower() in text_lower)
-    if product_matches > 0:
-        score += 0.2 * product_matches
-    
-    # Cap at 1.0
-    return min(1.0, score)
+        return False, "empty_text"
+
+    # Ad / promo
+    if _ad_like_score(text) >= 0.60 or clip.get("is_advertisement") or clip.get("features", {}).get("is_advertisement"):
+        return False, "ad_like"
+
+    # Finished thought gating
+    finished_like = bool(clip.get("finished_thought") or clip.get("ft_status") in ("finished", "sparse_finished"))
+    ft_cov = float(clip.get("ft_coverage_ratio") or 0.0)
+    req_cov = float(relax.get("finished_thresh", 0.66))
+    if not finished_like or ft_cov < req_cov:
+        return False, "unfinished"
+
+    # Safety (soft example, keep your existing checks if any)
+    if clip.get("safety_flag") in ("hate", "sexual_minor", "self_harm"):
+        return False, "safety_block"
+
+    return True, ""
 
 logger = logging.getLogger(__name__)
-log = logging.getLogger("services.quality_filters")
 
 # Safe defaults for when config is not passed
 _DEFAULTS = {
