@@ -4161,9 +4161,9 @@ class ClipScoreService:
                 "limited_features" if any(s in ("missing", "imputed") for s in ft_statuses) else "full_features",
             )
             
-            # Debug: log ft_status from enhanced pipeline
+            # Debug: log ft_status from enhanced pipeline (use corrected clips)
             if viral_result and "clips" in viral_result:
-                ft_statuses = [c.get("ft_status", "missing") for c in viral_result.get("clips", [])]
+                ft_statuses = [c.get("ft_status", "missing") for c in clips]  # Use corrected clips
                 logger.info(f"Enhanced pipeline ft_statuses: {ft_statuses}")
             
             # Use authoritative fallback mode from enhanced pipeline
@@ -4191,6 +4191,20 @@ class ClipScoreService:
             
             clips = viral_result.get('clips', [])
             logger.info(f"Found {len(clips)} viral clips using {'enhanced' if not use_legacy else 'legacy'} pipeline")
+            
+            # 🔧 FT STATUS FIX: Ensure all clips have proper ft_status
+            for clip in clips:
+                if "ft_status" not in clip or clip.get("ft_status") == "missing":
+                    # Compute FT status based on finished_thought and coverage
+                    finished_thought = clip.get("finished_thought", False)
+                    ft_coverage = clip.get("ft_coverage_ratio", 0.0)
+                    
+                    if finished_thought and ft_coverage >= 0.66:
+                        clip["ft_status"] = "finished"
+                    elif finished_thought and ft_coverage >= 0.40:
+                        clip["ft_status"] = "sparse_finished"
+                    else:
+                        clip["ft_status"] = "partial"
             
             # Use pre-gate candidates from enhanced pipeline if available
             if not use_legacy and 'pre_gate_candidates' in locals():
@@ -4865,7 +4879,6 @@ class ClipScoreService:
             
             # Log platform-aware selection info
             logger.info(f"SELECTION: platform_neutral={PLATFORM_NEUTRAL_SELECTION}")
-            logger.info(f"PLATFORM_MODE: pl_v2_weight={pl_v2_weight}, platform_protect={platform_protect}")
             if ranked_clips:
                 logger.info(f"PLATFORM_REC: {ranked_clips[0].get('platform_recommendations', [])[:3]}")
             

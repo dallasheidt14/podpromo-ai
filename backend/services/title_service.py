@@ -1632,7 +1632,18 @@ def generate_titles(
         cache_key = _title_cache_key(episode_id=episode_id, clip_id=clip_id, platform=platform, text=clean_text)
         _cache_titles(cache_key, result)
     
+    # 🔧 GRAMMAR GUARD: Fix common grammar issues
+    if isinstance(result, list):
+        result = [{"title": _grammar_guard(t.get("title", t) if isinstance(t, dict) else str(t))} if isinstance(t, dict) else _grammar_guard(str(t)) for t in result]
+    
     return result
+
+def _grammar_guard(t: str) -> str:
+    """Fix common grammar issues in titles without blocking the pipeline"""
+    t = t.replace("How to Moving", "How to Move")
+    t = t.replace("How to Information", "How to Get Information")
+    t = re.sub(r"\bWhy (\w+) Matters\b", r"Why \1 Matters", t)  # keeps common pattern ok
+    return t
 
 def _score_title_quality(title: str, text: str, platform: str) -> float:
     """Score title based on engagement potential and content relevance"""

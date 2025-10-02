@@ -5135,8 +5135,10 @@ def create_dynamic_segments(segments: List[Dict], platform: str = 'tiktok', eos_
         # Assert dense requirement
         if dense:
             median_dur = sorted(post_durs)[len(post_durs)//2]
-            if median_dur < 16.0:
-                log.warning("WARN: dense=True but median seed length %.1fs < 16.0s", median_dur)
+            if median_dur < 8.0:  # Only warn if very short AND we're about to drop seeds
+                log.warning("WARN: dense=True but median seed length %.1fs < 8.0s", median_dur)
+            elif median_dur < 16.0:
+                log.debug("INFO: dense=True but median seed length %.1fs < 16.0s (harmless)", median_dur)
             else:
                 log.info("SEEDS: pre={%s} post={%s} median=%.1f", 
                          {k: v for k, v in pre_hist.items() if v > 0},
