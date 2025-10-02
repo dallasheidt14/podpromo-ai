@@ -1892,6 +1892,10 @@ from services.progress_writer import write_progress
 from services.prerank import pre_rank_candidates, get_safety_candidates, pick_stratified
 from services.utils.logging_ext import log_json
 from services.candidate_formatter import format_candidates
+from services.utils.deterministic import seed_everything
+from services.utils.clip_validation import validate_all_clips
+from services.utils.clip_ids import assign_clip_ids
+from services.utils.text_normalization import normalize_all_segments
 
 # Enhanced compute function with all Phase 1-3 features
 from services.secret_sauce_pkg.features import compute_features_v4_enhanced as _compute_features
@@ -5204,6 +5208,27 @@ class ClipScoreService:
             
             # Calculate finals_finished for consistent return type
             finals_finished = [c for c in final_clips if c.get("finished_thought", False)]
+            
+            # 🔥 SAFETY FIXES: Apply all safety and validation checks
+            logger.info("SAFETY_CHECKS: Applying path sanitization, time clamping, and ID assignment")
+            
+            # 1. Seed all RNGs for deterministic behavior
+            seed_everything(episode_id)
+            
+            # 2. Get episode duration for time validation
+            episode_duration_s = getattr(self.episode_service.get_episode(episode_id), 'duration_s', 3600.0)
+            
+            # 3. Validate and clamp all clip times
+            final_clips = validate_all_clips(final_clips, episode_duration_s)
+            
+            # 4. Assign canonical clip IDs
+            final_clips = assign_clip_ids(final_clips, episode_id)
+            
+            # 5. Normalize text in all clips
+            final_clips = normalize_all_segments(final_clips)
+            
+            logger.info(f"SAFETY_CHECKS: Validated {len(final_clips)} clips with canonical IDs and normalized text")
+            
             return final_clips, finals_finished
             
         except Exception as e:
@@ -5219,6 +5244,16 @@ class ClipScoreService:
             # This guarantees: if we've already computed finals, we get clips back
             if final_clips:
                 logger.info(f"SALVAGE_GUARD: returning {len(final_clips)} clips despite error")
+                
+                # Apply safety fixes even in error recovery
+                try:
+                    episode_duration_s = getattr(self.episode_service.get_episode(episode_id), 'duration_s', 3600.0)
+                    final_clips = validate_all_clips(final_clips, episode_duration_s)
+                    final_clips = assign_clip_ids(final_clips, episode_id)
+                    final_clips = normalize_all_segments(final_clips)
+                except Exception as safety_e:
+                    logger.warning(f"SAFETY_CHECKS_FAILED: {safety_e}")
+                
                 rescued_finished = [c for c in final_clips if c.get("finished_thought", False)]
                 return [self._minimal_candidate_dict(c) for c in final_clips], rescued_finished
             else:
