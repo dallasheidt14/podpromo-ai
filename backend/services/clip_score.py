@@ -4163,7 +4163,8 @@ class ClipScoreService:
             
             # Debug: log ft_status from enhanced pipeline (use corrected clips)
             if viral_result and "clips" in viral_result:
-                ft_statuses = [c.get("ft_status", "missing") for c in clips]  # Use corrected clips
+                clips_for_logging = viral_result.get("clips", [])
+                ft_statuses = [c.get("ft_status", "missing") for c in clips_for_logging]
                 logger.info(f"Enhanced pipeline ft_statuses: {ft_statuses}")
             
             # Use authoritative fallback mode from enhanced pipeline
