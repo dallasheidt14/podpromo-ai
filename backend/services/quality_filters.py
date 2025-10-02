@@ -13,6 +13,8 @@ from services.secret_sauce_pkg.features import (
     END_GAP_MS_OK, END_CONF_OK, SOFT_ENDING_MALUS,
 )
 
+# Deprecated: Legacy ad detection patterns - canonical ad detection now in services/ads.py
+# These constants are kept for backward compatibility but are no longer used.
 _AD_PATTERNS = [
     r"\b(visit|go to|use code|promo code|sponsored by|brought to you by)\b",
     r"\b(dot com|\.com|/pricing|/app)\b",
@@ -22,13 +24,13 @@ _AD_PATTERNS = [
     r"\b(our ai agent|24/7 support|money back guarantee)\b",
 ]
 
-# Brand list for ad detection
+# Brand list for ad detection (deprecated)
 _AD_BRANDS = {
     "Mint Mobile", "Granger", "Wise", "Shopify", "BetterHelp", "Squarespace", 
     "NordVPN", "HelloFresh", "Raycon", "SeatGeek", "Audible", "Cash App"
 }
 
-# Product-y phrases
+# Product-y phrases (deprecated)
 _AD_PRODUCT_PHRASES = {
     "fiber blend", "aromatic spices", "formulation", "subscription", 
     "workspace", "AI platform"

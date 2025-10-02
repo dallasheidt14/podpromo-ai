@@ -1891,6 +1891,7 @@ from services.progress_writer import write_progress
 from services.prerank import pre_rank_candidates, get_safety_candidates, pick_stratified
 from services.utils.logging_ext import log_json
 from services.candidate_formatter import format_candidates
+from services.semantics import semantic_dedupe
 
 # Enhanced compute function with all Phase 1-3 features
 from services.secret_sauce_pkg.features import compute_features_v4_enhanced as _compute_features
@@ -4571,7 +4572,8 @@ class ClipScoreService:
             finals = tighten_selection(finals, finished_required=finished_required)
             
             # Apply duration diversity (soft target mix)
-            finals = apply_duration_diversity(finals)
+            if os.getenv("DURATION_BUCKETING", "1") in ("1","true","True"):
+                finals = apply_duration_diversity(finals)
             
             # Dedup before saving
             finals = unique_by_id(finals)  # preserve order
@@ -5044,11 +5046,12 @@ class ClipScoreService:
             
             # Final "No-Ad" Hard Gate (belt-and-suspenders)
             # Stops any ad that slips past earlier stages
-            from services.ads import looks_like_ad
+            from services.ads import looks_like_ad, ad_like_score
             pre_ad_gate_count = len(final_clips)
             final_clips = [c for c in final_clips if not (
-                c.get("is_advertisement", False) or 
-                looks_like_ad(c.get("text", ""))
+                c.get("is_advertisement", False)
+                or ad_like_score(c.get("text","")) >= 0.60
+                or looks_like_ad(c.get("text",""))
             )]
             ad_gate_filtered = pre_ad_gate_count - len(final_clips)
             if ad_gate_filtered > 0:

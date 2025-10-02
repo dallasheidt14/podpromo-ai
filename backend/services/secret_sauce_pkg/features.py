@@ -6,6 +6,7 @@ Contains feature extraction and computation functions.
 from typing import Dict, List, Tuple, Any, Iterable, Optional, Literal
 from dataclasses import dataclass
 import logging
+import os
 from bisect import bisect_left
 import re
 import math
@@ -4583,11 +4584,9 @@ def discover_dynamic_length(words, eos_times, score_fn, duration_s):
     eos_gaps = [eos_times[i+1] - eos_times[i] for i in range(len(eos_times)-1)]
     eos_gap_med = sorted(eos_gaps)[len(eos_gaps)//2] if eos_gaps else 4.0
     
-    # Improved min_dist calculation: scale with episode length and EOS density
-    base_min_dist = max(8.0, min(18.0, (duration_s / 180.0) * 10.0))
-    eos_density = len(eos_times) / (duration_s / 60.0) if duration_s > 0 else 0.0  # EOS per minute
-    eos_density_factor = 1.15 if eos_density > 0.15 else 1.0  # Dense speech → larger spacing
-    min_dist = base_min_dist * eos_density_factor
+    # Seatbelt min-distance: 4s for short (<10m), 6s for long (>=10m)
+    eos_density = len(eos_times) / (duration_s / 60.0) if duration_s > 0 else 0.0  # per_min
+    min_dist = 6.0 if duration_s >= 600 else 4.0
     
     # Log EOS density for dynamic discovery
     log.debug(f"DYNAMIC_DISCOVERY: EOS count={len(eos_times)}, density={eos_density:.3f} per_min, min_dist={min_dist:.1f}s")
@@ -4606,7 +4605,6 @@ def discover_dynamic_length(words, eos_times, score_fn, duration_s):
         if os.getenv("DYNAMIC_RETRY", "1") in ("1", "true", "True"):
             log.info("DYNAMIC_LENGTH: no peaks; retrying with relaxed thresholds")
             # Reduce thresholds by ~25% as specified
-            relaxed_prominence = max(0.05, min_peak_prominence * 0.75)
             relaxed_distance = max(3.0, min_peak_distance_s * 0.75)
             peaks = top_k_local_maxima(hotness, times, k=k, min_dist=relaxed_distance)
         
@@ -4918,14 +4916,13 @@ def create_dynamic_segments(segments: List[Dict], platform: str = 'tiktok', eos_
         # Return segments to avoid complete failure, but skip ad-like content
         if segments:
             # Filter out ad-like segments and take more diverse samples
-            ad_keywords = ['sponsored', 'advertisement', 'promo', 'discount', 'check out', 'visit', 'www.', 'http']
+            from services.ads import looks_like_ad
             filtered_segments = []
             
             for seg in segments:
-                text = seg.get('text', '').lower()
-                # Skip segments that look like ads
-                if any(keyword in text for keyword in ad_keywords):
-                    log.debug(f"Skipping ad-like segment: {text[:50]}...")
+                text = seg.get('text', '') or ''
+                if looks_like_ad(text, strict=True):
+                    log.debug(f"Skipping ad-like segment: {text[:64]}...")
                     continue
                 filtered_segments.append(seg)
             
@@ -4966,7 +4963,8 @@ def create_dynamic_segments(segments: List[Dict], platform: str = 'tiktok', eos_
     
     # Compute dense flag once after EOS_UNIFIED
     src = "episode"  # or "gap_fallback" if from fallback
-    dense = (eos_density >= 0.04 and src != 'gap_fallback') or (src == 'gap_fallback' and eos_density >= 0.05)
+    # Typical English speech ~8–14 EOS/min; call "dense" at >=12/min (>=14/min if gap_fallback)
+    dense = (eos_density >= 12.0 and src != 'gap_fallback') or (src == 'gap_fallback' and eos_density >= 14.0)
     
     # Only log EOS details if we were actually given eos_times
     if eos_times is not None:

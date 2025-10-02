@@ -206,10 +206,14 @@ def _load_clip(clip_id: str, uploads_dir: pathlib.Path) -> Optional[Dict[str, An
         logger.error("Failed to load clips.json for episode %s: %s", episode_id, e)
         return None
 
+import warnings
+
 class TitlesService:
     """Service class for managing clip titles - provides backward compatibility"""
     
     def __init__(self):
+        warnings.warn("TitlesService is deprecated; use title_service.generate_titles",
+                      DeprecationWarning, stacklevel=2)
         self.clips_cache = {}  # Simple in-memory cache
         self._skip_warnings = set()  # Track warned clip_ids to prevent spam
         self._skip_lock = threading.Lock()  # Thread safety for skip warnings
