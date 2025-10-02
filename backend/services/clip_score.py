@@ -1897,6 +1897,32 @@ from services.utils.clip_validation import validate_all_clips
 from services.utils.clip_ids import assign_clip_ids
 from services.utils.text_normalization import normalize_all_segments
 
+# --- duration helpers (new) ---
+def _estimate_episode_duration_s(words: list | None, segments: list | None, meta: dict | None) -> float:
+    """Estimate episode duration from available sources to prevent UnboundLocalError"""
+    # 1) metadata
+    dur = float(meta.get("duration_s")) if meta and meta.get("duration_s") else None
+    if dur and dur > 0:
+        return dur
+    # 2) words (ASR) – end of last word
+    if words:
+        try:
+            last_end = max(float(w.get("end") or 0.0) for w in words)
+            if last_end > 0:
+                return last_end
+        except Exception:
+            pass
+    # 3) dynamic segments – end of last segment
+    if segments:
+        try:
+            last_end = max(float(s.get("end") or 0.0) for s in segments)
+            if last_end > 0:
+                return last_end
+        except Exception:
+            pass
+    # 4) conservative fallback
+    return 60.0  # 1 minute minimal, avoids UnboundLocalError and zero spans
+
 def _normalize_clip_obj(c: dict, episode_dur: float) -> dict:
     """
     Normalize clip object schema to prevent field drift and type errors.
@@ -1927,6 +1953,43 @@ def _normalize_clip_obj(c: dict, episode_dur: float) -> dict:
     c["text"] = (c.get("text") or "").strip()
     
     return c
+
+# --- simple 1D time NMS / overlap filter (new) ---
+def filter_overlapping_candidates(clips: list[dict], iou_thresh: float = 0.6) -> list[dict]:
+    """
+    Keep higher-scored clips when [start,end] overlaps exceed iou_thresh.
+    Falls back to stable start-order if scores are missing.
+    """
+    if not clips:
+        return clips
+    # ensure needed fields exist
+    def _span(c):
+        return float(c.get("start") or 0.0), float(c.get("end") or 0.0)
+    def _score(c):
+        try:
+            return float(c.get("final_score") or c.get("score") or 0.0)
+        except Exception:
+            return 0.0
+
+    # sort by score desc, then earlier start
+    ordered = sorted(clips, key=lambda c: (-_score(c), _span(c)[0]))
+    kept = []
+    for c in ordered:
+        cs, ce = _span(c)
+        if ce <= cs:
+            continue
+        drop = False
+        for k in kept:
+            ks, ke = _span(k)
+            inter = max(0.0, min(ce, ke) - max(cs, ks))
+            union = max(ce, ke) - min(cs, ks)
+            iou = (inter / union) if union > 0 else 0.0
+            if iou >= iou_thresh:
+                drop = True
+                break
+        if not drop:
+            kept.append(c)
+    return kept
 
 def safe_question_collapse(clips: list[dict]) -> list[dict]:
     """Safe wrapper for question collapse that bypasses on failure."""
@@ -4230,6 +4293,14 @@ class ClipScoreService:
                 clip_meta["is_fallback"] = bool(episode_fallback_mode)
                 clip["meta"] = clip_meta
             
+            # 🔧 EPISODE DURATION: Estimate early to prevent UnboundLocalError
+            episode_duration_s = _estimate_episode_duration_s(
+                getattr(episode, 'words', None), 
+                clips, 
+                {"duration_s": getattr(episode, 'duration_s', None)}
+            )
+            logger.info(f"EPISODE_DURATION: estimated={episode_duration_s:.1f}s")
+            
             # Convert to candidate format with title generation and grades
             try:
                 candidates = format_candidates(clips, final_genre, backend_platform, episode_id, full_episode_transcript, episode)
@@ -4376,6 +4447,38 @@ class ClipScoreService:
                     filtered_candidates.append(c)
                     if len(filtered_candidates) >= MIN_FINALS:
                         break
+            
+            # 🔧 BULLETPROOF END-OF-PIPELINE: Ensure we never ship empty results
+            # Universal end-of-pipeline gate (non-ad/safety/finished)
+            from services.quality_filters import is_viable_clip
+            safe_finals = []
+            for c in filtered_candidates:
+                ok, reason = is_viable_clip(c)
+                if ok:
+                    safe_finals.append(c)
+                else:
+                    c.setdefault("drop_reasons", []).append(f"final_gate:{reason}")
+            filtered_candidates = safe_finals
+
+            # If strict final gate nuked list, salvage: restore last good set and apply only the hard ad gate
+            if not filtered_candidates:
+                logger.warning("FINAL_STRICT_EMPTY: salvaging from last_good_finals / authoritative")
+                fallback = last_good_finals or authoritative_finals or []
+                if fallback:
+                    from services.ads import looks_like_ad, ad_like_score
+                    filtered_candidates = [c for c in fallback
+                                          if not (c.get("is_advertisement") or ad_like_score(c.get("text","")) >= 0.60 or looks_like_ad(c.get("text","")))]
+                # One last MIN_FINALS top-up if still short
+                if len(filtered_candidates) < MIN_FINALS:
+                    pool = [c for c in candidates if c not in filtered_candidates]
+                    pool.sort(key=lambda c: c.get("final_score", 0.0), reverse=True)
+                    for c in pool:
+                        filtered_candidates.append(c)
+                        if len(filtered_candidates) >= MIN_FINALS:
+                            break
+
+            # Legacy alias to guarantee save path sees a populated list
+            final_clips = list(filtered_candidates)
             
             # Apply quality filtering with global skip support
             if skip_quality_recheck:
