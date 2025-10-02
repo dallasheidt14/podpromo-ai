@@ -1897,6 +1897,46 @@ from services.utils.clip_validation import validate_all_clips
 from services.utils.clip_ids import assign_clip_ids
 from services.utils.text_normalization import normalize_all_segments
 
+def _normalize_clip_obj(c: dict, episode_dur: float) -> dict:
+    """
+    Normalize clip object schema to prevent field drift and type errors.
+    Guarantees every downstream function gets the same keys and sane numeric types.
+    """
+    # Normalize timing fields
+    s = float(c.get("start") or 0.0)
+    e = float(c.get("end") or s)
+    dur = c.get("duration", c.get("dur"))
+    if dur is None:
+        dur = max(0.0, e - s)
+    dur = float(dur)
+    
+    # Roboclaw safety - ensure valid duration
+    if dur < 0.001 or e <= s:
+        e = min(episode_dur, s + 0.5)  # enforce 0.5s minimum
+        dur = max(0.5, e - s)
+    
+    c["start"] = round(s, 3)
+    c["end"] = round(e, 3) 
+    c["duration"] = round(dur, 3)
+    
+    # Normalize score fields
+    c["final_score"] = float(c.get("final_score") or c.get("score") or 0.0)
+    c["display_score"] = float(c.get("display_score") or c.get("final_score") or 0.0)
+    
+    # Ensure text is always a string
+    c["text"] = (c.get("text") or "").strip()
+    
+    return c
+
+def safe_question_collapse(clips: list[dict]) -> list[dict]:
+    """Safe wrapper for question collapse that bypasses on failure."""
+    try:
+        from services.secret_sauce_pkg.scoring_utils import collapse_question_runs
+        return collapse_question_runs(clips)
+    except Exception as e:
+        logger.warning("QUESTION_COLLAPSE_FAIL: %s; bypassing collapse", e)
+        return clips
+
 # Enhanced compute function with all Phase 1-3 features
 from services.secret_sauce_pkg.features import compute_features_v4_enhanced as _compute_features
 
@@ -4179,6 +4219,22 @@ class ClipScoreService:
             try:
                 candidates = format_candidates(clips, final_genre, backend_platform, episode_id, full_episode_transcript, episode)
                 logger.info(f"Formatted {len(candidates)} candidates")
+                
+                # 🔧 SCHEMA NORMALIZATION: Prevent field drift and type errors
+                logger.info("SCHEMA_NORMALIZE: Applying consistent field schema to all candidates")
+                candidates = [_normalize_clip_obj(c, episode_duration_s) for c in candidates]
+                
+                # --- NORMALIZE + SNAPSHOT ---
+                # Normalize everything once to avoid type/field drift later
+                finals = [_normalize_clip_obj(c, episode_duration_s) for c in finals]
+                candidates = [_normalize_clip_obj(c, episode_duration_s) for c in candidates]
+                
+                # Keep a last known good snapshot we can safely fall back to
+                authoritative_finals = list(finals)           # from enhanced path
+                last_good_finals = list(finals)               # rolling snapshot
+                last_good_candidates = list(candidates)       # optional: reserve pool
+                
+                logger.info(f"NORMALIZE_COMPLETE: finals={len(finals)}, candidates={len(candidates)}")
             except Exception as e:
                 logger.exception("FORMAT_CANDIDATES_ERROR: %s", e)
                 # Fallback: persist clips with safe titles
@@ -4242,32 +4298,69 @@ class ClipScoreService:
             for i, candidate in enumerate(candidates[:3]):  # Log first 3 candidates
                 logger.info(f"Candidate {i}: display_score={candidate.get('display_score', 'MISSING')}, text_length={len(candidate.get('text', '').split())}")
             
-            # Collapse consecutive question runs (keep only the strongest)
-            from services.secret_sauce_pkg.scoring_utils import collapse_question_runs
-            candidates = collapse_question_runs(candidates)
-            logger.info(f"After question collapse: {len(candidates)} candidates")
-            
-            # Filter overlapping candidates
-            filtered_candidates = filter_overlapping_candidates(candidates)
-            logger.info(f"After overlap filtering: {len(filtered_candidates)} candidates")
-            
-            # Normalize candidates before any gates
-            filtered_candidates = [normalize_ft_status(c) for c in filtered_candidates]
-            
-            # Duration/np.float64 guard (prevents weird types later)
+            # === RISKY POST-FORMATTING STAGES ===
             try:
-                import numpy as np
-                for c in filtered_candidates:
-                    if isinstance(c.get("duration"), np.floating):
-                        c["duration"] = float(c["duration"])
-            except Exception:
-                pass
+                # (Update the snapshot after every successful stage.)
+                
+                # 1) Question collapse / collapse heuristics
+                candidates = safe_question_collapse(candidates)
+                logger.info(f"After question collapse: {len(candidates)} candidates")
+                last_good_candidates = list(candidates)
+                
+                # 2) Filter overlapping candidates (Time-NMS equivalent)
+                filtered_candidates = filter_overlapping_candidates(candidates)
+                logger.info(f"After overlap filtering: {len(filtered_candidates)} candidates")
+                last_good_candidates = list(filtered_candidates)
+                
+                # 3) Normalize candidates before any gates
+                filtered_candidates = [normalize_ft_status(c) for c in filtered_candidates]
+                
+                # 4) Duration/np.float64 guard (prevents weird types later)
+                try:
+                    import numpy as np
+                    for c in filtered_candidates:
+                        if isinstance(c.get("duration"), np.floating):
+                            c["duration"] = float(c["duration"])
+                except Exception:
+                    pass
+                
+                # 5) Continue with quality gates and selection...
+                # (This will be expanded as we find more risky operations)
+                
+            except Exception as e:
+                logger.exception("CANDIDATE_PIPELINE_FAIL: %s", e)
+                
+                # === REAL FALLBACK LOGIC ===
+                if last_good_candidates:
+                    filtered_candidates = list(last_good_candidates)
+                    logger.warning("FALLBACK: using last_good_candidates (n=%d)", len(filtered_candidates))
+                elif last_good_finals:
+                    filtered_candidates = list(last_good_finals)
+                    logger.warning("FALLBACK: using last_good_finals (n=%d)", len(filtered_candidates))
+                elif authoritative_finals:
+                    filtered_candidates = list(authoritative_finals)
+                    logger.warning("FALLBACK: using authoritative finals (n=%d)", len(filtered_candidates))
+                else:
+                    filtered_candidates = []
+                    logger.error("FALLBACK: no finals/candidates available; emitting empty set")
             
             # Create reserve pool before quality gates (for auto-relax)
             import heapq
             RESERVE_TOP_K = 24
             reserve_pool = heapq.nlargest(RESERVE_TOP_K, filtered_candidates, key=lambda c: c.get("utility_pre_gate", c.get("final_score", 0.0)))
             logger.info(f"POOL: pre_gate={len(filtered_candidates)} reserve={len(reserve_pool)}")
+            
+            # 🔧 MIN_FINALS ENFORCEMENT: Always run after try/except
+            # This ensures we never return empty results even if processing fails
+            if len(filtered_candidates) < MIN_FINALS:
+                logger.info("MIN_FINALS: enforcing target=%d shipped=%d", MIN_FINALS, len(filtered_candidates))
+                # choose best safe candidates not already included
+                pool = [c for c in candidates if c not in filtered_candidates]
+                pool.sort(key=lambda c: c.get("final_score", 0.0), reverse=True)
+                for c in pool:
+                    filtered_candidates.append(c)
+                    if len(filtered_candidates) >= MIN_FINALS:
+                        break
             
             # Apply quality filtering with global skip support
             if skip_quality_recheck:
@@ -5229,36 +5322,41 @@ class ClipScoreService:
             
             logger.info(f"SAFETY_CHECKS: Validated {len(final_clips)} clips with canonical IDs and normalized text")
             
+            # 🔧 ALIAS FOR LEGACY SAVE PATH: Some code paths still read final_clips
+            final_clips = list(final_clips)   # alias for legacy save path
+            
             return final_clips, finals_finished
             
         except Exception as e:
-            logger.exception("CANDIDATE_PIPELINE_FAIL: returning finals as-is")
-            meta = {
-                "reason": "exception",
-                "episode_id": episode_id,
-                "error": str(e)[:200],
-                "platform": platform,
-                "genre": genre
-            }
-            # Return minimally formatted finals instead of zero.
-            # This guarantees: if we've already computed finals, we get clips back
-            if final_clips:
-                logger.info(f"SALVAGE_GUARD: returning {len(final_clips)} clips despite error")
-                
-                # Apply safety fixes even in error recovery
-                try:
-                    episode_duration_s = getattr(self.episode_service.get_episode(episode_id), 'duration_s', 3600.0)
-                    final_clips = validate_all_clips(final_clips, episode_duration_s)
-                    final_clips = assign_clip_ids(final_clips, episode_id)
-                    final_clips = normalize_all_segments(final_clips)
-                except Exception as safety_e:
-                    logger.warning(f"SAFETY_CHECKS_FAILED: {safety_e}")
-                
-                rescued_finished = [c for c in final_clips if c.get("finished_thought", False)]
-                return [self._minimal_candidate_dict(c) for c in final_clips], rescued_finished
+            logger.exception("CANDIDATE_PIPELINE_FAIL: %s", e)
+            
+            # === REAL FALLBACK LOGIC ===
+            if 'last_good_finals' in locals() and last_good_finals:
+                final_clips = list(last_good_finals)
+                logger.warning("FALLBACK: using last_good_finals (n=%d)", len(final_clips))
+            elif 'authoritative_finals' in locals() and authoritative_finals:
+                final_clips = list(authoritative_finals)
+                logger.warning("FALLBACK: using authoritative finals (n=%d)", len(final_clips))
+            elif 'last_good_candidates' in locals() and last_good_candidates:
+                # top-up from reserve pool to at least MIN_FINALS
+                pool = sorted(last_good_candidates, key=lambda c: c.get("final_score", 0.0), reverse=True)
+                final_clips = pool[:max(1, MIN_FINALS)]
+                logger.warning("FALLBACK: using reserve candidates (n=%d)", len(final_clips))
             else:
-                logger.warning("SALVAGE_GUARD: no finals to salvage, returning empty")
-                return [], []
+                final_clips = []
+                logger.error("FALLBACK: no finals/candidates available; emitting empty set")
+            
+            # Apply safety fixes even in error recovery
+            try:
+                episode_duration_s = getattr(self.episode_service.get_episode(episode_id), 'duration_s', 3600.0)
+                final_clips = validate_all_clips(final_clips, episode_duration_s)
+                final_clips = assign_clip_ids(final_clips, episode_id)
+                final_clips = normalize_all_segments(final_clips)
+            except Exception as safety_e:
+                logger.warning(f"SAFETY_CHECKS_FAILED: {safety_e}")
+            
+            rescued_finished = [c for c in final_clips if c.get("finished_thought", False)]
+            return [self._minimal_candidate_dict(c) for c in final_clips], rescued_finished
 
 async def score_episode(episode, segments):
     """
