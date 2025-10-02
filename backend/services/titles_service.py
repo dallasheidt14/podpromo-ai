@@ -25,6 +25,30 @@ logger = logging.getLogger(__name__)
 # Regex to extract episode ID from clip ID (supports both UUID and test formats)
 CLIP_ID_RE = re.compile(r"^clip_([0-9a-f\-]{36}|[a-z0-9\-]+)_")
 
+def _episode_for_clip_id(clip_id: str, clip_obj: dict = None) -> str:
+    """Resolve episode_id from clip_id using multiple strategies"""
+    # 1) Direct from clip metadata if provided
+    if clip_obj and clip_obj.get("episode_id"):
+        return clip_obj["episode_id"]
+    
+    # 2) Try old format parsing first
+    match = CLIP_ID_RE.match(clip_id)
+    if match:
+        return match.group(1)
+    
+    # 3) Global clip index lookup
+    try:
+        uploads_root = UPLOAD_DIR
+        index_path = os.path.join(uploads_root, "clip_index.json")
+        if os.path.exists(index_path):
+            with open(index_path, "r", encoding="utf-8") as f:
+                index = json.load(f)
+            return index.get(clip_id)
+    except Exception as e:
+        logger.debug("CLIP_INDEX_READ_FAIL: %s", e)
+    
+    return None
+
 # In-memory clip index with TTL (fast path)
 _CLIP_INDEX = {}          # clip_id -> Path(clips.json)
 _CLIP_INDEX_BUILT_AT = 0
@@ -112,17 +136,10 @@ def _atomic_write_json(out_path: str, data: Dict[str, Any]) -> None:
 
 def _episode_id_from_clip_id(clip_id: str) -> str:
     """Extract episode ID from clip ID using robust parsing."""
-    # 'clip_' prefix sanity check
-    if not clip_id.startswith("clip_"):
-        raise ValueError(f"Unexpected clip_id format: {clip_id}")
-    # split from the right: last '_' separates index
-    base, _, _ = clip_id.rpartition("_")
-    if not base:
-        raise ValueError(f"Missing index in clip_id: {clip_id}")
-    # remove 'clip_' prefix to get episode_id
-    if not base.startswith("clip_"):
-        raise ValueError(f"Unexpected base in clip_id: {clip_id}")
-    return base[len("clip_"):]
+    episode_id = _episode_for_clip_id(clip_id)
+    if not episode_id:
+        raise ValueError(f"Unable to resolve episode for clip_id {clip_id}")
+    return episode_id
 
 
 def _titles_path_for(clip_id: str) -> str:
