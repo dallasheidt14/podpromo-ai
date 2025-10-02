@@ -4526,6 +4526,7 @@ class ClipScoreService:
                 logger.info(f"QUALITY_GATE[strict]: adaptive floor={min_score} "
                             f"(eos_density_per_min={eos_density if 'eos_density' in locals() else 0.0:.3f} unit=per_min, pool={len(filtered_candidates)})")
                 
+                from services.quality_filters import filter_low_quality
                 quality_filtered = filter_low_quality(filtered_candidates, min_score=min_score)
             logger.info(f"QUALITY_FILTER: kept={len(quality_filtered)} of {len(filtered_candidates)}")
             
