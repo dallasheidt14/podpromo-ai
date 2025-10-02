@@ -106,8 +106,8 @@ def _atomic_write_json(out_path: str, data: Dict[str, Any]) -> None:
         try:
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
-        except:
-            pass
+        except Exception as e:
+            logger.debug("IGNORED_ERROR[%s]: %s", e.__class__.__name__, e)
 
 
 def _episode_id_from_clip_id(clip_id: str) -> str:

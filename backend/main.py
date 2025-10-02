@@ -1461,8 +1461,8 @@ async def get_episode_clips(episode_id: str, regenerate: bool = False, force_reg
                         ], capture_output=True, text=True, timeout=5)
                         if result.returncode == 0:
                             preview_duration_s = round(float(result.stdout.strip()), 1)
-                    except:
-                        pass
+                    except Exception as e:
+                        logger.debug("IGNORED_ERROR[%s]: %s", e.__class__.__name__, e)
                 
                 # Prefer virality if present, then display_score, finally final_score
                 display_score = clip.get("display_score", clip.get("final_score", 0.0))

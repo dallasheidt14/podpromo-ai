@@ -121,7 +121,8 @@ async def _get_episode_duration(episode_id: str) -> Optional[float]:
             return episode.duration
         # If no duration, assume it exists and return a default
         return 3600.0  # 1 hour default
-    except:
+    except Exception as e:
+        logger.debug("IGNORED_ERROR[%s]: %s", e.__class__.__name__, e)
         return None
 
 def _check_cached_candidates(episode_id: str, params: dict) -> bool:
@@ -133,7 +134,8 @@ def _check_cached_candidates(episode_id: str, params: dict) -> bool:
         episode_service = EpisodeService()
         # Note: This is a sync call, but in production you'd want async
         return True  # Simplified for now
-    except:
+    except Exception as e:
+        logger.debug("IGNORED_ERROR[%s]: %s", e.__class__.__name__, e)
         return False
 
 def _enqueue_clip_job(episode_id: str, params: dict, idempotency_key: Optional[str] = None) -> str:

@@ -10,19 +10,22 @@ import logging
 logger = logging.getLogger(__name__)
 
 try:
-    # If you already have an embedding service, import that instead
     from sentence_transformers import SentenceTransformer
-    _MODEL = SentenceTransformer("all-MiniLM-L6-v2")
-    def _embed(texts: List[str]):
-        return _MODEL.encode(texts, normalize_embeddings=True)
     HAS_EMB = True
-    logger.info("SEMANTIC_DEDUPE: using sentence-transformers model")
-except Exception as e:
+    _MODEL = None
+except Exception:
     HAS_EMB = False
-    logger.warning(f"SEMANTIC_DEDUPE: sentence-transformers not available ({e}), using fallback")
-    def _embed(texts: List[str]):
-        # Fallback: crude hashing vector to keep API stable (low quality)
+    _MODEL = None
+
+def _embed(texts: List[str]):
+    # Lazy init to avoid cold-start penalty
+    global _MODEL
+    if not HAS_EMB:
         return [[hash(t) % 997 / 997.0] for t in texts]
+    if _MODEL is None:
+        _MODEL = SentenceTransformer("all-MiniLM-L6-v2")
+        logger.info("SEMANTIC_DEDUPE: lazy-loaded sentence-transformers model")
+    return _MODEL.encode(texts, normalize_embeddings=True)
 
 def cosine(a, b):
     """Calculate cosine similarity between two vectors"""

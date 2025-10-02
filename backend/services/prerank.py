@@ -1,4 +1,4 @@
-﻿import logging
+import logging
 import math
 import hashlib
 import re

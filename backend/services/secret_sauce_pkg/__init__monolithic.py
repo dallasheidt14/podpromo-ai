@@ -1,4 +1,4 @@
-﻿"""
+"""
 secret_sauce_pkg - V4 Enhanced Viral Detection System
 All heuristics + weights for picking 'winning' clips.
 """
@@ -4041,7 +4041,8 @@ def _load_ail() -> Dict[str, Dict[str, float]]:
                     x = float(v)
                     # AIL scores usually 0..1 (or 0..1-ish). Clamp just in case.
                     return max(0.0, min(1.0, x))
-                except: 
+                except Exception as e:
+                    logger.debug("IGNORED_ERROR[%s]: %s", e.__class__.__name__, e)
                     return 0.0
             
             if header and len(header) >= 3 and header[0].lower().startswith("word"):
@@ -4100,7 +4101,8 @@ def _load_depechemood() -> Dict[str, Dict[str, float]]:
                         continue
                     try:
                         s = float(val)
-                    except:
+                    except Exception as e:
+                        logger.debug("IGNORED_ERROR[%s]: %s", e.__class__.__name__, e)
                         continue
                     # normalize roughly into [0,1] per row
                     out.setdefault(lemma_pos, {})[fam] = max(out[lemma_pos].get(fam, 0.0), s)
@@ -4581,7 +4583,8 @@ def _arousal_v5(y, sr, text="", genre="general", dur_s=None, tokens=None):
             # Try pyin first (more accurate)
             f0, voiced_flag, voiced_probs = librosa.pyin(y, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C7'))
             f0_clean = f0[voiced_flag]
-        except:
+        except Exception as e:
+            logger.debug("IGNORED_ERROR[%s]: %s", e.__class__.__name__, e)
             # Fallback to piptrack
             pitches, magnitudes = librosa.piptrack(y=y, sr=sr)
             f0_clean = pitches[pitches > 0]

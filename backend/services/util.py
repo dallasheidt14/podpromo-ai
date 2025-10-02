@@ -304,8 +304,8 @@ def atomic_write_json(path: Path, data: Any) -> None:
         # Clean up temp file on failure
         try:
             tmp_path.unlink(missing_ok=True)
-        except:
-            pass
+        except Exception as cleanup_e:
+            logger.debug("IGNORED_ERROR[%s]: %s", cleanup_e.__class__.__name__, cleanup_e)
         raise e
 
 

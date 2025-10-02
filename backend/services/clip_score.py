@@ -1146,9 +1146,10 @@ def adaptive_gate(candidates: List[Dict], min_count: int = 3, gate_mode=None) ->
             ft_ratio_sparse_ok = c["meta"]["ft_ratio_sparse_ok"]
             break
     
+    # Sparse speech: < ~6 EOS/min → allow soft floor
     should_softfloor = (
         fallback or 
-        eos_density < 0.015 or 
+        eos_density < 6.0 or 
         ft_ratio_sparse_ok >= 0.70 or 
         len(passed) == 0
     )
@@ -1581,8 +1582,8 @@ def _salvage_pass(candidates: List[Dict], *, fallback=False, tail_close_sec=1.0,
                     c_ext = re_extended[0]
                 
                 dur = float(c_ext.get("dur", 0.0))
-            except:
-                pass
+            except Exception as e:
+                logger.debug("IGNORED_ERROR[%s]: %s", e.__class__.__name__, e)
             
             # Reject if still too short
             if dur < MIN_FINAL_DUR:
@@ -1891,7 +1892,6 @@ from services.progress_writer import write_progress
 from services.prerank import pre_rank_candidates, get_safety_candidates, pick_stratified
 from services.utils.logging_ext import log_json
 from services.candidate_formatter import format_candidates
-from services.semantics import semantic_dedupe
 
 # Enhanced compute function with all Phase 1-3 features
 from services.secret_sauce_pkg.features import compute_features_v4_enhanced as _compute_features
@@ -2108,12 +2108,13 @@ def _word_end_times(words):
     return out
 
 def _telemetry_density(episode_words, eos_times):
+    from services.utils.units import per_min
     we = _word_end_times(episode_words)
     et = _safe_eos(eos_times)
     wc = len(we)
     ec = len(et)
-    # Avoid bogus density; prefer 0.0 over inflated value
-    dens = (ec / wc) if wc > 0 else 0.0
+    dur_s = (we[-1] - we[0]) if wc > 1 else 60.0
+    dens = per_min(ec, dur_s)  # EOS per minute
     return wc, ec, dens
 
 def apply_length_bucket_cap(finals, *, length_agnostic: bool) -> list:
@@ -2323,7 +2324,7 @@ def final_safety_pass(clips: List[Dict[str, Any]], eos_times: List[float], word_
     # Standardize EOS density calculation: markers per minute
     total_duration_minutes = max(1.0, (word_end_times[-1] - word_end_times[0]) / 60.0) if word_end_times and len(word_end_times) > 1 else 1.0
     eos_density = len(eos_times) / total_duration_minutes
-    is_sparse = eos_density < 0.02 or word_count < 500
+    is_sparse = eos_density < 6.0 or word_count < 500
     
     if is_sparse:
         logger.warning(f"EOS_SPARSE: Using relaxed safety mode (density: {eos_density:.3f}, words: {word_count})")
@@ -2388,7 +2389,7 @@ def final_safety_pass(clips: List[Dict[str, Any]], eos_times: List[float], word_
     finished_ratio = finished_count / max(len(clips), 1)
     
     # Log episode-level telemetry
-    logger.info(f"TELEMETRY: word_count={wc}, eos_count={ec}, eos_density={eos_density:.3f}")
+    logger.info(f"TELEMETRY: word_count={wc}, eos_count={ec}, eos_density_per_min={eos_density:.3f} unit=per_min")
     logger.info(f"TELEMETRY: fallback_mode={fallback_mode}, finished_ratio={finished_ratio:.2f}")
     logger.info(f"SAFETY_PASS: updated {safety_updated}, dropped {safety_dropped}, protected {safety_protected} clips")
     
@@ -3938,10 +3939,10 @@ class ClipScoreService:
             eos_times, word_end_times, eos_source = build_eos_index(segments, episode_words, episode_raw_text)
             
             # One-time fallback mode decision per episode (freeze this value)
-            # Standardize EOS density calculation: markers per minute
+            # EOS per minute
             total_duration_minutes = max(1.0, (word_end_times[-1] - word_end_times[0]) / 60.0) if word_end_times and len(word_end_times) > 1 else 1.0
             eos_density = len(eos_times) / total_duration_minutes
-            episode_fallback_mode = eos_density < 0.020
+            episode_fallback_mode = eos_density < 6.0
             
             # --- Decide if enhanced should run ---
             from config import settings
@@ -4272,10 +4273,9 @@ class ClipScoreService:
                 # Adaptive quality floor when recheck runs
                 base_floor = 15  # Convert to score scale (0.15 * 100)
                 
-                # If EOS is sparse (e.g., long monologues), lower the bar a bit:
+                # Adaptive floor: baseline around spoken English ~9 EOS/min
                 if 'eos_density' in locals() and eos_density > 0:
-                    # 0.06 is a healthy baseline density we've seen; scale down below that
-                    scale = min(1.0, max(0.35, eos_density / 0.06))
+                    scale = min(1.0, max(0.35, eos_density / 9.0))
                 else:
                     scale = 0.9  # cautious fallback
                 
@@ -4287,7 +4287,7 @@ class ClipScoreService:
                 
                 min_score = int(adaptive_floor)
                 logger.info(f"QUALITY_GATE[strict]: adaptive floor={min_score} "
-                            f"(eos_density={eos_density if 'eos_density' in locals() else 0.0:.3f}, pool={len(filtered_candidates)})")
+                            f"(eos_density_per_min={eos_density if 'eos_density' in locals() else 0.0:.3f} unit=per_min, pool={len(filtered_candidates)})")
                 
                 quality_filtered = filter_low_quality(filtered_candidates, min_score=min_score)
             logger.info(f"QUALITY_FILTER: kept={len(quality_filtered)} of {len(filtered_candidates)}")
@@ -4480,6 +4480,7 @@ class ClipScoreService:
             
             # Apply semantic deduplication after timing dedupe
             if finals and os.getenv("SEMANTIC_DEDUPE", "1") in ("1","true","True"):
+                from services.semantics import semantic_dedupe
                 before_semantic = len(finals)
                 sim_thresh = float(os.getenv("SEMANTIC_SIM", "0.92"))
                 finals = semantic_dedupe(finals, sim_thresh=sim_thresh)
@@ -5130,7 +5131,7 @@ class ClipScoreService:
             # FT summary already logged above via _log_final_summary
             
             # Telemetry already calculated above
-            logger.info("TELEMETRY: word_count=%d, eos_count=%d, eos_density=%.3f", wc, ec, dens)
+            logger.info("TELEMETRY: word_count=%d, eos_count=%d, eos_density_per_min=%.3f unit=per_min", wc, ec, dens)
             logger.info(f"TELEMETRY: fallback_mode={episode_fallback_mode} (authoritative={authoritative_enhanced})")
             
             # Candidate-level FT summary (post-refinement, post-extension)

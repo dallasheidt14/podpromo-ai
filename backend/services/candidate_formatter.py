@@ -1,4 +1,4 @@
-﻿from typing import Dict, List
+from typing import Dict, List
 import logging
 
 from config_loader import get_config
