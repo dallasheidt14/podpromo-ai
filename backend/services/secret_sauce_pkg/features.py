@@ -4612,28 +4612,38 @@ def discover_dynamic_length(words, eos_times, score_fn, duration_s):
             log.warning("DYNAMIC_LENGTH: discovery failed; falling back")
             return []
     
-    # Optimize each peak
+    # 🔧 MULTI-WINDOW PER PEAK: Keep multiple window lengths instead of collapsing to median
+    TARGET_WINDOWS = [8, 20, 35, 60]  # Multiple target lengths per peak
+    K_PER_PEAK = int(os.getenv("DYN_K_PER_PEAK", "2"))  # Keep top-N per peak
+    
     candidates = []
     for peak_time, peak_score in peaks:
-        try:
-            s, e, score = optimize_window(peak_time, words, eos_times, score_fn, min_len=7.0, max_len=120.0)
-            if score > 0.1:  # Minimum quality threshold
-                # Validate segment spans before adding
-                if s >= e or e - s < 1.0:  # Invalid or too short
-                    log.debug(f"Skipping invalid segment: start={s}, end={e}, duration={e-s}")
-                    continue
-                    
-                candidates.append({
-                    'start': s,
-                    'end': e,
-                    'duration': e - s,
-                    'score': score,
-                    'peak_time': peak_time,
-                    'peak_score': peak_score
-                })
-        except Exception as e:
-            log.debug(f"Window optimization error at peak {peak_time}: {e}")
-            continue
+        variants = []
+        for target_len in TARGET_WINDOWS:
+            try:
+                s, e, score = optimize_window(peak_time, words, eos_times, score_fn, min_len=7.0, max_len=120.0)
+                if score > 0.1:  # Minimum quality threshold
+                    # Validate segment spans before adding
+                    if s >= e or e - s < 1.0:  # Invalid or too short
+                        log.debug(f"Skipping invalid segment: start={s}, end={e}, duration={e-s}")
+                        continue
+                        
+                    variants.append({
+                        'start': s,
+                        'end': e,
+                        'duration': e - s,
+                        'score': score,
+                        'peak_time': peak_time,
+                        'peak_score': peak_score,
+                        'pre_score': score  # For sorting variants
+                    })
+            except Exception as e:
+                log.debug(f"Window optimization error at peak {peak_time}, target_len={target_len}: {e}")
+                continue
+        
+        # Score quick & keep best K for this peak
+        variants.sort(key=lambda s: s.get("pre_score", 0.0), reverse=True)
+        candidates.extend(variants[:K_PER_PEAK])
     
     # Deduplicate candidates
     deduped = dedupe_candidates(candidates)
@@ -4642,7 +4652,7 @@ def discover_dynamic_length(words, eos_times, score_fn, duration_s):
     target_count = max(20, min(40, int(duration_minutes * 1.0)))
     final_candidates = sorted(deduped, key=lambda x: x['score'], reverse=True)[:target_count]
     
-    log.info(f"DYNAMIC_LENGTH: found {len(peaks)} peaks (smooth={smooth_window:.1f}s), optimized {len(candidates)} candidates, kept {len(final_candidates)} after dedupe mode=peaks")
+    log.info(f"DYNAMIC_LENGTH: found {len(peaks)} peaks (smooth={smooth_window:.1f}s), multi-window={len(candidates)} candidates, kept {len(final_candidates)} after dedupe mode=peaks")
     
     # Structured logging for dynamic discovery
     from services.utils.logging_ext import log_json

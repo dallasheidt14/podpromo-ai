@@ -983,6 +983,25 @@ class EpisodeService:
                     
                     logger.info(f"Saved {len(clips)} clips to {clips_file}")
                     
+                    # 🔧 CLIP INDEX: Update global clip-to-episode mapping for titles service
+                    try:
+                        uploads_root = UPLOAD_DIR
+                        index_path = os.path.join(uploads_root, "clip_index.json")
+                        index = {}
+                        if os.path.exists(index_path):
+                            with open(index_path, "r", encoding="utf-8") as f:
+                                index = json.load(f)
+                        for c in serializable_clips:
+                            if c.get("id"):
+                                index[c["id"]] = episode_id
+                        tmp = index_path + ".tmp"
+                        with open(tmp, "w", encoding="utf-8") as f:
+                            json.dump(index, f, ensure_ascii=False, indent=2)
+                        os.replace(tmp, index_path)
+                        logger.debug(f"CLIP_INDEX: updated with {len(serializable_clips)} clips")
+                    except Exception as e:
+                        logger.warning("CLIP_INDEX_UPDATE_FAIL: %s", e)
+                    
                     # Fire-and-forget auto-titling so the UI always has options on first load
                     try:
                         from services.titles_service import TitlesService

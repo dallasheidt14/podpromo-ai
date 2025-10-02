@@ -1897,6 +1897,22 @@ from services.utils.clip_validation import validate_all_clips
 from services.utils.clip_ids import assign_clip_ids
 from services.utils.text_normalization import normalize_all_segments
 
+# --- ID management helpers (new) ---
+import hashlib
+
+def _canonical_clip_id(episode_id: str, start: float, end: float) -> str:
+    """Generate canonical clip ID from episode_id and precise timings"""
+    raw = f"{episode_id}:{int(round(start*1000))}:{int(round(end*1000))}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+def _ensure_clip_id(episode_id: str, clip: dict) -> None:
+    """Ensure clip has canonical ID and episode_id metadata"""
+    if not clip.get("id"):
+        s = float(clip.get("start") or 0.0)
+        e = float(clip.get("end") or s)
+        clip["id"] = _canonical_clip_id(episode_id, s, e)
+    clip["episode_id"] = episode_id
+
 # --- duration helpers (new) ---
 def _estimate_episode_duration_s(words: list | None, segments: list | None, meta: dict | None) -> float:
     """Estimate episode duration from available sources to prevent UnboundLocalError"""
@@ -3965,8 +3981,7 @@ class ClipScoreService:
         
         # Platform flags: always defined unconditionally at the start
         pl_v2_weight, platform_protect, length_agnostic = _get_platform_mode()
-        logger.info("PLATFORM_MODE: pl_v2_weight=%.2f, platform_protect=%s, length_agnostic=%s", 
-                   pl_v2_weight, platform_protect, length_agnostic)
+        # Note: PLATFORM_MODE already logged in _get_platform_mode()
         
         # Initialize final_clips for salvage guard
         final_clips = []
@@ -4309,6 +4324,13 @@ class ClipScoreService:
                 # 🔧 SCHEMA NORMALIZATION: Prevent field drift and type errors
                 logger.info("SCHEMA_NORMALIZE: Applying consistent field schema to all candidates")
                 candidates = [_normalize_clip_obj(c, episode_duration_s) for c in candidates]
+                
+                # 🔧 ID NORMALIZATION: Ensure all clips have canonical IDs and episode_id metadata
+                logger.info("ID_NORMALIZE: Ensuring canonical IDs and episode metadata")
+                for c in finals:
+                    _ensure_clip_id(episode_id, c)
+                for c in candidates:
+                    _ensure_clip_id(episode_id, c)
                 
                 # --- NORMALIZE + SNAPSHOT ---
                 # Normalize everything once to avoid type/field drift later
@@ -5425,8 +5447,12 @@ class ClipScoreService:
             # 1. Seed all RNGs for deterministic behavior
             seed_everything(episode_id)
             
-            # 2. Get episode duration for time validation
-            episode_duration_s = getattr(self.episode_service.get_episode(episode_id), 'duration_s', 3600.0)
+            # 2. Get episode duration for time validation (use safe estimator)
+            episode_duration_s = _estimate_episode_duration_s(
+                getattr(episode, 'words', None), 
+                final_clips, 
+                {"duration_s": getattr(episode, 'duration_s', None)}
+            )
             
             # 3. Validate and clamp all clip times
             final_clips = validate_all_clips(final_clips, episode_duration_s)
@@ -5465,7 +5491,11 @@ class ClipScoreService:
             
             # Apply safety fixes even in error recovery
             try:
-                episode_duration_s = getattr(self.episode_service.get_episode(episode_id), 'duration_s', 3600.0)
+                episode_duration_s = _estimate_episode_duration_s(
+                    getattr(episode, 'words', None), 
+                    final_clips, 
+                    {"duration_s": getattr(episode, 'duration_s', None)}
+                )
                 final_clips = validate_all_clips(final_clips, episode_duration_s)
                 final_clips = assign_clip_ids(final_clips, episode_id)
                 final_clips = normalize_all_segments(final_clips)
