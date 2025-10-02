@@ -1607,6 +1607,14 @@ def generate_titles(
             sanitized_title = re.sub(r'\bthat that\b', 'that', sanitized_title, flags=re.IGNORECASE)
             sanitized_title = re.sub(r'\bthe the\b', 'the', sanitized_title, flags=re.IGNORECASE)
             sanitized_title = re.sub(r'\band and\b', 'and', sanitized_title, flags=re.IGNORECASE)
+            
+            # Additional grammar fixes for Phase 2/3
+            sanitized_title = re.sub(r"\bHow to\s+(\w+?)(ing)\b", r"How to \1", sanitized_title, flags=re.I)   # Understanding -> Understand
+            sanitized_title = re.sub(r"\bWhy\s+doesnt\b", "Why Doesn't", sanitized_title, flags=re.I)
+            sanitized_title = re.sub(r"\bThe\s+3\s+\b\bRules\b", "The 3 Rules", sanitized_title)              # remove accidental double spaces
+            sanitized_title = re.sub(r"\s{2,}", " ", sanitized_title).strip()
+            # Remove dangling "How to  in 30 Days" gaps
+            sanitized_title = re.sub(r"How to\s+in\s+(\d+\s*Days)", r"How to in \1", sanitized_title)  # if still broken, at least not empty slot
             # Check for banned phrases and rewrite if needed
             for banned in BANNED_PHRASES:
                 if banned.lower() in sanitized_title.lower():

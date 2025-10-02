@@ -4,6 +4,7 @@ import type {
   Progress, Episode, Clip, ConfigGet,
   ClipGenParams
 } from "./types";
+import { normalizeClip } from "./normalize";
 
 // Title management types
 export interface TitleGenRequest {
@@ -110,21 +111,22 @@ export async function getEpisodeProgress(id: string): Promise<ApiResult<{ progre
   });
 }
 
-export async function getClips(episodeId: string): Promise<ApiResult<{ clips: Clip[] }>> {
+export async function getClips(episodeId: string, variant?: 'seeds' | 'control'): Promise<ApiResult<{ clips: Clip[] }>> {
+  const qs = new URLSearchParams({ ts: String(Date.now()) });
+  if (variant) qs.set('variant', variant);
+  
   const r = await getJson<any>(
-    apiUrl(`/api/episodes/${encodeURIComponent(episodeId)}/clips?ts=${Date.now()}`),
+    apiUrl(`/api/episodes/${encodeURIComponent(episodeId)}/clips?${qs}`),
     { cache: "no-store" }
   );
   if (!r.ok) throw new Error(r.error || `clips_http_${r.status ?? "unknown"}`);
-  const clips = parseClips<Clip>(r.data);
   
-  // Add uiScores bundle for consistent score display
+  const raw = parseClips<any>(r.data);
+  const clips = raw.map(normalizeClip);        // <-- normalize here, preserves order
+
   const { buildScoreBundle } = await import("../../app/lib/score");
-  const clipsWithScores = clips.map((c: any) => ({
-    ...c,
-    uiScores: buildScoreBundle(c),
-  }));
-  
+  const clipsWithScores = clips.map((c: any) => ({ ...c, uiScores: buildScoreBundle(c) }));
+
   return { ok: true, data: { clips: clipsWithScores } };
 }
 

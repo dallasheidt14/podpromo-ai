@@ -265,7 +265,7 @@ def _slice_words_text(words, t0, t1):
     if not words:
         return ""
     i = max(0, _idx_at_or_before(words, t0))
-    acc = []
+    acc: list[str] = []
     for j in range(i, len(words)):
         try:
             wt = _w_start(words[j])
@@ -825,9 +825,9 @@ def _run_quality_gates(cands, base_floor, log_ctx):
         balanced_floor = strict_floor + BALANCED_EXTRA_DELTA
         kept_balanced = [c for c in cands if c.get("final_score", 0.0) >= balanced_floor]
 
-        # Enforce MIN_FINALS when strict is empty.
+        # Enforce MIN_FINALS when strict is empty (or when APPLIED_WHEN_STRICT_EMPTY=true).
         # Still keep safety/dup constraints intact – we're only relaxing the score floor.
-        if len(kept_balanced) < MIN_FINALS:
+        if len(kept_balanced) < MIN_FINALS and (len(kept_strict) == 0 or APPLIED_WHEN_STRICT_EMPTY):
             # take top-N by final_score (already safe) up to MIN_FINALS
             # NOTE: these are still from `cands` (already safety/gate-eligible)
             kept_balanced = sorted(cands, key=lambda x: x.get("final_score", 0.0), reverse=True)[:MIN_FINALS]
@@ -842,10 +842,14 @@ def _run_quality_gates(cands, base_floor, log_ctx):
         # Strict had items — return strict as the finals for gate stage.
         return kept_strict, log_ctx
 
-def apply_quality_gate(candidates: List[Dict], mode: str = "strict") -> List[Dict]:
+def apply_quality_gate(candidates: List[Dict], mode: str = "strict", skip_quality_recheck: bool = False) -> List[Dict]:
     """Apply quality gate with auto-relaxation when too few clips remain"""
     if not candidates:
         return []
+    
+    if skip_quality_recheck:
+        logger.info("ENHANCED: skipping quality gate (authoritative)")
+        return candidates
     
     # Initialize logging context
     log_ctx = {}
@@ -857,7 +861,7 @@ def apply_quality_gate(candidates: List[Dict], mode: str = "strict") -> List[Dic
     logger.info(f"QUALITY_GATE[strict]: kept={log_ctx.get('strict_kept', 0)} floor={log_ctx.get('strict_floor', 'N/A')}")
     if 'balanced_floor' in log_ctx:
         logger.info(f"QUALITY_GATE[balanced]: kept={log_ctx.get('balanced_kept', 0)} floor={log_ctx.get('balanced_floor', 'N/A')} reason={log_ctx.get('balanced_reason', 'N/A')}")
-    logger.info(f"MIN_FINALS: target={MIN_FINALS} applied_when_strict_empty={log_ctx.get('strict_kept', 0) == 0}")
+    logger.info(f"MIN_FINALS: target={MIN_FINALS} applied_when_strict_empty={log_ctx.get('strict_kept', 0) == 0} env_override={APPLIED_WHEN_STRICT_EMPTY}")
     
     return kept
 
@@ -996,11 +1000,11 @@ def _anti_uniform_tiebreak(picks, reserve, window=1.0, LOG=None):
 # Length-agnostic selection: pure top-K by virality with diversity tie-breaker
 EPSILON = 0.03  # Virality difference threshold for tie-breaking
 
-def pure_topk_pick(sorted_pool, reserve, want=4, LOG=None):
+def pure_topk_pick(sorted_pool, reserve, want=4, LOG=None, skip_quality=False, skip_quality_recheck: bool = False):
     """Pure top-K by virality with diversity tie-breaker only on near-ties"""
     picks = []
     
-    # Pure top-K selection by virality
+    # Pure top-K selection by virality (use virality_calibrated if available)
     for c in sorted_pool:
         if len(picks) >= want:
             break
@@ -1009,7 +1013,12 @@ def pure_topk_pick(sorted_pool, reserve, want=4, LOG=None):
     # If we need more, add from reserve
     if len(picks) < want:
         from services.quality_filters import filter_low_quality
-        reserve_ok = filter_low_quality(reserve, mode="balanced")
+        if skip_quality or skip_quality_recheck:
+            if LOG:
+                LOG.info("ENHANCED: skipping quality filter in pure_topk_pick (authoritative)")
+            reserve_ok = reserve
+        else:
+            reserve_ok = filter_low_quality(reserve, mode="balanced")
         
         for c in reserve_ok:
             if len(picks) >= want:
@@ -1376,9 +1385,13 @@ def dedup_by_timing(clips, time_window=0.15):
     
     return unique
 
-def tighten_selection(clips):
+def tighten_selection(clips, finished_required=True):
     """Tighten selection after gating - drop unfinished clips unless they meet quality thresholds"""
     if not clips:
+        return clips
+    
+    # Skip tightening for authoritative enhanced results
+    if not finished_required:
         return clips
     
     tightened = []
@@ -1752,11 +1765,15 @@ def _dedup_by_text(cands, text_thresh=0.90):
 
 def _format_candidate(seg):
     """Format a single segment into a candidate with ft_status propagation"""
+    # Use refined durations if available, otherwise fall back to original
+    start = seg.get("start_refined", seg.get("start", 0))
+    end = seg.get("end_refined", seg.get("end", 0))
+    
     c = {
         "id": seg.get("id"),
-        "start": float(seg.get("start", 0)),
-        "end": float(seg.get("end", 0)),
-        "duration": float(seg.get("end", 0) - seg.get("start", 0)),
+        "start": float(start),
+        "end": float(end),
+        "duration": float(end - start),
         "text": seg.get("text", ""),
         "ft_status": seg.get("ft_status"),   # <-- carry through
         "ft_meta": seg.get("ft_meta", {}),   # optional but useful for logging
@@ -1855,6 +1872,77 @@ def _soft_relax_on_zero(pool, min_keep=3):
 # Environment variable for soft-relax
 import os
 _SOFT_RELAX = os.getenv("FT_SOFT_RELAX_ON_ZERO", "1") != "0"
+APPLIED_WHEN_STRICT_EMPTY = os.getenv("APPLIED_WHEN_STRICT_EMPTY", "false").lower() in ("1","true","yes")
+
+def _flatten_enhanced_scores(c: dict) -> dict:
+    """
+    Normalize enhanced/legacy clip dicts so formatters/UI can read scores:
+    - Lift per-feature scores to top-level as <feature>_score
+    - Normalize virality fields: virality, virality_calibrated, virality_pct, display_score
+    - Return a new dict (do not mutate input)
+    """
+    if not isinstance(c, dict):
+        return c
+    out = dict(c)
+    feats = out.get("features") or {}
+
+    # Per-feature scores
+    feature_keys = ["hook", "arousal", "emotion", "payoff", "info", "q_or_list", "loop", "platform_len"]
+    for k in feature_keys:
+        # Prefer explicit *_score; fallback to raw feature value if provided.
+        v = out.get(f"{k}_score", feats.get(f"{k}_score", feats.get(k)))
+        if v is not None:
+            # Do not overwrite if already present
+            out.setdefault(f"{k}_score", float(v))
+
+    # Enhanced virality normalization - prioritize enhanced scores
+    vir_raw = out.get("virality")
+    vir_cal = out.get("virality_calibrated", feats.get("virality_calibrated"))
+    vir_pct = out.get("virality_pct", feats.get("virality_pct"))
+    vir_score = out.get("virality_score", feats.get("virality_score"))  # Enhanced normalized score
+    composite_score = out.get("composite_score", feats.get("composite_score"))  # Enhanced composite
+
+    # Priority: enhanced normalized scores > calibrated > raw
+    base = None
+    if vir_score is not None:
+        base = vir_score
+    elif composite_score is not None:
+        base = composite_score
+    elif vir_cal is not None:
+        base = vir_cal
+    elif vir_raw is not None:
+        base = vir_raw
+
+    # Use enhanced virality_pct if available, otherwise compute from base
+    if vir_pct is None and base is not None:
+        try:
+            vir_pct = (max(0.0, min(1.0, float(base))) * 100.0)
+        except Exception:
+            vir_pct = 0.0
+    elif vir_pct is None:
+        vir_pct = 0.0
+
+    # Set virality fields with enhanced priority
+    if vir_score is not None:
+        out["virality_score"] = float(vir_score)
+        out["virality"] = float(vir_score)  # Use enhanced score as primary virality
+    elif composite_score is not None:
+        out["composite_score"] = float(composite_score)
+        out["virality"] = float(composite_score)
+    elif vir_raw is not None:
+        out["virality"] = float(vir_raw)
+    else:
+        out.setdefault("virality", 0.0)
+
+    if vir_cal is not None:
+        out["virality_calibrated"] = float(vir_cal)
+    out["virality_pct"] = float(vir_pct)
+
+    # display_score used by UI: prefer enhanced virality_pct
+    if "display_score" not in out or out.get("display_score") is None:
+        out["display_score"] = out["virality_pct"]
+
+    return out
 
 # Terminal punctuation patterns for finished-like detection
 _TERMINAL_PUNCT = ('.', '!', '?', '…', '."', '!"', '?"')
@@ -1888,11 +1976,17 @@ def _get_platform_mode():
     """
     import os
     # v2 weighting (0..1)
-    pl_v2_weight = float(os.getenv("PL_V2_WEIGHT", "0.5") or 0.5)
+    pl_v2_weight = float(os.getenv("PL_V2_WEIGHT", "0.25") or 0.25)
     # keep at least one long clip in traditional/platform-biased modes
     platform_protect = os.getenv("PLATFORM_PROTECT", "1") in ("1", "true", "True")
     # when TRUE we treat all lengths neutrally and cap long-count
-    length_agnostic = os.getenv("LENGTH_AGNOSTIC", "0") in ("1", "true", "True")
+    # Enable length-agnostic mode when enhanced pipeline is active
+    try:
+        from config import settings
+        length_agnostic = os.getenv("LENGTH_AGNOSTIC", "1" if settings.PP_ENHANCED else "0") in ("1", "true", "True")
+    except ImportError:
+        # Fallback if config not available
+        length_agnostic = os.getenv("LENGTH_AGNOSTIC", "0") in ("1", "true", "True")
     
     logger.info(
         "PLATFORM_MODE: pl_v2_weight=%s, platform_protect=%s, length_agnostic=%s",
@@ -2148,7 +2242,9 @@ def final_safety_pass(clips: List[Dict[str, Any]], eos_times: List[float], word_
     
     # Check EOS density
     word_count = len(word_end_times)
-    eos_density = len(eos_times) / max(word_count, 1)
+    # Standardize EOS density calculation: markers per minute
+    total_duration_minutes = max(1.0, (word_end_times[-1] - word_end_times[0]) / 60.0) if word_end_times and len(word_end_times) > 1 else 1.0
+    eos_density = len(eos_times) / total_duration_minutes
     is_sparse = eos_density < 0.02 or word_count < 500
     
     if is_sparse:
@@ -2204,7 +2300,9 @@ def final_safety_pass(clips: List[Dict[str, Any]], eos_times: List[float], word_
     ec = len(eos_times) if eos_times else 0
     # Note: episode-level fallbacks are handled in the calling function
     # Avoid bogus density; prefer 0.0 over inflated value
-    eos_density = (ec / wc) if wc > 0 else 0.0
+    # Standardize EOS density calculation: markers per minute
+    total_duration_minutes = max(1.0, (word_end_times[-1] - word_end_times[0]) / 60.0) if word_end_times and len(word_end_times) > 1 else 1.0
+    eos_density = ec / total_duration_minutes
     fallback_mode = wc < 500 or ec == 0
     
     # Count finish thought results
@@ -3554,34 +3652,37 @@ class ClipScoreService:
 
     def _format_one(self, c):
         """Format a single clip with bulletproof field access."""
+        # Normalize enhanced scores to top-level fields
+        clip = _flatten_enhanced_scores(c)
+        
         # Extract virality and individual scores
-        virality = float(self._safe_get(c, "virality_raw", 0.0))
+        virality = float(self._safe_get(clip, "virality_raw", 0.0))
         
         # Individual score fields (0-1)
         scores = {
-            "hook_score": float(self._safe_get(c, "hook_score", 0.0)),
-            "arousal_score": float(self._safe_get(c, "arousal_score", 0.0)),
-            "emotion_score": float(self._safe_get(c, "emotion_score", 0.0)),
-            "question_score": float(self._safe_get(c, "question_score", 0.0)),
-            "payoff_score": float(self._safe_get(c, "payoff_score", 0.0)),
-            "info_density": float(self._safe_get(c, "info_density", 0.0)),
-            "loopability": float(self._safe_get(c, "loopability", 0.0)),
-            "platform_len_match": float(self._safe_get(c, "platform_len_match", 0.0)),
+            "hook_score": float(self._safe_get(clip, "hook_score", 0.0)),
+            "arousal_score": float(self._safe_get(clip, "arousal_score", 0.0)),
+            "emotion_score": float(self._safe_get(clip, "emotion_score", 0.0)),
+            "question_score": float(self._safe_get(clip, "question_score", 0.0)),
+            "payoff_score": float(self._safe_get(clip, "payoff_score", 0.0)),
+            "info_density": float(self._safe_get(clip, "info_density", 0.0)),
+            "loopability": float(self._safe_get(clip, "loopability", 0.0)),
+            "platform_len_match": float(self._safe_get(clip, "platform_len_match", 0.0)),
         }
         
         # Extract seed and payoff sentences for enhanced title generation (Phase 3)
         seed_sentence = None
         payoff_sentence = None
-        if c.get('seed_idx') is not None:
+        if clip.get('seed_idx') is not None:
             # Try to get sentence_spans from the clip or episode context
-            sentence_spans = c.get('sentence_spans') or getattr(self, 'sentence_spans', None)
-            if sentence_spans and c['seed_idx'] < len(sentence_spans):
-                seed_sentence = sentence_spans[c['seed_idx']].text
-        payoff_sentence = last_sentence_of(c.get('text', ''))
+            sentence_spans = clip.get('sentence_spans') or getattr(self, 'sentence_spans', None)
+            if sentence_spans and clip['seed_idx'] < len(sentence_spans):
+                seed_sentence = sentence_spans[clip['seed_idx']].text
+        payoff_sentence = last_sentence_of(clip.get('text', ''))
         
         # Add to clip for title service
-        c['seed_sentence'] = seed_sentence
-        c['payoff_sentence'] = payoff_sentence
+        clip['seed_sentence'] = seed_sentence
+        clip['payoff_sentence'] = payoff_sentence
         
         # Generate eager title
         title = None
@@ -3590,20 +3691,24 @@ class ClipScoreService:
             from services.titles_service import TitlesService
             ts = TitlesService()
             # Use the existing ensure_titles_for_clip method
-            title_data = ts.ensure_titles_for_clip(c, platform="shorts")
+            title_data = ts.ensure_titles_for_clip(clip, platform="shorts")
             if title_data:
                 title = title_data.get("chosen") or title_data.get("overlay")
                 title_suggestions = title_data.get("variants", [])
         except Exception as e:
-            logger.warning("TITLE_GEN_FAIL %s: %s", c.get("id", "unknown"), e)
+            logger.warning("TITLE_GEN_FAIL %s: %s", clip.get("id", "unknown"), e)
         
-        return {
-            "id": c["id"],
-            "start": c.get("start"),
-            "end": c.get("end"),
-            "duration": round(c.get("duration", (c.get("end", 0) - c.get("start", 0))), 1),
-            "display_score": int(round(self._safe_get(c, "display_score", 50))),
-            "text": (c.get("text") or "")[:240],
+        # Title fallback (simple truncation)
+        if not title:
+            title = (clip.get("text", "")[:80] or f"Clip {clip.get('id','') or ''}").strip()
+        
+        out = {
+            "id": clip["id"],
+            "start": clip.get("start"),
+            "end": clip.get("end"),
+            "duration": round(clip.get("duration", (clip.get("end", 0) - clip.get("start", 0))), 1),
+            "display_score": int(round(self._safe_get(clip, "display_score", 50))),
+            "text": (clip.get("text") or "")[:240],
             
             # Virality fields (both 0-1 and 0-100)
             "virality": virality,
@@ -3611,8 +3716,8 @@ class ClipScoreService:
             "virality_pct": int(round(virality * 100)),
             
             # Platform fit fields
-            "platform_fit": float(self._safe_get(c, "platform_len", 0.0)),
-            "platform_fit_pct": int(round(self._safe_get(c, "platform_len", 0.0) * 100)),
+            "platform_fit": float(self._safe_get(clip, "platform_len", 0.0)),
+            "platform_fit_pct": int(round(self._safe_get(clip, "platform_len", 0.0) * 100)),
             
             # Individual scores (0-1)
             **scores,
@@ -3625,8 +3730,27 @@ class ClipScoreService:
             "title_suggestions": title_suggestions,
             
             # keep any extra fields safely
-            "meta": {k: v for k, v in c.items() if k not in {"id", "start", "end", "duration", "text"}}
+            "meta": {k: v for k, v in clip.items() if k not in {"id", "start", "end", "duration", "text"}}
         }
+        
+        # TEMP DEBUG: verify scores flow (toggle via config if you have one)
+        try:
+            if getattr(self, "debug_format_scores", True):
+                logger.info(
+                    "FORMAT_SCORE: id=%s hook=%.3f arous=%.3f payoff=%.3f info=%.3f vir=%.3f vir_pct=%.1f disp=%.1f",
+                    clip.get("id"),
+                    float(clip.get("hook_score", 0.0)),
+                    float(clip.get("arousal_score", 0.0)),
+                    float(clip.get("payoff_score", 0.0)),
+                    float(clip.get("info_score", 0.0)),
+                    float(clip.get("virality", 0.0)),
+                    float(clip.get("virality_pct", 0.0)),
+                    float(clip.get("display_score", 0.0)),
+                )
+        except Exception:
+            pass
+        
+        return out
 
     def _minimal_candidate_dict(self, clip):
         """Lowest-common-denominator fields so the UI can render something."""
@@ -3736,29 +3860,149 @@ class ClipScoreService:
             eos_times, word_end_times, eos_source = build_eos_index(segments, episode_words, episode_raw_text)
             
             # One-time fallback mode decision per episode (freeze this value)
-            eos_density = len(eos_times) / max(len(word_end_times), 1)
+            # Standardize EOS density calculation: markers per minute
+            total_duration_minutes = max(1.0, (word_end_times[-1] - word_end_times[0]) / 60.0) if word_end_times and len(word_end_times) > 1 else 1.0
+            eos_density = len(eos_times) / total_duration_minutes
             episode_fallback_mode = eos_density < 0.020
-            logger.info(f"EOS_UNIFIED: count={len(eos_times)}, src={eos_source}, density={eos_density:.3f}, fallback={episode_fallback_mode}")
+            
+            # --- Decide if enhanced should run ---
+            from config import settings
+            
+            use_enhanced = settings.PP_ENHANCED
+            
+            # EOS pick: prefer unified if present
+            eos_unified = effective_eos_times if 'effective_eos_times' in locals() and effective_eos_times is not None else eos_times
+            eos_count = len(eos_unified) if eos_unified is not None else 0
+            word_count = len(episode_words) if episode_words is not None else 0
+            
+            enhance_reasons = []
+            if word_count < settings.PP_MIN_WORDS_FOR_ENHANCED:
+                enhance_reasons.append("insufficient_words")
+            if eos_count < settings.PP_MIN_EOS_FOR_ENHANCED:
+                enhance_reasons.append("low_eos")
+            
+            if use_enhanced:
+                # We log reasons but do NOT block; the guardrails are advisory
+                if enhance_reasons:
+                    logger.info("ENHANCED: invoking despite %s (words=%s eos=%s)",
+                                ",".join(enhance_reasons), word_count, eos_count)
+                else:
+                    logger.info("ENHANCED: invoking (words=%s eos=%s)", word_count, eos_count)
+            else:
+                logger.info("ENHANCED: disabled via flag; using legacy.")
+            
+            enhanced_result = None
+            enhanced_error = None
+            skip_quality_recheck = False  # Initialize skip flag
+            authoritative_enhanced = False  # Initialize authoritative flag
+            
+            if use_enhanced:
+                try:
+                    # ---------------- ENHANCED CALL ----------------
+                    enhanced_result = find_viral_clips_enhanced(
+                        segments,
+                        episode.audio_path,
+                        genre=final_genre,
+                        platform=backend_platform,
+                        fallback_mode=episode_fallback_mode,
+                        effective_eos_times=eos_times,
+                        effective_word_end_times=word_end_times,
+                        eos_source=eos_source,
+                        episode_words=episode_words,
+                    )
+                    logger.info("ENHANCED: completed candidates=%d finals=%d seeds=%d",
+                                len(enhanced_result.get("candidates", [])),
+                                len(enhanced_result.get("finals", [])),
+                                enhanced_result.get("meta", {}).get("seed_count", 0))
+                    
+                    # Debug: Log what we received from enhanced pipeline
+                    logger.info("ENHANCED_DEBUG: received keys=%s", list(enhanced_result.keys()))
+                    if enhanced_result.get("finals"):
+                        logger.info("ENHANCED_DEBUG: first final keys=%s", list(enhanced_result["finals"][0].keys()))
+                        logger.info("ENHANCED_DEBUG: first final finished=%s", enhanced_result["finals"][0].get('finished', 'MISSING'))
+                    
+                    # Trust authoritative enhanced results (skip recheck when safe)
+                    finals = list(enhanced_result.get("finals") or [])
+                    candidates = list(enhanced_result.get("candidates") or [])
+                    ft = enhanced_result.get("ft", {})
+                    ft_finished = int(ft.get("finished", 0))
+                    ft_total = max(int(ft.get("total", len(finals))), 1)
+                    finished_ratio = ft_finished / ft_total
+                    coverage_note = enhanced_result.get("coverage_note") or "full_features"
+                    eos_density = float(enhanced_result.get("meta", {}).get("eos_density", 0.0))
+                    
+                    # Compute authoritative flag with stronger logic
+                    authoritative_enhanced = bool(
+                        enhanced_result.get("authoritative")
+                        or (
+                            len(finals) > 0
+                            and (ft.get("ratio_strict", 0.0) >= 0.67)
+                        )
+                    )
+                    skip_quality_recheck = bool(skip_quality_recheck or authoritative_enhanced)
+                    if authoritative_enhanced:
+                        logger.info("ENHANCED: authoritative finals detected; quality re-checks will be bypassed")
+                    
+                    # Determine if we should skip quality recheck for authoritative enhanced results
+                    def _should_skip_quality(enhanced_result):
+                        if not enhanced_result:
+                            return False
+                        auth = bool(enhanced_result.get("authoritative"))
+                        finals = enhanced_result.get("finals") or []
+                        ft = enhanced_result.get("ft") or {}
 
-            # Use the enhanced viral clips pipeline with all Phase 1-3 improvements
-            logger.info(f"Using enhanced viral clips pipeline with {len(segments)} segments")
-            try:
-                viral_result = find_viral_clips_enhanced(
-                    segments,
-                    episode.audio_path,
-                    genre=final_genre,
-                    platform=backend_platform,
-                    fallback_mode=episode_fallback_mode,
-                    effective_eos_times=eos_times,
-                    effective_word_end_times=word_end_times,
-                    eos_source=eos_source,
-                    episode_words=episode_words,
-                )
-                if not viral_result or not viral_result.get("clips"):
-                    raise RuntimeError("ENHANCED_EMPTY")
-            except Exception:
-                logger.error("CANDIDATE_PIPELINE_FAIL: enhanced pipeline threw; invoking legacy fallback")
-                logger.exception("CANDIDATE_PIPELINE_FAIL_STACK")
+                        # Prefer explicit ft counters; fall back to inspecting finals
+                        finished = ft.get("finished")
+                        total = ft.get("total")
+                        if finished is None:
+                            finished = sum(1 for f in finals if f.get("finished_thought"))
+                        if total is None:
+                            total = len(finals)
+
+                        denom = total if (total and total > 0) else max(len(finals), 1)
+                        finished_ratio = (finished or 0) / denom
+
+                        # Be a bit conservative: require at least a few finals
+                        return auth and finished_ratio >= 0.60 and len(finals) >= 3
+
+                    skip_quality_recheck = _should_skip_quality(enhanced_result)
+                    
+                    # If enhanced is authoritative AND the finals are reasonably finished,
+                    # accept them directly and bypass strict re-filtering.
+                    if skip_quality_recheck:
+                        logger.info("ENHANCED: trusting authoritative results "
+                                    f"(finals={len(finals)} finished_ratio={finished_ratio:.2f})")
+                        # Normalize objects to clip_score's expected shape if needed
+                        pre_gate_candidates = finals  # <- use enhanced finals as pre-gate list
+                    else:
+                        pre_gate_candidates = finals or candidates
+                except Exception as e:
+                    enhanced_error = e
+                    logger.exception("ENHANCED: hard error → falling back to legacy.")
+            
+            # Helper function to conditionally apply quality filtering
+            def maybe_quality_filter(cands, where: str, skip_quality_recheck: bool = False):
+                cands = cands or []
+                if skip_quality_recheck:
+                    logger.info(f"ENHANCED: skipping quality filter at {where} (authoritative)")
+                    logger.info(f"QUALITY_FILTER: kept={len(cands)} of {len(cands)} (skipped)")
+                    return cands
+                return filter_low_quality(cands)
+            
+            # Decide to use legacy or enhanced
+            use_legacy = False
+            legacy_reason = None
+            
+            if enhanced_error is not None:
+                use_legacy = True
+                legacy_reason = "hard_error"
+            elif use_enhanced and (not enhanced_result or len(enhanced_result.get("candidates", [])) == 0):
+                use_legacy = True
+                legacy_reason = "no_candidates"
+            
+            if use_legacy or not use_enhanced:
+                logger.info("LEGACY: invoked due to %s", legacy_reason or ("enhanced_disabled" if not use_enhanced else "unknown"))
+                # ---------------- LEGACY CALL ----------------
                 # Legacy fallback on segments → simple pass-through as minimal candidates
                 legacy_candidates = []
                 for seg in segments or []:
@@ -3776,6 +4020,23 @@ class ClipScoreService:
                     except Exception:
                         continue
                 viral_result = {"clips": legacy_candidates, "meta": {"fallback": True}}
+            else:
+                viral_result = enhanced_result
+            
+            # Strong, unambiguous summary logs
+            meta = viral_result.get("meta", {})
+            seed_count = meta.get("seed_count", 0)
+            brute_count = meta.get("brute_count", 0)
+            logger.info("RANKING: %d seed clips, %d brute clips", seed_count, brute_count)
+            
+            # Preserve enhanced authority; don't conflate feature coverage with 'fallback'
+            ft_statuses = viral_result.get("ft_statuses", [])
+            fallback_flag = bool(viral_result.get("fallback", False))
+            logger.info(
+                "GATE_MODE: fallback=%s (coverage_note=%s)",
+                fallback_flag,
+                "limited_features" if any(s in ("missing", "imputed") for s in ft_statuses) else "full_features",
+            )
             
             # Debug: log ft_status from enhanced pipeline
             if viral_result and "clips" in viral_result:
@@ -3791,7 +4052,7 @@ class ClipScoreService:
             if env_force is not None:
                 episode_fallback_mode = (env_force == "1")
             
-            logger.info(f"GATE_MODE: fallback={episode_fallback_mode} (authoritative from enhanced pipeline)")
+            logger.info(f"GATE_MODE: fallback={episode_fallback_mode} (enhanced ft.fallback_mode={viral_result.get('ft', {}).get('fallback_mode', False)})")
             
             # Compute gate_mode for adaptive gate
             gate_mode = {
@@ -3806,7 +4067,12 @@ class ClipScoreService:
                 return [], {"reason": "viral_pipeline_error", "error": viral_result.get('error', 'Unknown error'), "episode_id": episode_id}
             
             clips = viral_result.get('clips', [])
-            logger.info(f"Found {len(clips)} viral clips using enhanced pipeline")
+            logger.info(f"Found {len(clips)} viral clips using {'enhanced' if not use_legacy else 'legacy'} pipeline")
+            
+            # Use pre-gate candidates from enhanced pipeline if available
+            if not use_legacy and 'pre_gate_candidates' in locals():
+                clips = pre_gate_candidates
+                logger.info(f"ENHANCED: using pre-gate candidates ({len(clips)} clips)")
             
             # Convert episode transcript to full text for display
             full_episode_transcript = ""
@@ -3920,8 +4186,32 @@ class ClipScoreService:
             reserve_pool = heapq.nlargest(RESERVE_TOP_K, filtered_candidates, key=lambda c: c.get("utility_pre_gate", c.get("final_score", 0.0)))
             logger.info(f"POOL: pre_gate={len(filtered_candidates)} reserve={len(reserve_pool)}")
             
-            # Apply quality filtering with safety net
-            quality_filtered = filter_low_quality(filtered_candidates, min_score=15)
+            # Apply quality filtering with global skip support
+            if skip_quality_recheck:
+                logger.info("QUALITY_GATE[strict]: bypassed (authoritative enhanced)")
+                quality_filtered = filtered_candidates
+            else:
+                # Adaptive quality floor when recheck runs
+                base_floor = 15  # Convert to score scale (0.15 * 100)
+                
+                # If EOS is sparse (e.g., long monologues), lower the bar a bit:
+                if 'eos_density' in locals() and eos_density > 0:
+                    # 0.06 is a healthy baseline density we've seen; scale down below that
+                    scale = min(1.0, max(0.35, eos_density / 0.06))
+                else:
+                    scale = 0.9  # cautious fallback
+                
+                adaptive_floor = max(3, base_floor * scale)  # Convert back to score scale
+                
+                # If our pool is thin, relax further until we can hit targets
+                if len(filtered_candidates) < max(8, 10):  # MIN_FINALS * 2
+                    adaptive_floor = max(2, adaptive_floor * 0.75)
+                
+                min_score = int(adaptive_floor)
+                logger.info(f"QUALITY_GATE[strict]: adaptive floor={min_score} "
+                            f"(eos_density={eos_density if 'eos_density' in locals() else 0.0:.3f}, pool={len(filtered_candidates)})")
+                
+                quality_filtered = filter_low_quality(filtered_candidates, min_score=min_score)
             logger.info(f"QUALITY_FILTER: kept={len(quality_filtered)} of {len(filtered_candidates)}")
             
             # CANDIDATES_BEFORE_SAFETY: Log before safety pass
@@ -3938,12 +4228,22 @@ class ClipScoreService:
             logger.info(f"SAFETY_PASS: updated {updated}/{len(quality_filtered)}")
             
             # --- Apply quality gate with auto-relaxation ---
-            quality_filtered = apply_quality_gate(quality_filtered, mode="strict" if not episode_fallback_mode else "fallback")
+            if skip_quality_recheck:
+                logger.info("ENHANCED: skipping quality gate (authoritative)")
+                # Keep quality_filtered as-is
+            else:
+                quality_filtered = apply_quality_gate(
+                    quality_filtered,
+                    mode="strict" if not episode_fallback_mode else "fallback",
+                    skip_quality_recheck=skip_quality_recheck
+                )
             
             # Apply adaptive gate if we have too few clips (use reserve pool)
-            if len(quality_filtered) < 3:
+            if len(quality_filtered) < 3 and not skip_quality_recheck:
                 quality_filtered = adaptive_gate(reserve_pool, min_count=3, gate_mode=gate_mode)
                 logger.info(f"POOL: STRICT={len(quality_filtered)} BALANCED(from=reserve)={len(quality_filtered)}")
+            elif skip_quality_recheck and len(quality_filtered) < 3:
+                logger.info("ENHANCED: skipping adaptive gate (authoritative, keeping original count)")
             
             # Finish polish: extend borderline clips to coherent stops
             quality_filtered = [_finish_polish(c, LOG=logger) for c in quality_filtered]
@@ -4002,7 +4302,7 @@ class ClipScoreService:
             logger.info("LENGTH_POLICY: max=90.0, quotas=off, gaussian_weight=0.00, notch_weight=0.00")
             
             # Pure top-K selection by virality (no forced buckets)
-            finals = pure_topk_pick(quality_filtered, reserve_pool, want=10, LOG=logger)
+            finals = pure_topk_pick(quality_filtered, reserve_pool, want=10, LOG=logger, skip_quality=skip_quality_recheck, skip_quality_recheck=skip_quality_recheck)
             
             # Enforce final soft floor after all gates
             finals = enforce_soft_floor(finals, min_count=3)
@@ -4096,8 +4396,31 @@ class ClipScoreService:
                 final_info.append(f"{display_dur}s {prot}".strip())
             logger.info(f"FINAL_PICK_BEFORE_LIMITS: n={len(finals)} :: [{', '.join(final_info)}]")
             
+            # Determine finished requirement based on authoritative enhanced status
+            finished_required = FINISHED_THOUGHT_REQUIRED and not authoritative_enhanced
+            
+            # Apply min-max normalization over finals for proper score spread
+            if len(finals) > 1:
+                scores = [c.get('virality_score', c.get('composite_score', c.get('final_score', 0))) for c in finals]
+                vmin, vmax = min(scores), max(scores)
+                
+                if vmax - vmin < 1e-6:
+                    # Guard against score collapse - set neutral scores
+                    for c in finals:
+                        c['virality_pct'] = 50.0
+                        c['display_score'] = 50.0
+                    logger.info("VIRALITY_MINMAX: score collapse detected, set neutral virality_pct=50.0")
+                else:
+                    # Apply min-max normalization
+                    for c in finals:
+                        score = c.get('virality_score', c.get('composite_score', c.get('final_score', 0)))
+                        virality_pct = 100.0 * (score - vmin) / (vmax - vmin)
+                        c['virality_pct'] = round(virality_pct, 1)
+                        c['display_score'] = round(virality_pct, 1)
+                    logger.info(f"VIRALITY_MINMAX: vmin={vmin:.3f} vmax={vmax:.3f} → virality_pct={[c.get('virality_pct', 0) for c in finals[:3]]}")
+            
             # Tighten selection after gating
-            finals = tighten_selection(finals)
+            finals = tighten_selection(finals, finished_required=finished_required)
             
             # Apply duration diversity (soft target mix)
             finals = apply_duration_diversity(finals)
@@ -4117,7 +4440,6 @@ class ClipScoreService:
             
             # Check if we require finished but ended with none
             finals_finished = [c for c in finals if c.get("finished_thought", False)]
-            finished_required = FINISHED_THOUGHT_REQUIRED
             
             # If we require finished but ended with none, try finished-like first
             if finished_required and not finals_finished:
@@ -4144,6 +4466,7 @@ class ClipScoreService:
             logger.debug(f"PRE_SAVE_DEBUG: pre_limit_backup={len(pre_limit_finals)}, soft_relax_enabled={_SOFT_RELAX}")
             
             # Remove hard assert on zero; degrade gracefully
+            candidates_after = len(finals)  # Update to current finals length after rescue logic
             if candidates_after == 0:
                 logger.error("NO_CANDIDATES: returning empty set after gating")
                 
@@ -4176,19 +4499,19 @@ class ClipScoreService:
                 
                 for seed in top_seeds:
                     if not seed.get("finished_thought", False):
-                        extended = extend_to_coherent_end(
-                            seed, eos_times, word_end_times, 
-                            max_extend=8.0, platform=backend_platform
+                        updated_seg, extended = extend_to_coherent_end(
+                            seed, eos_times, 
+                            max_extra=8.0
                         )
-                        if extended and extended.get("end", 0) > seed.get("end", 0):
-                            extended["finished_thought"] = True
-                            extended["finish_reason"] = "early_salvage_eos"
+                        if extended and updated_seg.get("end", 0) > seed.get("end", 0):
+                            updated_seg["finished_thought"] = True
+                            updated_seg["finish_reason"] = "early_salvage_eos"
                             # Re-score with V_core
                             from services.secret_sauce_pkg.features import compute_v_core
-                            start_s = extended.get("start", 0)
-                            end_s = extended.get("end", 0)
-                            extended["v_core_score"] = compute_v_core(extended, start_s, end_s)
-                            early_salvaged.append(extended)
+                            start_s = updated_seg.get("start", 0)
+                            end_s = updated_seg.get("end", 0)
+                            updated_seg["v_core_score"] = compute_v_core(updated_seg, start_s, end_s)
+                            early_salvaged.append(updated_seg)
                             logger.debug(f"EARLY_SALVAGE: extended {seed.get('id', 'unknown')} by {end_s - seed.get('end', 0):.1f}s")
                 
                 # Add early salvaged to finals
@@ -4206,11 +4529,11 @@ class ClipScoreService:
                 
                 for seed in top_seeds:
                     if not seed.get("finished_thought", False):
-                        extended = extend_to_coherent_end(
-                            seed, eos_times, word_end_times, 
-                            max_extend=8.0, platform=backend_platform
+                        updated_seg, extended = extend_to_coherent_end(
+                            seed, eos_times, 
+                            max_extra=8.0
                         )
-                        if extended and extended.get("end", 0) > seed.get("end", 0):
+                        if extended and updated_seg.get("end", 0) > seed.get("end", 0):
                             extended["finished_thought"] = True
                             extended["finish_reason"] = "salvage_eos"
                             # Re-score with V_core
@@ -4332,8 +4655,9 @@ class ClipScoreService:
                     # Store original end time for A/B metrics
                     old_end = clip.get("end", 0.0)
                     
-                    # Step 1: Hill-climb refinement (increased max_nudge for better context)
-                    s1, e1 = refine_bounds_with_hill_climb(clip, episode, max_nudge=8.0, step=0.05)
+                    # Step 1: Hill-climb refinement (reduced for enhanced pipeline since it already refines boundaries)
+                    max_nudge = 2.0 if use_enhanced else 8.0
+                    s1, e1 = refine_bounds_with_hill_climb(clip, episode, max_nudge=max_nudge, step=0.05)
                     
                     # Step 1.5: Apply soft start pad and gentle filler trim (Phase 3)
                     if episode_words:
@@ -4370,7 +4694,8 @@ class ClipScoreService:
                     # keep original clip untouched
             
             # Step 3: Smart extension to natural sentence endings (if words available)
-            if episode_words:
+            # Skip aggressive extension for enhanced pipeline results since they already handle natural boundaries
+            if episode_words and not use_enhanced:
                 from services.util import extend_to_natural_end
                 extended_count = 0
                 for clip in ranked_clips:
@@ -4389,6 +4714,8 @@ class ClipScoreService:
                 
                 if extended_count > 0:
                     logger.info("BOUNDARY_REFINEMENT: extended %d/%d clips to natural endings", extended_count, len(ranked_clips))
+            elif use_enhanced:
+                logger.info("BOUNDARY_REFINEMENT: skipping aggressive extension for enhanced pipeline results")
             
             logger.info("BOUNDARY_REFINEMENT: refined=%d/%d", len(refined), len(ranked_clips))
             
@@ -4634,7 +4961,7 @@ class ClipScoreService:
             
             # Telemetry already calculated above
             logger.info("TELEMETRY: word_count=%d, eos_count=%d, eos_density=%.3f", wc, ec, dens)
-            logger.info(f"TELEMETRY: fallback_mode={episode_fallback_mode} (authoritative)")
+            logger.info(f"TELEMETRY: fallback_mode={episode_fallback_mode} (authoritative={authoritative_enhanced})")
             
             # Candidate-level FT summary (post-refinement, post-extension)
             cand_total = len(final_clips)

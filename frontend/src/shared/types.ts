@@ -56,6 +56,15 @@ export interface Clip {
   previewUrl?: string;
   captionsVttUrl?: string;
   error?: string;
+  
+  // NEW: Phase 2 & 3 context signals
+  seed_idx?: number | null;
+  seed_sentence?: string | null;
+  payoff_sentence?: string | null;
+  
+  // Preview fields
+  preview_name?: string;
+  preview_url?: string;
   features?: {
     // Core scoring features
     hook_score?: number;

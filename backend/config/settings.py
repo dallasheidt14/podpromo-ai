@@ -5,6 +5,12 @@ Application settings and configuration
 import os
 from pathlib import Path
 
+def _env_bool(name, default):
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.strip().lower() not in ("0", "false", "no", "off")
+
 # Base directory
 BASE_DIR = Path(__file__).parent.parent
 
@@ -230,6 +236,19 @@ ASR_PROGRESS_LABEL_HQ = os.getenv("ASR_PROGRESS_LABEL_HQ", "transcribing_hq")
 
 # Feature weight adjustments for low ASR quality
 ENABLE_ASR_QUALITY_WEIGHTING = _bool("ENABLE_ASR_QUALITY_WEIGHTING", True)
+
+# -------- Enhanced Pipeline Configuration --------
+# Enhanced pipeline defaults (ON by default)
+PP_ENHANCED = _env_bool("PP_ENHANCED", True)
+PP_CONTEXT_SEEDS = _env_bool("PP_CONTEXT_SEEDS", True)
+
+# Very permissive guardrails so enhanced almost always runs
+PP_MIN_WORDS_FOR_ENHANCED = int(os.getenv("PP_MIN_WORDS_FOR_ENHANCED", "120"))
+PP_MIN_EOS_FOR_ENHANCED = int(os.getenv("PP_MIN_EOS_FOR_ENHANCED", "3"))
+
+# Dynamic length discovery (Option 1: True Dynamic Length Discovery)
+USE_DYNAMIC_LENGTH_DISCOVERY = _env_bool("USE_DYNAMIC_LENGTH_DISCOVERY", True)
+DYNAMIC_LENGTH_ROLLOUT_PCT = int(os.getenv("DYNAMIC_LENGTH_ROLLOUT_PCT", "100"))
 
 # -------- Context-Aware Clip Generation --------
 # Feature flags for context-first clip generation

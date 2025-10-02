@@ -145,9 +145,11 @@ def _normalize_01(arr: np.ndarray) -> float:
     if arr.size == 0:
         return 0.0
     lo, hi = np.percentile(arr, 10), np.percentile(arr, 90)
-    if hi - lo < 1e-9:
-        return 0.0
-    return float(np.clip((np.mean(arr) - lo) / (hi - lo), 0.0, 1.0))
+    rng = hi - lo
+    if rng <= 1e-9:
+        return 0.5  # Return neutral value instead of 0.0
+    x = (np.mean(arr) - lo) / rng
+    return 0.0 if x != x or x == float("inf") or x == float("-inf") else float(np.clip(x, 0.0, 1.0))
 
 
 def _var_01(arr: np.ndarray) -> float:

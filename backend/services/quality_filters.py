@@ -532,6 +532,34 @@ def _filter_low_quality_impl(candidates, gate_mode):
                     reasons.remove("rate_based_quality_fail")
                     notes.append("rate_exception_applied")
         
+        # Relax gates for longer clips (20s+) with strong payoff/arousal
+        duration = candidate.get('end', 0) - candidate.get('start', 0)
+        if duration >= 20.0:  # Lowered threshold for soft ending
+            payoff_score = candidate.get('payoff_score', 0.0)
+            arousal_score = candidate.get('arousal_score', 0.0)
+            
+            # If long clip has strong payoff/arousal, relax strict gates
+            if payoff_score >= 0.4 or arousal_score >= 0.4:
+                if "too_short" in reasons:
+                    reasons.remove("too_short")
+                    notes.append("long_clip_relaxation")
+                if "too_stopwordy" in reasons and stopword_ratio <= 0.75:
+                    reasons.remove("too_stopwordy")
+                    notes.append("long_clip_relaxation")
+                if "rate_based_quality_fail" in reasons:
+                    reasons.remove("rate_based_quality_fail")
+                    notes.append("long_clip_relaxation")
+                
+                # Soft ending criterion: allow conjunction endings for high-value long clips
+                if duration >= 20.0 and payoff_score >= 0.5:
+                    # Allow clips that end on conjunctions if payoff is very high
+                    if not candidate.get('finished_thought', False) and payoff_score >= 0.6:
+                        notes.append("soft_ending_high_payoff")
+                        # Don't penalize for not being "finished" if payoff is exceptional
+                        # Override finished_thought for high-value long clips
+                        candidate['finished_thought'] = True
+                        candidate['soft_ending'] = True
+        
         if not reasons:
             # Apply penalties to final score
             if penalties > 0:

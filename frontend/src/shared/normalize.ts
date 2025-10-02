@@ -125,6 +125,15 @@ export function normalizeClip(raw: any): Clip {
         `http://localhost:8000${raw.preview_url || raw.previewUrl}` : 
       null,
     error: raw.error || null,
+    
+    // NEW: Phase 2 & 3 context signals
+    seed_idx: raw.seed_idx !== undefined ? raw.seed_idx : null,
+    seed_sentence: raw.seed_sentence || null,
+    payoff_sentence: raw.payoff_sentence || null,
+    
+    // Preview fields
+    preview_name: raw.preview_name || null,
+    preview_url: raw.preview_url || raw.previewUrl || null,
   };
 }
 

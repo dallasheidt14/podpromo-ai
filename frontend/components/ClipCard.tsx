@@ -3,6 +3,7 @@ import { ScorePill } from '../ui/ScorePill';
 import { MiniBar } from '../ui/MiniBar';
 import { getPlatformFitPct } from '../ui/score';
 import { buildScoreBundle } from '../app/lib/score';
+import { ContextBadges } from './ContextBadges';
 import type { Clip } from '../types/Clip';
 import { useEffect } from 'react';
 
@@ -42,6 +43,11 @@ export const ClipCard: React.FC<{ clip: Clip; onClick?: () => void }> = ({ clip,
         </div>
       </div>
 
+      {/* context badges */}
+      <div className="mb-2">
+        <ContextBadges clip={clip} />
+      </div>
+
       {/* bars */}
       <div className="space-y-2">
         <MiniBar label="Virality" pct={ui.viralityPct} />
@@ -68,6 +74,23 @@ export const ClipCard: React.FC<{ clip: Clip; onClick?: () => void }> = ({ clip,
       <div className="mt-3 flex items-center justify-end gap-2">
         {/* your existing buttons */}
       </div>
+
+      {/* debug section for development */}
+      {process.env.NODE_ENV !== 'production' && (
+        <details className="mt-2">
+          <summary className="cursor-pointer text-sm text-slate-500">Debug</summary>
+          <pre className="text-xs text-slate-600 mt-1 whitespace-pre-wrap">
+            {JSON.stringify({
+              seed_idx: clip.seed_idx,
+              payoff_type: clip.features?.payoff_type,
+              payoff_score: clip.features?.payoff_score,
+              start: clip.startTime,
+              end: clip.endTime,
+              duration: clip.duration
+            }, null, 2)}
+          </pre>
+        </details>
+      )}
     </div>
   );
 };

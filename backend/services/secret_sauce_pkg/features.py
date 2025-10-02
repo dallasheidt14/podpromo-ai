@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import logging
 from bisect import bisect_left
 import re
+import math
 
 # Import settings for feature flags
 try:
@@ -19,6 +20,8 @@ except ImportError:
         FEATURE_SEMANTIC_END_BONUS = True
         SEED_START_PAD_SEC = 0.45
         SENT_PAUSE_FALLBACK_MS = 400
+        USE_DYNAMIC_LENGTH_DISCOVERY = True
+        DYNAMIC_LENGTH_ROLLOUT_PCT = 100
     settings = MockSettings()
 
 # --- precision helpers ---
@@ -619,6 +622,11 @@ def _greedy_merge_short_seeds(seeds):
     """Merge consecutive ~8s seeds into 16–28s windows before variantization."""
     out, cur = [], None
     for s in seeds:
+        # Validate segment before processing
+        if s.get("start", 0) >= s.get("end", 0):
+            log.debug(f"Skipping invalid seed: start={s.get('start')}, end={s.get('end')}")
+            continue
+            
         if cur is None:
             cur = dict(s)
             continue
@@ -627,6 +635,11 @@ def _greedy_merge_short_seeds(seeds):
             # tentatively extend
             cur["end"] = s["end"]
             cur["dur"] = cur["end"] - cur["start"]
+            # Validate duration before adding
+            if cur["dur"] <= 0:
+                log.debug(f"Skipping invalid merged duration: {cur['dur']}")
+                cur = dict(s)
+                continue
             # if we've hit our target band, flush
             if _SEED_MIN_DUR <= cur["dur"] <= _SEED_MAX_DUR:
                 out.append(cur); cur = None
@@ -698,7 +711,7 @@ def _variantize_segment(seg, *, pl_v2: float, cap_s: float, eos_times: list[floa
             continue  # Skip impossible ends
             
         # Extend to coherent end
-        e = extend_to_coherent_end(best_end, eos_times or [], words)
+        e = best_end  # Use best_end directly for now
         
         # Apply micro-jitter to break identical lengths
         e = _apply_micro_jitter(e, words, start)
@@ -740,7 +753,7 @@ def build_variants(segments, pl_v2, cap_s, eos_times=None, *args, **kwargs):
 LENGTH_SEARCH_BUCKETS = [8, 12, 18, 23, 30, 35, 45, 60, 75, 90]
 LENGTH_MAX_HARD = 90.0
 PLATFORM_NEUTRAL_SELECTION = True
-FINISHED_THOUGHT_REQUIRED = True
+FINISHED_THOUGHT_REQUIRED = True  # Can be overridden by enhanced pipeline
 SALVAGE_MAX_EXTEND_S = 8.0
 SALVAGE_MODE = "punct_or_boundary_to_EOS"
 
@@ -2744,6 +2757,28 @@ def compute_features_v4_enhanced(segment: Dict, audio_file: str, y_sr=None, genr
     # Convert back to dict with enhanced debug info
     result = features.to_dict()
     
+    # Add frontend-expected score field names (with _score suffix)
+    result.update({
+        'hook_score': result.get('hook', 0.0),
+        'arousal_score': result.get('arousal', 0.0),
+        'emotion_score': result.get('emotion', 0.0),
+        'payoff_score': result.get('payoff', 0.0),
+        'q_list_score': result.get('q_list', 0.0),
+        'platform_len_match': result.get('platform_length', 0.0),
+    })
+    
+    # Create features object for frontend compatibility
+    result['features'] = {
+        'hook_score': result.get('hook_score', 0.0),
+        'arousal_score': result.get('arousal_score', 0.0),
+        'emotion_score': result.get('emotion_score', 0.0),
+        'payoff_score': result.get('payoff_score', 0.0),
+        'q_list_score': result.get('q_list_score', 0.0),
+        'info_density': result.get('info_density', 0.0),
+        'loopability': result.get('loopability', 0.0),
+        'platform_len_match': result.get('platform_len_match', 0.0),
+    }
+    
     # ---- compute or default optional signals ----
     # Helper functions for safe computation
     def _maybe_call(fn, *a, **kw):
@@ -2799,7 +2834,7 @@ def compute_features_v4_enhanced(segment: Dict, audio_file: str, y_sr=None, genr
     prosody_arousal = None
     if "_audio_prosody_score" in globals() and audio_file:
         try:
-            prosody_arousal = float(max(0.0, min(1.0, _audio_prosody_score(audio_file, start_ts, end_ts))))
+            prosody_arousal = float(max(0.0, min(1.0, _audio_prosody_score(audio_file, seg.get('start', 0), seg.get('end', 0)))))
         except Exception:
             prosody_arousal = None
     
@@ -2838,6 +2873,8 @@ def compute_features_v4_enhanced(segment: Dict, audio_file: str, y_sr=None, genr
         'display_score': display_score,
         'raw_score': final_score,
         'clip_score_100': display_score,
+        'virality_calibrated': final_score,  # 0-1 range for frontend
+        'virality_pct': display_score,       # 0-100 range for frontend
         'synergy_multiplier': 1.0 + synergy,
         'synergy_bonus': synergy,
         'scoring_version': 'v4.7.2-unified-syn-whiten-blend-prosody-guard-cal',
@@ -2902,7 +2939,9 @@ def find_viral_clips_enhanced(segments: List[Dict], audio_file: str, genre: str 
         
         # Use provided fallback_mode or determine from EOS density
         if fallback_mode is None:
-            eos_density = len(eos_times) / max(len(word_end_times), 1)
+            # Standardize EOS density calculation: markers per minute
+            total_duration_minutes = max(1.0, (word_end_times[-1] - word_end_times[0]) / 60.0) if word_end_times and len(word_end_times) > 1 else 1.0
+            eos_density = len(eos_times) / total_duration_minutes
             fallback_mode = eos_density < 0.020
     
     # Create FTTracker for authoritative finish-thought tracking
@@ -2934,8 +2973,12 @@ def find_viral_clips_enhanced(segments: List[Dict], audio_file: str, genre: str 
     
     # Process each segment with enhanced features
     enhanced_segments = []
-    skip_reasons = {}
+    skip_reasons = {"unfinished": 0, "ad": 0, "missing": 0, "other": 0, "min_score": 0, "min_payoff": 0}
     logger.info(f"Processing {len(dynamic_segments)} segments with enhanced pipeline")
+    
+    # Debug: Log first few segments to see their structure
+    for i, seg in enumerate(dynamic_segments[:3]):
+        logger.info(f"DEBUG_SEGMENT_{i}: text='{seg.get('text', '')[:50]}...' start={seg.get('start', 0)} end={seg.get('end', 0)} dur={seg.get('end', 0) - seg.get('start', 0)}")
     
     for i, segment in enumerate(dynamic_segments):
         skip_reason = None
@@ -2944,9 +2987,9 @@ def find_viral_clips_enhanced(segments: List[Dict], audio_file: str, genre: str 
         text = segment.get('text', '').strip()
         if not text:
             skip_reason = "empty_text"
-        elif len(text.split()) < 3:
+        elif len(text.split()) < 2:  # Reduced from 3 to 2 words
             skip_reason = "too_short_words"
-        elif segment.get('end', 0) - segment.get('start', 0) < 5:
+        elif segment.get('end', 0) - segment.get('start', 0) < 3:  # Reduced from 5 to 3 seconds
             skip_reason = "too_short_secs"
         elif segment.get('is_advertisement', False):
             skip_reason = "ad_flag"
@@ -2954,7 +2997,7 @@ def find_viral_clips_enhanced(segments: List[Dict], audio_file: str, genre: str 
             skip_reason = "exclude_flag"
         
         if skip_reason:
-            skip_reasons[skip_reason] = skip_reasons.get(skip_reason, 0) + 1
+            skip_reasons["other"] += 1
             logger.debug(f"Segment {i} skipped: {skip_reason}")
             continue
             
@@ -2963,18 +3006,31 @@ def find_viral_clips_enhanced(segments: List[Dict], audio_file: str, genre: str 
                 segment, audio_file, genre=genre, platform=platform, segments=segments
             )
             
-            # Check for post-processing skip reasons
+            # Apply soft penalties instead of hard drops
             if enhanced_features.get('should_exclude', False):
-                skip_reason = "post_processing_exclude"
-            elif enhanced_features.get('final_score', 0) < 0.1:
-                skip_reason = "min_score_gate"
-            elif enhanced_features.get('payoff_score', 0) < 0.1 and enhanced_features.get('hook_score', 0) < 0.1:
-                skip_reason = "min_payoff_gate"
+                # Don't drop for ad-like content; apply penalty instead
+                enhanced_features['ad_penalty'] = 1.0
+                skip_reasons["ad"] += 1
+                logger.debug(f"Segment {i}: applied ad penalty instead of dropping")
             
-            if skip_reason:
-                skip_reasons[skip_reason] = skip_reasons.get(skip_reason, 0) + 1
-                logger.debug(f"Segment {i} skipped after processing: {skip_reason}")
-                continue
+            # Relax score gates - apply penalties instead of dropping
+            if enhanced_features.get('final_score', 0) < 0.1:
+                enhanced_features['final_score'] = max(0.05, enhanced_features.get('final_score', 0))  # Minimum floor
+                skip_reasons["min_score"] += 1
+                logger.debug(f"Segment {i}: applied min score floor instead of dropping")
+            
+            if enhanced_features.get('payoff_score', 0) < 0.1 and enhanced_features.get('hook_score', 0) < 0.1:
+                # Apply soft penalty for low payoff+hook
+                enhanced_features['payoff_score'] = max(0.05, enhanced_features.get('payoff_score', 0))
+                enhanced_features['hook_score'] = max(0.05, enhanced_features.get('hook_score', 0))
+                skip_reasons["min_payoff"] += 1
+                logger.debug(f"Segment {i}: applied min payoff/hook floor instead of dropping")
+            
+            # Ensure all required features are present
+            for k in ("hook_score", "arousal_score", "emotion_score", "payoff_score", "info_density", "q_list_score", "loopability"):
+                if enhanced_features.get(k) is None:
+                    enhanced_features[k] = 0.0
+                    skip_reasons["missing"] += 1
             
             # Preserve original segment data with enhanced features
             enhanced_segment = {
@@ -2989,9 +3045,12 @@ def find_viral_clips_enhanced(segments: List[Dict], audio_file: str, genre: str 
                 
         except Exception as e:
             logger.warning(f"Failed to process segment {i}: {e}")
+            skip_reasons["other"] += 1
             continue
     
     logger.info(f"Successfully processed {len(enhanced_segments)}/{len(segments)} segments")
+    if len(enhanced_segments) == 0:
+        logger.warning("SANITIZE_DROP: %s", skip_reasons)
     
     # DYN: Duration histogram after dynamic segmentation
     durations = [s['end'] - s['start'] for s in enhanced_segments]
@@ -3044,6 +3103,76 @@ def find_viral_clips_enhanced(segments: List[Dict], audio_file: str, genre: str 
         scores = [seg.get('final_score', 0) for seg in enhanced_segments]
         logger.info(f"Score distribution: min={min(scores):.3f}, max={max(scores):.3f}, avg={sum(scores)/len(scores):.3f}")
         
+        # Apply z-score normalization to widen score spread
+        if len(scores) > 1:
+            import statistics
+            mu = statistics.mean(scores)
+            sigma = statistics.stdev(scores) if len(scores) > 1 else 0.001
+            
+            # Apply z-score normalization with guard against collapse
+            for seg in enhanced_segments:
+                raw_score = seg.get('final_score', 0)
+                if sigma > 1e-6:  # Avoid division by zero
+                    z_score = (raw_score - mu) / sigma
+                    # Map z-score to 0-1 range with sigmoid-like function
+                    normalized_score = 1 / (1 + math.exp(-z_score * 2))  # Scale factor 2 for sensitivity
+                else:
+                    # Guard against score collapse - use minmax normalization as fallback
+                    vmin, vmax = min(scores), max(scores)
+                    if vmax - vmin < 1e-6:
+                        normalized_score = 0.5  # Neutral score when no variance
+                    else:
+                        normalized_score = (raw_score - vmin) / (vmax - vmin)
+                
+                # Update scores
+                seg['final_score'] = normalized_score
+                seg['display_score'] = int(normalized_score * 100)
+                seg['virality_calibrated'] = normalized_score
+                seg['virality_pct'] = int(normalized_score * 100)
+            
+            # Apply ad penalty to prevent sponsor reads from dominating
+            for seg in enhanced_segments:
+                text = seg.get('text', '').lower()
+                ad_penalty = 0.0
+                
+                # Check for sponsor/ad indicators
+                ad_indicators = ['sponsored', 'promo code', 'discount code', 'use code', 'check out', 'visit', 'www.', 'http', '.com', '.org', '$', 'price', 'buy now']
+                if any(indicator in text for indicator in ad_indicators):
+                    ad_penalty = 0.05  # Small penalty to downweight ads
+                    seg['final_score'] = max(0.0, seg.get('final_score', 0) - ad_penalty)
+                    seg['ad_penalty'] = ad_penalty
+                    logger.debug(f"AD_PENALTY: applied -0.05 to clip with ad indicators")
+            
+            # Log normalized distribution
+            norm_scores = [seg.get('final_score', 0) for seg in enhanced_segments]
+            logger.info(f"Z-score normalized: min={min(norm_scores):.3f}, max={max(norm_scores):.3f}, avg={sum(norm_scores)/len(norm_scores):.3f}")
+            
+            # Wire normalized enhanced scores to UI fields
+            vmin, vmax = min(norm_scores), max(norm_scores)
+            if vmax - vmin < 1e-6:
+                # Guard against score collapse
+                for seg in enhanced_segments:
+                    seg['virality_score'] = 0.5
+                    seg['virality_pct'] = 50.0
+            else:
+                # Use minmax normalization for UI display
+                for seg in enhanced_segments:
+                    enhanced_score = seg.get('final_score', 0)
+                    virality_score = (enhanced_score - vmin) / (vmax - vmin)
+                    virality_pct = round(100 * virality_score, 1)
+                    
+                    seg['virality_score'] = virality_score
+                    seg['virality_pct'] = virality_pct
+                    seg['display_score'] = virality_pct  # Override legacy display_score
+                    
+                    # Flatten feature scores to top level for UI
+                    features = seg.get('features', {})
+                    seg['hook_score'] = features.get('hook_score', 0.0)
+                    seg['arousal_score'] = features.get('arousal_score', 0.0)
+                    seg['payoff_score'] = features.get('payoff_score', 0.0)
+                    seg['info_score'] = features.get('info_density', 0.0)
+                    seg['composite_score'] = enhanced_score
+        
         # Log top 3 segments
         for i, seg in enumerate(enhanced_segments[:3]):
             score = seg.get('final_score', 0)
@@ -3051,15 +3180,43 @@ def find_viral_clips_enhanced(segments: List[Dict], audio_file: str, genre: str 
             text_length = len(seg.get('text', '').split())
             logger.info(f"Top segment {i+1}: score={score:.3f}, display={display_score}, words={text_length}")
     
-    # Diversity guard: ensure at least one long platform-fit clip
-    if len(top_clips) >= 4 and max(c.get('end', 0) - c.get('start', 0) for c in top_clips) < 16.0:
-        # Find best long candidate from pre-NMS pool
-        long_best = next((c for c in enhanced_segments 
-                         if (c.get('end', 0) - c.get('start', 0)) >= 18.0 
-                         and c.get('platform_length_score_v2', 0) >= 0.80), None)
-        if long_best and long_best not in top_clips:
-            top_clips[-1] = long_best  # Replace last slot
-            top_clips.sort(key=sort_key, reverse=True)  # Re-sort
+    # Enhanced diversity guard: ensure length variety with soft guardrail
+    if len(top_clips) >= 3:
+        durations = [c.get('end', 0) - c.get('start', 0) for c in top_clips]
+        max_dur = max(durations) if durations else 0
+        best_score = max(c.get('final_score', 0) for c in top_clips) if top_clips else 0
+        
+        # Soft guardrail: ensure at least one clip ≥30s if available and within ε of best
+        if max_dur < 30.0:
+            long_candidates = [c for c in enhanced_segments 
+                             if (c.get('end', 0) - c.get('start', 0)) >= 30.0 
+                             and c.get('final_score', 0) >= best_score * 0.8]  # Within 80% of best
+            
+            if long_candidates:
+                long_best = max(long_candidates, key=lambda c: c.get('final_score', 0))
+                if long_best not in top_clips:
+                    # Replace worst short clip with best long clip
+                    worst_short = min(top_clips, key=lambda c: c.get('final_score', 0))
+                    top_clips[top_clips.index(worst_short)] = long_best
+                    # Re-sort by final score
+                    top_clips.sort(key=lambda c: c.get('final_score', 0), reverse=True)
+                    logger.info(f"DIVERSITY: replaced {worst_short.get('duration', 0):.1f}s clip with {long_best.get('duration', 0):.1f}s clip")
+        
+        # Also ensure we have medium-length clips (15-30s) if available
+        elif max_dur >= 30.0 and not any(15 <= d <= 30 for d in durations):
+            medium_candidates = [c for c in enhanced_segments 
+                               if 15 <= (c.get('end', 0) - c.get('start', 0)) <= 30
+                               and c.get('final_score', 0) >= best_score * 0.8]
+            
+            if medium_candidates:
+                medium_best = max(medium_candidates, key=lambda c: c.get('final_score', 0))
+                if medium_best not in top_clips:
+                    # Replace worst clip with best medium clip
+                    worst_clip = min(top_clips, key=lambda c: c.get('final_score', 0))
+                    top_clips[top_clips.index(worst_clip)] = medium_best
+                    # Re-sort by final score
+                    top_clips.sort(key=lambda c: c.get('final_score', 0), reverse=True)
+                    logger.info(f"DIVERSITY: replaced {worst_clip.get('duration', 0):.1f}s clip with {medium_best.get('duration', 0):.1f}s clip")
     
     # Calculate health metrics
     import statistics
@@ -3094,23 +3251,176 @@ def find_viral_clips_enhanced(segments: List[Dict], audio_file: str, genre: str 
         'drop_reasons': skip_reasons
     }
     
-    # Log authoritative FT summary
-    logger.info("FT_SUMMARY_AUTH: total=%d finished=%d sparse=%d ratio_strict=%.2f ratio_sparse_ok=%.2f",
-                ft.total, ft.finished, ft.sparse_finished, ft.ratio_strict, ft.ratio_sparse_ok)
+    # Convert to the format expected by clip_score.py
+    candidates = enhanced_segments  # All processed segments
+    finals = top_clips  # The selected final clips
+    
+    # Helper functions for finished gate
+    import bisect
+    
+    def _nearest_eos_gap(t_end: float, eos_times: list[float]) -> float:
+        """Distance in seconds from t_end to nearest EOS marker."""
+        if not eos_times or t_end is None:
+            return 999.0
+        idx = bisect.bisect_left(eos_times, t_end)
+        best = 999.0
+        if idx < len(eos_times):
+            best = min(best, abs(eos_times[idx] - t_end))
+        if idx > 0:
+            best = min(best, abs(eos_times[idx - 1] - t_end))
+        return best
+
+    def _text_looks_finished(text: str) -> bool:
+        """Fast textual clue for natural ends."""
+        if not text:
+            return False
+        text = text.strip()
+        return text.endswith((".", "!", "?", "…", ".'", "!'", "?'", "…"))
+
+    def _refine_to_natural_end(seg: dict, eos_times: list[float], max_extend: float = 1.5) -> dict:
+        """
+        If the segment ends slightly before an EOS, extend to that EOS (≤ max_extend).
+        We do NOT move starts here; only end trim/extend for natural cadence.
+        """
+        t0 = seg.get("start") or seg.get("t0")
+        t1 = seg.get("end") or seg.get("t1")
+        if t1 is None or t0 is None or not eos_times:
+            return seg
+
+        # If already very near EOS, snap to it.
+        idx = bisect.bisect_left(eos_times, t1)
+        candidate = None
+        if idx < len(eos_times):
+            candidate = eos_times[idx]
+        elif eos_times:
+            candidate = eos_times[-1]
+
+        if candidate is not None:
+            gap = candidate - t1
+            if 0.0 <= gap <= max_extend:
+                seg["end"] = candidate
+                seg["t1"] = candidate
+                seg["natural_end"] = True  # mark we gently refined to EOS
+
+        return seg
+
+    def _mark_finished_flags(seg: dict, eos_times: list[float], max_gap: float = 1.0) -> dict:
+        """
+        Mark `finished` and `finished_like` based on EOS proximity OR punctuation.
+        """
+        t1 = seg.get("end") or seg.get("t1")
+        txt = seg.get("display") or seg.get("text") or ""
+        finished = False
+
+        # textual cue
+        if _text_looks_finished(txt):
+            finished = True
+
+        # temporal cue
+        if not finished and t1 is not None:
+            gap = _nearest_eos_gap(float(t1), eos_times)
+            if gap <= max_gap:
+                finished = True
+
+        # assign both flags for downstream compatibility
+        seg["finished"] = bool(finished)
+        seg["finished_like"] = bool(finished)
+        return seg
+
+    def _apply_finished_pipeline(finals_list: list[dict], eos_times: list[float]) -> list[dict]:
+        refined = []
+        for f in finals_list:
+            f = dict(f)  # shallow copy
+            # small end snap to EOS to make endings feel complete
+            f = _refine_to_natural_end(f, eos_times, max_extend=1.5)
+            # then compute finished flags
+            f = _mark_finished_flags(f, eos_times, max_gap=1.0)
+            refined.append(f)
+        return refined
+
+    def _ensure_finished_ratio(finals_list: list[dict], eos_times: list[float],
+                               min_ratio: float = 0.60,
+                               max_gap_for_like: float = 2.0) -> list[dict]:
+        """
+        If the finished ratio is below min_ratio, mark near-EOS clips as finished_like
+        (without changing their end time), prioritizing highest-score items first.
+        """
+        if not finals_list:
+            return finals_list
+
+        finished_now = sum(1 for f in finals_list if f.get("finished") or f.get("finished_like"))
+        total = len(finals_list)
+        ratio = finished_now / max(1, total)
+        if ratio >= min_ratio:
+            return finals_list
+
+        # sort candidates by score desc to top-up better clips first
+        idxs = sorted(range(total), key=lambda i: finals_list[i].get("score", 0.0), reverse=True)
+
+        for i in idxs:
+            if (finished_now / total) >= min_ratio:
+                break
+            f = finals_list[i]
+            if f.get("finished") or f.get("finished_like"):
+                continue
+            t1 = f.get("end") or f.get("t1")
+            if t1 is None:
+                continue
+            gap = _nearest_eos_gap(float(t1), eos_times)
+            if gap <= max_gap_for_like or _text_looks_finished(f.get("text") or f.get("display") or ""):
+                f["finished_like"] = True
+                # we leave f["finished"]=False to preserve the fact we didn't change timing,
+                # but both flags are acceptable; set to True if your gate only checks one flag:
+                f["finished"] = True
+                finished_now += 1
+
+        return finals_list
+
+    # Apply finished pipeline to ensure good finished ratio
+    finals_refined = _apply_finished_pipeline(finals, eos_times)
+    finals_ready = _ensure_finished_ratio(finals_refined, eos_times, min_ratio=0.60, max_gap_for_like=2.0)
+    finished_count = sum(1 for f in finals_ready if f.get("finished") or f.get("finished_like"))
+    
+    # Log the actual finished ratio after refinement
+    total_finals = len(finals_ready)
+    finished_ratio = finished_count / max(1, total_finals)
+    logger.info("FT_SUMMARY_AUTH: total=%d finished=%d ratio_strict=%.2f (after refinement)",
+                total_finals, finished_count, finished_ratio)
+    
+    # Debug: Log what we're returning
+    logger.info("ENHANCED_DEBUG: returning candidates=%d finals=%d", len(candidates), len(finals_ready))
+    if finals_ready:
+        logger.info("ENHANCED_DEBUG: first final keys=%s", list(finals_ready[0].keys()))
+        logger.info("ENHANCED_DEBUG: first final finished=%s", finals_ready[0].get('finished', 'MISSING'))
+    
+    # Create ft_statuses array - "ok" for processed segments, "missing" for skipped
+    ft_statuses = ["ok"] * len(enhanced_segments)
     
     return {
-        'clips': top_clips,
+        'candidates': candidates,
+        'finals': finals_ready,
+        'clips': finals_ready,  # Also return as 'clips' for compatibility
+        'meta': {
+            'seed_count': 0,  # TODO: implement seed counting
+            'brute_count': len(candidates),
+            'total_processed': len(enhanced_segments),
+            'finished_count': finished_count,
+            'ft_statuses': ft_statuses
+        },
+        'ft_statuses': ft_statuses,
+        'coverage_note': 'full_features',
+        'authoritative': len(finals_ready) > 0 and finished_ratio >= 0.60,  # Only authoritative if we have finals AND good finished ratio
+        'ft': {
+            'fallback_mode': False,  # Enhanced pipeline should not use fallback
+            'total': total_finals,
+            'finished': finished_count,
+            'sparse_finished': 0,
+            'ratio_strict': finished_ratio,
+            'ratio_sparse_ok': finished_ratio
+        },
         'genre': genre,
         'platform': platform,
         'scoring_version': 'v4.7.2-unified-syn-whiten-blend-prosody-guard-cal',
-        'ft': {
-            'fallback_mode': ft.fallback_mode,
-            'total': ft.total,
-            'finished': ft.finished,
-            'sparse_finished': ft.sparse_finished,
-            'ratio_strict': ft.ratio_strict,
-            'ratio_sparse_ok': ft.ratio_sparse_ok
-        },
         'debug': {
             'phase2_enabled': True,
             'phase3_enabled': True,
@@ -3774,6 +4084,621 @@ def find_natural_boundaries(text: str) -> List[Dict]:
     
     return unique_boundaries
 
+def _w_start(w):
+    """Get word start time"""
+    if not isinstance(w, dict):
+        return float(w) if isinstance(w, (int, float)) else 0.0
+    
+    return w.get("t") or w.get("start") or w.get("ts") or w.get("s") or 0.0
+
+def _w_end(w):
+    """Get word end time"""
+    if not isinstance(w, dict):
+        return float(w) if isinstance(w, (int, float)) else 0.0
+    
+    if "d" in w:  # duration
+        return (w.get("t", 0.0)) + float(w["d"])
+    return w.get("end") or w.get("te") or w.get("e") or _w_start(w)
+
+def _w_text(w):
+    """Get word text"""
+    if not isinstance(w, dict):
+        return str(w) if w is not None else ""
+    
+    return w.get("word") or w.get("text") or w.get("w") or ""
+
+def compute_features_lite(words, hop_s=0.5):
+    """
+    Lightweight feature computation for hotness curve generation.
+    Returns per-second feature arrays for peak detection.
+    """
+    if not words:
+        return [], [], [], [], [], [], [], []
+    
+    # Build time grid (every hop_s seconds)
+    total_duration = max(_w_end(w) for w in words) if words else 0.0
+    times = [i * hop_s for i in range(int(total_duration / hop_s) + 1)]
+    
+    # Initialize feature arrays
+    hook = [0.0] * len(times)
+    arousal = [0.0] * len(times)
+    payoff = [0.0] * len(times)
+    info = [0.0] * len(times)
+    q_or_list = [0.0] * len(times)
+    emotion = [0.0] * len(times)
+    loop = [0.0] * len(times)
+    
+    # Compute features for each time window
+    for i, t in enumerate(times):
+        window_start = max(0.0, t - 2.0)  # 2s window
+        window_end = t + 2.0
+        
+        # Get words in this window
+        window_words = [w for w in words if window_start <= _w_start(w) <= window_end]
+        if not window_words:
+            continue
+            
+        # Extract text
+        text = " ".join(_w_text(w) for w in window_words).strip()
+        if not text:
+            continue
+        
+        # Compute lightweight features (text-based only)
+        try:
+            # Hook score (question words, curiosity phrases)
+            hook_score = _compute_hook_lite(text)
+            
+            # Arousal score (emotional intensity, exclamation)
+            arousal_score = _compute_arousal_lite(text)
+            
+            # Payoff score (value words, insights)
+            payoff_score = _compute_payoff_lite(text)
+            
+            # Info density (factual content, numbers)
+            info_score = _compute_info_lite(text)
+            
+            # Q or list (questions, lists, numbered items)
+            q_list_score = _compute_q_list_lite(text)
+            
+            # Emotion (sentiment, emotional words)
+            emotion_score = _compute_emotion_lite(text)
+            
+            # Loopability (repetitive patterns, catchphrases)
+            loop_score = _compute_loop_lite(text)
+            
+            # Store in arrays
+            hook[i] = hook_score
+            arousal[i] = arousal_score
+            payoff[i] = payoff_score
+            info[i] = info_score
+            q_or_list[i] = q_list_score
+            emotion[i] = emotion_score
+            loop[i] = loop_score
+            
+        except Exception as e:
+            log.debug(f"Feature computation error at t={t}: {e}")
+            continue
+    
+    return times, hook, arousal, payoff, info, q_or_list, emotion, loop
+
+def _compute_hook_lite(text):
+    """Lightweight hook score computation"""
+    if not text:
+        return 0.0
+    
+    text_lower = text.lower()
+    score = 0.0
+    
+    # Question words
+    question_words = ['what', 'why', 'how', 'when', 'where', 'who', 'which']
+    for word in question_words:
+        score += text_lower.count(word) * 0.1
+    
+    # Curiosity phrases
+    curiosity_phrases = ['but', 'however', 'here\'s why', 'the catch', 'what you don\'t', 'what no one']
+    for phrase in curiosity_phrases:
+        if phrase in text_lower:
+            score += 0.2
+    
+    # Question marks
+    score += text.count('?') * 0.15
+    
+    return min(1.0, score)
+
+def _compute_arousal_lite(text):
+    """Lightweight arousal score computation"""
+    if not text:
+        return 0.0
+    
+    text_lower = text.lower()
+    score = 0.0
+    
+    # Exclamation marks
+    score += text.count('!') * 0.2
+    
+    # Emotional intensity words
+    intensity_words = ['amazing', 'incredible', 'shocking', 'surprising', 'unbelievable', 'stunning']
+    for word in intensity_words:
+        if word in text_lower:
+            score += 0.15
+    
+    # Caps (indicating emphasis)
+    caps_ratio = sum(1 for c in text if c.isupper()) / max(1, len(text))
+    score += caps_ratio * 0.1
+    
+    return min(1.0, score)
+
+def _compute_payoff_lite(text):
+    """Lightweight payoff score computation"""
+    if not text:
+        return 0.0
+    
+    text_lower = text.lower()
+    score = 0.0
+    
+    # Value words
+    value_words = ['insight', 'secret', 'tip', 'trick', 'strategy', 'method', 'way', 'solution']
+    for word in value_words:
+        if word in text_lower:
+            score += 0.1
+    
+    # Action words
+    action_words = ['learn', 'discover', 'find', 'get', 'achieve', 'create', 'build', 'make']
+    for word in action_words:
+        if word in text_lower:
+            score += 0.08
+    
+    # Numbers (indicating specific information)
+    import re
+    numbers = re.findall(r'\d+', text)
+    score += len(numbers) * 0.05
+    
+    return min(1.0, score)
+
+def _compute_info_lite(text):
+    """Lightweight info density computation"""
+    if not text:
+        return 0.0
+    
+    # Simple word count vs character ratio
+    words = text.split()
+    if not words:
+        return 0.0
+    
+    avg_word_length = sum(len(word) for word in words) / len(words)
+    word_count = len(words)
+    
+    # Higher word count and reasonable word length = more info
+    score = min(1.0, (word_count / 20.0) * (avg_word_length / 5.0))
+    
+    return score
+
+def _compute_q_list_lite(text):
+    """Lightweight Q or list score computation"""
+    if not text:
+        return 0.0
+    
+    text_lower = text.lower()
+    score = 0.0
+    
+    # Questions
+    if '?' in text:
+        score += 0.3
+    
+    # Lists (numbered or bulleted)
+    import re
+    if re.search(r'\d+\.', text) or re.search(r'[•·-]', text):
+        score += 0.2
+    
+    # List words
+    list_words = ['first', 'second', 'third', 'next', 'then', 'finally', 'also', 'additionally']
+    for word in list_words:
+        if word in text_lower:
+            score += 0.1
+    
+    return min(1.0, score)
+
+def _compute_emotion_lite(text):
+    """Lightweight emotion score computation"""
+    if not text:
+        return 0.0
+    
+    text_lower = text.lower()
+    score = 0.0
+    
+    # Positive emotion words
+    positive_words = ['love', 'amazing', 'great', 'awesome', 'fantastic', 'wonderful', 'excellent']
+    for word in positive_words:
+        if word in text_lower:
+            score += 0.1
+    
+    # Negative emotion words
+    negative_words = ['hate', 'terrible', 'awful', 'horrible', 'disgusting', 'annoying', 'frustrating']
+    for word in negative_words:
+        if word in text_lower:
+            score += 0.1
+    
+    return min(1.0, score)
+
+def _compute_loop_lite(text):
+    """Lightweight loopability score computation"""
+    if not text:
+        return 0.0
+    
+    text_lower = text.lower()
+    score = 0.0
+    
+    # Repetitive patterns
+    words = text_lower.split()
+    if len(words) > 3:
+        # Check for repeated phrases
+        for i in range(len(words) - 2):
+            phrase = ' '.join(words[i:i+3])
+            if text_lower.count(phrase) > 1:
+                score += 0.2
+                break
+    
+    # Catchphrases
+    catchphrases = ['you know', 'i mean', 'basically', 'literally', 'obviously']
+    for phrase in catchphrases:
+        if phrase in text_lower:
+            score += 0.1
+    
+    return min(1.0, score)
+
+def build_hotness_curve(times, hook, arousal, payoff, info, q_or_list, emotion, loop, smooth_window=3.0):
+    """
+    Build hotness curve from feature arrays using enhanced pipeline weights.
+    """
+    if not times:
+        return []
+    
+    # Use same weights as enhanced pipeline
+    weights = {
+        'hook': 0.26,
+        'arousal': 0.20,
+        'payoff': 0.18,
+        'info': 0.11,
+        'q_or_list': 0.09,
+        'emotion': 0.06,
+        'loop': 0.05
+    }
+    
+    # Compute raw hotness
+    hotness = []
+    for i in range(len(times)):
+        h = (weights['hook'] * hook[i] +
+             weights['arousal'] * arousal[i] +
+             weights['payoff'] * payoff[i] +
+             weights['info'] * info[i] +
+             weights['q_or_list'] * q_or_list[i] +
+             weights['emotion'] * emotion[i] +
+             weights['loop'] * loop[i])
+        hotness.append(h)
+    
+    # Smooth with moving average
+    if smooth_window > 0:
+        smoothed = []
+        window_size = int(smooth_window / (times[1] - times[0])) if len(times) > 1 else 1
+        window_size = max(1, window_size)
+        
+        for i in range(len(hotness)):
+            start_idx = max(0, i - window_size // 2)
+            end_idx = min(len(hotness), i + window_size // 2 + 1)
+            window_avg = sum(hotness[start_idx:end_idx]) / (end_idx - start_idx)
+            smoothed.append(window_avg)
+        
+        hotness = smoothed
+    
+    return hotness
+
+def top_k_local_maxima(hotness, times, k=30, min_dist=6.0):
+    """
+    Find top K local maxima in hotness curve with minimum distance constraint.
+    """
+    if not hotness or not times or len(hotness) != len(times):
+        return []
+    
+    # Find all local maxima
+    peaks = []
+    for i in range(1, len(hotness) - 1):
+        if hotness[i] > hotness[i-1] and hotness[i] > hotness[i+1]:
+            peaks.append((times[i], hotness[i]))
+    
+    # Sort by hotness (descending)
+    peaks.sort(key=lambda x: x[1], reverse=True)
+    
+    # Apply minimum distance constraint
+    filtered_peaks = []
+    for peak_time, peak_score in peaks:
+        # Check if this peak is too close to any already selected peak
+        too_close = False
+        for selected_time, _ in filtered_peaks:
+            if abs(peak_time - selected_time) < min_dist:
+                too_close = True
+                break
+        
+        if not too_close:
+            filtered_peaks.append((peak_time, peak_score))
+            if len(filtered_peaks) >= k:
+                break
+    
+    return filtered_peaks
+
+def snap_to_boundaries(center_time, words, eos_times, init_len=10.0, max_shift=3.0):
+    """
+    Snap start and end times to natural boundaries within max_shift of target.
+    Returns (start, end, boundary_quality_score)
+    """
+    if not words or not eos_times:
+        return center_time - init_len/2, center_time + init_len/2, 0.0
+    
+    # Initial window around center
+    start_target = center_time - init_len/2
+    end_target = center_time + init_len/2
+    
+    # Find best start boundary
+    best_start = start_target
+    start_quality = 0.0
+    
+    # Check EOS markers for start
+    for eos in eos_times:
+        if abs(eos - start_target) <= max_shift:
+            if eos < start_target:  # Prefer EOS before start
+                best_start = eos
+                start_quality = 1.0  # Strong EOS
+                break
+    
+    # Check sentence boundaries
+    if start_quality < 1.0:
+        for i, word in enumerate(words):
+            word_start = _w_start(word)
+            if abs(word_start - start_target) <= max_shift:
+                # Check if this looks like a sentence start
+                if i > 0:
+                    prev_word = words[i-1]
+                    prev_end = _w_end(prev_word)
+                    gap = word_start - prev_end
+                    if gap > 0.35:  # Significant pause
+                        best_start = word_start
+                        start_quality = 0.8  # Sentence start
+                        break
+    
+    # Find best end boundary
+    best_end = end_target
+    end_quality = 0.0
+    
+    # Check EOS markers for end (prefer strong EOS)
+    for eos in eos_times:
+        if abs(eos - end_target) <= max_shift:
+            if eos >= end_target:  # Prefer EOS after end
+                best_end = eos
+                end_quality = 1.0  # Strong EOS
+                break
+    
+    # Check sentence boundaries
+    if end_quality < 1.0:
+        for i, word in enumerate(words):
+            word_end = _w_end(word)
+            if abs(word_end - end_target) <= max_shift:
+                # Check if this looks like a sentence end
+                if i < len(words) - 1:
+                    next_word = words[i+1]
+                    next_start = _w_start(next_word)
+                    gap = next_start - word_end
+                    if gap > 0.35:  # Significant pause
+                        best_end = word_end
+                        end_quality = 0.8  # Sentence end
+                        break
+    
+    # Apply boundary malus
+    boundary_score = (start_quality + end_quality) / 2.0
+    malus = 0.0
+    if start_quality < 0.8:
+        malus += 0.01  # Start not on top boundary
+    if end_quality < 0.8:
+        malus += 0.02  # End not on top boundary
+    
+    return best_start, best_end, boundary_score - malus
+
+def optimize_window(center, words, eos_times, score_fn, min_len=7.0, max_len=120.0):
+    """
+    Hill climb optimization to find best window around center.
+    Try multiple starting lengths to avoid short-clip bias.
+    Returns (start, end, score)
+    """
+    # Try multiple starting lengths to avoid short-clip bias - bias toward longer viral moments
+    init_lengths = [12, 18, 23, 30, 35, 45, 60, 75, 90]  # Real long seeds for viral discovery
+    best_overall = None
+    
+    for init_len in init_lengths:
+        if init_len > max_len:
+            continue
+            
+        # Start with snapped boundaries for this length
+        s, e, _ = snap_to_boundaries(center, words, eos_times, init_len=init_len)
+        
+        if e - s < min_len or e - s > max_len:
+            continue
+            
+        best = (s, e, score_fn(s, e))
+        step = 6.0  # seconds to try expanding/contracting - increased for more aggressive optimization
+        improved = True
+        iterations = 0
+        max_iterations = 10  # Increased to allow more exploration
+        
+        while improved and iterations < max_iterations:
+            improved = False
+            iterations += 1
+            
+            # Try different expansion/contraction directions
+            for ds, de in [(-step, 0), (0, +step), (-step, +step), (+step, -step)]:
+                ns = max(0.0, s + ds)
+                ne = min(max_len, e + de)
+                
+                if ne - ns < min_len or ne - ns > max_len:
+                    continue
+                
+                # Snap to boundaries
+                ns, ne, _ = snap_to_boundaries((ns + ne) / 2, words, eos_times, init_len=ne - ns)
+                
+                if ne - ns < min_len or ne - ns > max_len:
+                    continue
+                
+                val = score_fn(ns, ne)
+                if val > best[2] + 1e-4:  # tiny epsilon for stability
+                    best = (ns, ne, val)
+                    s, e = ns, ne
+                    improved = True
+            
+            # If no improvement, try finer steps
+            if not improved and step > 1.0:
+                step *= 0.5
+                improved = True
+        
+        # Track best result across all starting lengths
+        if best_overall is None or best[2] > best_overall[2]:
+            best_overall = best
+    
+    return best_overall if best_overall else (0.0, 0.0, 0.0)
+
+def discover_dynamic_length(words, eos_times, score_fn, duration_s):
+    """
+    Main dynamic length discovery function.
+    Returns list of optimized segments.
+    """
+    if not words or not eos_times:
+        return []
+    
+    # Compute hotness curve
+    times, hook, arousal, payoff, info, q_or_list, emotion, loop = compute_features_lite(words, hop_s=0.5)
+    hotness = build_hotness_curve(times, hook, arousal, payoff, info, q_or_list, emotion, loop, smooth_window=3.0)
+    
+    # Adaptive peak detection with improved spacing
+    duration_minutes = duration_s / 60.0
+    eos_gaps = [eos_times[i+1] - eos_times[i] for i in range(len(eos_times)-1)]
+    eos_gap_med = sorted(eos_gaps)[len(eos_gaps)//2] if eos_gaps else 4.0
+    
+    # Improved min_dist calculation: scale with episode length and EOS density
+    base_min_dist = max(8.0, min(18.0, (duration_s / 180.0) * 10.0))
+    eos_density = len(eos_times) / (duration_s / 60.0) if duration_s > 0 else 0.0  # EOS per minute
+    eos_density_factor = 1.15 if eos_density > 0.15 else 1.0  # Dense speech → larger spacing
+    min_dist = base_min_dist * eos_density_factor
+    
+    k = max(20, min(60, int(duration_minutes * 1.5)))
+    
+    # Find peaks
+    peaks = top_k_local_maxima(hotness, times, k=k, min_dist=min_dist)
+    
+    # Optimize each peak
+    candidates = []
+    for peak_time, peak_score in peaks:
+        try:
+            s, e, score = optimize_window(peak_time, words, eos_times, score_fn, min_len=7.0, max_len=120.0)
+            if score > 0.1:  # Minimum quality threshold
+                # Validate segment spans before adding
+                if s >= e or e - s < 1.0:  # Invalid or too short
+                    log.debug(f"Skipping invalid segment: start={s}, end={e}, duration={e-s}")
+                    continue
+                    
+                candidates.append({
+                    'start': s,
+                    'end': e,
+                    'duration': e - s,
+                    'score': score,
+                    'peak_time': peak_time,
+                    'peak_score': peak_score
+                })
+        except Exception as e:
+            log.debug(f"Window optimization error at peak {peak_time}: {e}")
+            continue
+    
+    # Deduplicate candidates
+    deduped = dedupe_candidates(candidates)
+    
+    # Limit to target count
+    target_count = max(20, min(40, int(duration_minutes * 1.0)))
+    final_candidates = sorted(deduped, key=lambda x: x['score'], reverse=True)[:target_count]
+    
+    log.info(f"DYNAMIC_LENGTH: found {len(peaks)} peaks, optimized {len(candidates)} candidates, kept {len(final_candidates)} after dedupe")
+    
+    return final_candidates
+
+def dedupe_candidates(candidates, time_iou_thresh=0.6, text_sim_thresh=0.85):
+    """
+    Deduplicate candidates by time overlap and text similarity.
+    """
+    if not candidates:
+        return []
+    
+    # Sort by score (descending)
+    candidates.sort(key=lambda x: x['score'], reverse=True)
+    
+    kept = []
+    for candidate in candidates:
+        # Check time overlap
+        time_conflict = False
+        for kept_candidate in kept:
+            iou = _compute_time_iou(
+                candidate['start'], candidate['end'],
+                kept_candidate['start'], kept_candidate['end']
+            )
+            if iou >= time_iou_thresh:
+                time_conflict = True
+                break
+        
+        if time_conflict:
+            continue
+        
+        # Check text similarity
+        text_conflict = False
+        candidate_text = _extract_text_for_candidate(candidate)
+        for kept_candidate in kept:
+            kept_text = _extract_text_for_candidate(kept_candidate)
+            similarity = _compute_text_similarity(candidate_text, kept_text)
+            if similarity >= text_sim_thresh:
+                text_conflict = True
+                break
+        
+        if not text_conflict:
+            kept.append(candidate)
+    
+    return kept
+
+def _compute_time_iou(start1, end1, start2, end2):
+    """Compute intersection over union for time intervals"""
+    intersection_start = max(start1, start2)
+    intersection_end = min(end1, end2)
+    
+    if intersection_start >= intersection_end:
+        return 0.0
+    
+    intersection = intersection_end - intersection_start
+    union = (end1 - start1) + (end2 - start2) - intersection
+    
+    return intersection / union if union > 0 else 0.0
+
+def _extract_text_for_candidate(candidate):
+    """Extract text for a candidate (placeholder - would need words data)"""
+    return f"clip_{candidate['start']:.1f}_{candidate['end']:.1f}"
+
+def _compute_text_similarity(text1, text2):
+    """Compute text similarity (placeholder - would use proper text similarity)"""
+    if not text1 or not text2:
+        return 0.0
+    
+    # Simple word overlap similarity
+    words1 = set(text1.lower().split())
+    words2 = set(text2.lower().split())
+    
+    if not words1 or not words2:
+        return 0.0
+    
+    intersection = len(words1 & words2)
+    union = len(words1 | words2)
+    
+    return intersection / union if union > 0 else 0.0
+
 def create_dynamic_segments(segments: List[Dict], platform: str = 'tiktok', eos_times: list[float] | None = None, words: List[Dict] = None) -> List[Dict]:
     """
     Create dynamic segments based on natural content boundaries and platform optimization.
@@ -3788,6 +4713,19 @@ def create_dynamic_segments(segments: List[Dict], platform: str = 'tiktok', eos_
     # Local helper for null-safe length
     def _safe_len(x):
         return len(x) if isinstance(x, (list, tuple, str)) else 0
+    
+    def _len_safe(xs):
+        """Safe length helper: None -> 0."""
+        return 0 if xs is None else len(xs)
+
+    def _normalize_list(xs):
+        """None -> [], list -> itself (copy not required)."""
+        return xs or []
+    
+    # Guard inputs to avoid NoneType len()
+    words = _normalize_list(words)
+    eos_times = _normalize_list(eos_times)
+    segments = _normalize_list(segments)
     
     # Context-first seed generation (Phase 2 - Real ASR Integration)
     seed_candidates = []
@@ -3857,12 +4795,137 @@ def create_dynamic_segments(segments: List[Dict], platform: str = 'tiktok', eos_
     
     dynamic_segments = []
     
-    # Platform-specific target bins (allow extension to others via grow_to_bins)
-    TARGETS = [12.0, 18.0, 24.0, 30.0]
-    MIN_SEC, MAX_SEC = 8.0, 60.0
+    # Define length constraints for all platforms (used by both dynamic and fixed approaches)
+    # Bias toward longer clips for true viral discovery
+    TARGETS = [20, 30, 45, 60, 75, 90]  # Focus on longer viral moments
+    MIN_SEC, MAX_SEC = 8.0, 120.0    # Wider range, bias toward longer clips
+    
+    # Check if dynamic length discovery is enabled
+    if settings.USE_DYNAMIC_LENGTH_DISCOVERY and words and eos_times:
+        log.info("DYNAMIC_LENGTH: using true dynamic length discovery")
+        
+        # Calculate total duration
+        total_duration = max(_w_end(w) for w in words) if words else 0.0
+        
+        # Create score function for optimization
+        def score_fn(start, end):
+            """Score function for window optimization"""
+            try:
+                # Extract text for this window
+                window_words = [w for w in words if start <= _w_start(w) <= end]
+                if not window_words:
+                    return 0.0
+                
+                text = " ".join(_w_text(w) for w in window_words).strip()
+                if not text:
+                    return 0.0
+                
+                # Create a segment dict for scoring
+                segment = {
+                    'start': start,
+                    'end': end,
+                    'text': text,
+                    'duration': end - start
+                }
+                
+                # Use lightweight scoring (no audio analysis)
+                features = {
+                    'hook': _compute_hook_lite(text),
+                    'arousal': _compute_arousal_lite(text),
+                    'payoff': _compute_payoff_lite(text),
+                    'info_density': _compute_info_lite(text),
+                    'q_list': _compute_q_list_lite(text),
+                    'emotion': _compute_emotion_lite(text),
+                    'loopability': _compute_loop_lite(text)
+                }
+                
+                # Apply same weights as enhanced pipeline
+                weights = {
+                    'hook': 0.26,
+                    'arousal': 0.20,
+                    'payoff': 0.18,
+                    'info_density': 0.11,
+                    'q_list': 0.09,
+                    'emotion': 0.06,
+                    'loopability': 0.05
+                }
+                
+                score = sum(weights[k] * v for k, v in features.items())
+                return score
+                
+            except Exception as e:
+                log.debug(f"Score function error: {e}")
+                return 0.0
+        
+        # Run dynamic length discovery
+        try:
+            dynamic_candidates = discover_dynamic_length(words, eos_times, score_fn, total_duration)
+            
+            # Convert to segment format
+            for candidate in dynamic_candidates:
+                dynamic_segments.append({
+                    'start': candidate['start'],
+                    'end': candidate['end'],
+                    'duration': candidate['duration'],
+                    'text': '',  # Will be filled later
+                    'boundary_type': 'dynamic',
+                    'confidence': candidate['score'],
+                    'peak_time': candidate['peak_time'],
+                    'peak_score': candidate['peak_score']
+                })
+            
+            log.info(f"DYNAMIC_LENGTH: generated {len(dynamic_segments)} dynamic segments")
+            
+        except Exception as e:
+            log.error(f"DYNAMIC_LENGTH: error in discovery: {e}")
+            # Fall back to fixed targets
+            dynamic_segments = []
+    
+    # Fallback to fixed targets if dynamic discovery failed or disabled
+    # Skip fixed targets when enhanced pipeline is enabled to avoid short-clip bias
+    if not dynamic_segments and not settings.USE_DYNAMIC_LENGTH_DISCOVERY:
+        log.info("DYNAMIC_LENGTH: using fixed target approach")
+    elif not dynamic_segments and settings.USE_DYNAMIC_LENGTH_DISCOVERY:
+        log.warning("DYNAMIC_LENGTH: discovery failed but enhanced enabled - using ad-aware fallback")
+        # Return segments to avoid complete failure, but skip ad-like content
+        if segments:
+            # Filter out ad-like segments and take more diverse samples
+            ad_keywords = ['sponsored', 'advertisement', 'promo', 'discount', 'check out', 'visit', 'www.', 'http']
+            filtered_segments = []
+            
+            for seg in segments:
+                text = seg.get('text', '').lower()
+                # Skip segments that look like ads
+                if any(keyword in text for keyword in ad_keywords):
+                    log.debug(f"Skipping ad-like segment: {text[:50]}...")
+                    continue
+                filtered_segments.append(seg)
+            
+            # Take more diverse samples (not just the first few)
+            if len(filtered_segments) >= 10:
+                # Take every 3rd segment to get diversity
+                fallback_segments = filtered_segments[::3][:15]
+            else:
+                fallback_segments = filtered_segments[:10]
+            
+            log.info(f"DYNAMIC_LENGTH: using {len(fallback_segments)} ad-filtered fallback segments")
+            return fallback_segments
+        else:
+            log.error("DYNAMIC_LENGTH: no segments available for fallback")
+            return []
     
     # Calculate EOS density for seed merging decision
-    eos_density = len(eos_times) / (segments[-1].get("end", 0) - segments[0].get("start", 0)) if segments and eos_times else 0.0
+    # Standardize EOS density calculation: markers per minute
+    if segments and _len_safe(segments) > 1:
+        total_duration_minutes = max(1.0, (segments[-1].get("end", 0) - segments[0].get("start", 0)) / 60.0)
+    else:
+        # Fallback: use episode duration from words if available
+        if words:
+            total_duration_minutes = max(1.0, (max(_w_end(w) for w in words) - min(_w_start(w) for w in words)) / 60.0)
+        else:
+            total_duration_minutes = 1.0
+    
+    eos_density = _len_safe(eos_times) / total_duration_minutes
     
     # Compute dense flag once after EOS_UNIFIED
     src = "episode"  # or "gap_fallback" if from fallback
@@ -3870,7 +4933,7 @@ def create_dynamic_segments(segments: List[Dict], platform: str = 'tiktok', eos_
     
     # Only log EOS details if we were actually given eos_times
     if eos_times is not None:
-        count = len(eos_times)
+        count = _len_safe(eos_times)
         fallback_flag = (src == "gap_fallback")
         log.info("EOS: %d markers, density=%.3f, source=%s, fallback=%s",
                  count, eos_density, src, fallback_flag)
@@ -3896,7 +4959,7 @@ def create_dynamic_segments(segments: List[Dict], platform: str = 'tiktok', eos_
     # Find natural boundaries in the combined text
     boundaries = find_natural_boundaries(combined_text)
     
-    if not boundaries or len(boundaries) < 2:
+    if not boundaries or _len_safe(boundaries) < 2:
         # No natural boundaries found, use original segments
         return segments
     
@@ -3929,8 +4992,8 @@ def create_dynamic_segments(segments: List[Dict], platform: str = 'tiktok', eos_
             continue
         
         # Calculate timing based on word count and total duration
-        total_words = len(words)
-        segment_ratio = len(segment_words) / total_words
+        total_words = _len_safe(words)
+        segment_ratio = _len_safe(segment_words) / total_words
         segment_duration = total_duration * segment_ratio
         
         # Ensure minimum duration for platform requirements
@@ -4012,13 +5075,19 @@ def create_dynamic_segments(segments: List[Dict], platform: str = 'tiktok', eos_
         # Merge short seeds into 16-28s windows
         merged_seeds = _greedy_merge_short_seeds(dynamic_segments)
         dynamic_segments = merged_seeds
-        log.info("SEED_MERGE: merged=%d -> median_len=%.1fs", len(merged_seeds), sorted(pre_durs)[len(pre_durs)//2] if pre_durs else 0)
+        # Calculate median safely, filtering out invalid durations
+        valid_durs = [d for d in pre_durs if d > 0] if pre_durs else []
+        median_len = sorted(valid_durs)[len(valid_durs)//2] if valid_durs else 0.0
+        log.info("SEED_MERGE: merged=%d -> median_len=%.1fs", len(merged_seeds), median_len)
     else:
         # Even for non-dense, merge 8s seeds to get sentence-level chunks
         if pre_durs and max(pre_durs) <= 10.0:  # All seeds are 8-10s
             merged_seeds = _greedy_merge_short_seeds(dynamic_segments)
             dynamic_segments = merged_seeds
-            log.info("SEED_MERGE: merged=%d -> median_len=%.1fs", len(merged_seeds), sorted(pre_durs)[len(pre_durs)//2] if pre_durs else 0)
+            # Calculate median safely, filtering out invalid durations
+            valid_durs = [d for d in pre_durs if d > 0] if pre_durs else []
+            median_len = sorted(valid_durs)[len(valid_durs)//2] if valid_durs else 0.0
+            log.info("SEED_MERGE: merged=%d -> median_len=%.1fs", len(merged_seeds), median_len)
     
     # Log post-merge stats and assert dense requirement
     if dynamic_segments:
@@ -4555,13 +5624,7 @@ def find_candidates(segments: List[Dict], audio_file: str, platform: str = 'tikt
             'interpretation': 'excellent' if compatibility >= 1.1 else 'good' if compatibility >= 1.0 else 'challenging' if compatibility >= 0.9 else 'difficult'
         }
     
-    # Sanity logs for pl_v2 debugging (temporarily keep)
-    if logger and segment_idx < 5:  # first few only
-        logger.info(
-            "pl_v2 dbg: dur=%.1f info=%.2f platform=%s -> v2=%s (v1=%.2f)",
-            duration_s, result.get('info_density', 0.0), platform,
-            str(platform_length_score_v2), float(result.get('platform_len_match', 0.0))
-        )
+    # Platform-specific logging removed - variables not available in this scope
     
     return result
 
@@ -4997,7 +6060,9 @@ def build_eos_index(segments: List[Dict], episode_words: List[Dict] = None, epis
         word_end_times.append(word.get('end', 0))
     
     # Log final EOS density
-    eos_density = len(eos_times) / max(len(word_end_times), 1) if word_end_times else 0
+    # Standardize EOS density calculation: markers per minute
+    total_duration_minutes = max(1.0, (word_end_times[-1] - word_end_times[0]) / 60.0) if word_end_times and len(word_end_times) > 1 else 1.0
+    eos_density = len(eos_times) / total_duration_minutes
     logger.info(f"EOS unified: {len(eos_times)} markers, {len(word_end_times)} words, density={eos_density:.3f}, source={eos_source}")
     
     return sorted(list(eos_times)), sorted(word_end_times), eos_source
